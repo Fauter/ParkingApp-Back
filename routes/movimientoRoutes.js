@@ -13,7 +13,7 @@ router.post('/registrar', registrarMovimiento);
 // GET ordenado por creación real (createdAt || fecha) DESC
 router.get('/', obtenerMovimientos);
 
-// Danger zone: borrar todos
+// Danger zone: borrar todos (sólo para mantenimiento)
 router.delete('/', eliminarTodosLosMovimientos);
 
 module.exports = router;

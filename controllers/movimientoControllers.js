@@ -29,6 +29,7 @@ exports.registrarMovimiento = async (req, res) => {
 
     const operador = getOperadorNombre(req);
 
+    // ⛔ No aceptamos `fecha`, `createdAt`, `updatedAt` desde el body.
     const nuevoMovimiento = new Movimiento({
       ...(cliente ? { cliente } : {}),
       patente,
@@ -39,20 +40,15 @@ exports.registrarMovimiento = async (req, res) => {
       monto,
       descripcion,
       tipoTarifa,
-      ...(ticket ? { ticket } : {})
-      // ❗ NO aceptamos createdAt/updatedAt desde el body
-      // `timestamps: true` lo setea solo Mongoose
+      ...(Number.isFinite(ticket) ? { ticket } : {})
     });
 
     await nuevoMovimiento.save();
 
-    // Normalizo respuesta: createdAt siempre presente (o igual a fecha)
+    // Normalizamos: siempre devolvemos `createdAt` (o `fecha` si no existiese).
     const createdAt = nuevoMovimiento.createdAt || nuevoMovimiento.fecha;
-    if (!nuevoMovimiento.createdAt && nuevoMovimiento.fecha) {
-      // (no persisto nada extra acá; ya guardado)
-    }
 
-    res.status(201).json({
+    return res.status(201).json({
       msg: "Movimiento registrado",
       movimiento: {
         ...nuevoMovimiento.toObject(),
@@ -61,33 +57,36 @@ exports.registrarMovimiento = async (req, res) => {
     });
   } catch (err) {
     console.error("Error al registrar movimiento:", err);
-    res.status(500).json({ msg: "Error del servidor" });
+    return res.status(500).json({ msg: "Error del servidor" });
   }
 };
 
-// 🧠 Devolvé siempre ordenado por creación real: createdAt || fecha (DESC)
-exports.obtenerMovimientos = async (_req, res) => {
+// 🧠 GET: siempre ordenado por la creación real (createdAt || fecha) DESC
+exports.obtenerMovimientos = async (req, res) => {
   try {
-    // Uso aggregation para construir una clave de orden
-    const movimientos = await Movimiento.aggregate([
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '0', 10), 0), 500); // opcional, seguro
+    const pipeline = [
       {
         $addFields: {
           _createdSort: { $ifNull: ['$createdAt', '$fecha'] }
         }
       },
       { $sort: { _createdSort: -1, _id: -1 } }
-    ]);
+    ];
+    if (limit) pipeline.push({ $limit: limit });
 
-    // Por compatibilidad, en cada doc garanto `createdAt` (si no venía)
+    const movimientos = await Movimiento.aggregate(pipeline);
+
+    // Compatibilidad: garantizamos createdAt si no viene (usando fecha)
     const normalizados = movimientos.map(m => ({
       ...m,
       createdAt: m.createdAt || m.fecha
     }));
 
-    res.json(normalizados);
+    return res.json(normalizados);
   } catch (err) {
     console.error('obtenerMovimientos error:', err);
-    res.status(500).json({ msg: "Error del servidor" });
+    return res.status(500).json({ msg: "Error del servidor" });
   }
 };
 
@@ -96,9 +95,9 @@ exports.eliminarTodosLosMovimientos = async (_req, res) => {
     console.log("⚠️ Eliminando todos los movimientos...");
     await Movimiento.deleteMany({});
     console.log("✅ Todos los movimientos fueron eliminados.");
-    res.json({ msg: "Todos los movimientos fueron eliminados correctamente." });
+    return res.json({ msg: "Todos los movimientos fueron eliminados correctamente." });
   } catch (err) {
     console.error("💥 Error al eliminar los movimientos:", err);
-    res.status(500).json({ msg: "Error del servidor" });
+    return res.status(500).json({ msg: "Error del servidor" });
   }
 };

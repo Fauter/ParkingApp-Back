@@ -1,11 +1,21 @@
+/* eslint-disable no-console */
 // controllers/cierreParcialControllers.js
-const CierreParcial = require('../models/CierreParcial');
+'use strict';
 
-// 💡 Ajustá si tu modelo se llama distinto
+const CierreParcial = require('../models/CierreParcial');
+// Si tu modelo de usuario se llama distinto, ajustá esta import
 const User = require('../models/User');
 
 const isObjectIdString = (v) => typeof v === 'string' && /^[0-9a-fA-F]{24}$/.test(v);
 const pickUserName = (u) => u?.nombre || u?.name || u?.username || u?.email || null;
+
+// Helper: sanea strings con límite
+const sanitizeStr = (v, maxLen) => {
+  if (typeof v !== 'string') return '';
+  const s = v.trim();
+  if (!maxLen) return s;
+  return s.length > maxLen ? s.slice(0, maxLen) : s;
+};
 
 async function extractOperador(body) {
   let operadorId = null;
@@ -40,42 +50,63 @@ async function extractOperador(body) {
 }
 
 function normalizeOut(doc, usersById = {}) {
-  const d = doc.toObject ? doc.toObject() : doc;
+  const d = doc?.toObject ? doc.toObject() : doc;
 
-  let nombre = d.operadorNombre || null;
+  let nombreOperador = d.operadorNombre || null;
 
-  if (!nombre) {
+  if (!nombreOperador) {
     const op = d.operador;
     if (typeof op === 'string') {
       if (op === '[object Object]') {
-        nombre = null;
+        nombreOperador = null;
       } else if (isObjectIdString(op)) {
-        nombre = usersById[op] || op;
+        nombreOperador = usersById[op] || op;
       } else {
-        nombre = op;
+        nombreOperador = op;
       }
     } else if (op && typeof op === 'object') {
-      nombre = pickUserName(op) || op._id || null;
+      nombreOperador = pickUserName(op) || op._id || null;
     }
   }
 
-  return { ...d, operador: nombre || '---' };
+  // Devuelve `operador` como string amigable (como venías usando en front)
+  return {
+    ...d,
+    operador: nombreOperador || '---',
+  };
 }
 
 exports.create = async (req, res) => {
   try {
     const payload = { ...req.body };
+
+    // 🧹 Saneamos y limitamos los campos nuevos del front
+    payload.nombre = sanitizeStr(payload.nombre, 60);
+    payload.texto  = sanitizeStr(payload.texto, 300);
+
+    // Aseguramos monto numérico >= 0 (tu front ya valida, pero reforzamos)
+    if (typeof payload.monto !== 'number') {
+      payload.monto = Number(payload.monto);
+    }
+    if (Number.isNaN(payload.monto) || payload.monto < 0) {
+      return res.status(400).json({ error: 'Monto inválido' });
+    }
+
     const { operadorId, operadorNombre } = await extractOperador(req.body);
 
     if (operadorId) payload.operadorId = operadorId;
     if (operadorNombre) {
       payload.operadorNombre = operadorNombre;
-      payload.operador = operadorNombre;
+      payload.operador = operadorNombre; // guardamos string amigable
+    } else {
+      // fallback para cumplir con schema.required de operador
+      payload.operador = payload.operador || '---';
     }
 
     const saved = await CierreParcial.create(payload);
     res.status(201).json(normalizeOut(saved));
   } catch (err) {
+    console.error('Error create CierreParcial:', err);
     res.status(400).json({ error: err.message });
   }
 };
@@ -84,6 +115,7 @@ exports.getAll = async (req, res) => {
   try {
     const cierres = await CierreParcial.find().lean();
 
+    // Resolver posibles ObjectId guardados en `operador`
     const ids = [
       ...new Set(
         cierres
@@ -107,6 +139,7 @@ exports.getAll = async (req, res) => {
     const out = cierres.map(d => normalizeOut(d, usersById));
     res.json(out);
   } catch (err) {
+    console.error('Error getAll CierreParcial:', err);
     res.status(500).json({ error: err.message });
   }
 };
@@ -126,6 +159,7 @@ exports.getById = async (req, res) => {
 
     res.json(normalizeOut(cierre, usersById));
   } catch (err) {
+    console.error('Error getById CierreParcial:', err);
     res.status(500).json({ error: err.message });
   }
 };
@@ -133,8 +167,21 @@ exports.getById = async (req, res) => {
 exports.updateById = async (req, res) => {
   try {
     const payload = { ...req.body };
-    const { operadorId, operadorNombre } = await extractOperador(req.body);
 
+    // 🧹 Saneamos y limitamos los campos nuevos
+    if ('nombre' in payload) payload.nombre = sanitizeStr(payload.nombre, 60);
+    if ('texto'  in payload) payload.texto  = sanitizeStr(payload.texto, 300);
+
+    if ('monto' in payload) {
+      if (typeof payload.monto !== 'number') {
+        payload.monto = Number(payload.monto);
+      }
+      if (Number.isNaN(payload.monto) || payload.monto < 0) {
+        return res.status(400).json({ error: 'Monto inválido' });
+      }
+    }
+
+    const { operadorId, operadorNombre } = await extractOperador(req.body);
     if (operadorId) payload.operadorId = operadorId;
     if (operadorNombre) {
       payload.operadorNombre = operadorNombre;
@@ -146,6 +193,7 @@ exports.updateById = async (req, res) => {
 
     res.json(normalizeOut(actualizado));
   } catch (err) {
+    console.error('Error updateById CierreParcial:', err);
     res.status(400).json({ error: err.message });
   }
 };
@@ -155,6 +203,7 @@ exports.deleteAll = async (req, res) => {
     await CierreParcial.deleteMany();
     res.json({ message: 'Todos los cierres parciales fueron eliminados' });
   } catch (err) {
+    console.error('Error deleteAll CierreParcial:', err);
     res.status(500).json({ error: err.message });
   }
 };
