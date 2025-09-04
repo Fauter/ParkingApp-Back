@@ -55,4 +55,12 @@ const abonoSchema = new Schema({
   vehiculo: { type: Schema.Types.ObjectId, ref: 'Vehiculo' },
 }, { strict: true, timestamps: true });
 
+/**
+ * Índices críticos para cron:
+ * - Expiración masiva
+ * - Recalculo por cliente
+ */
+abonoSchema.index({ activo: 1, fechaExpiracion: 1 });
+abonoSchema.index({ cliente: 1, activo: 1, fechaExpiracion: 1 });
+
 module.exports = mongoose.model('Abono', abonoSchema);

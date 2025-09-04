@@ -16,7 +16,7 @@ const estadiaSchema = new Schema({
 }, { _id: false });
 
 const vehiculoSchema = new Schema({
-  // ✅ ÚNICA definición de índice único (NO uses schema.index({ patente:1 }))
+  // ✅ ÚNICA definición de índice único
   patente: { type: String, required: true, unique: true },
 
   tipoVehiculo: String,
@@ -38,11 +38,16 @@ const vehiculoSchema = new Schema({
   historialEstadias: { type: [estadiaSchema], default: [] },
 }, { timestamps: true });
 
-// Normalizar patente
+// 🔤 Normalizar patente a UPPER
 vehiculoSchema.pre('save', function (next) {
   if (this.patente) this.patente = this.patente.trim().toUpperCase();
   next();
 });
+
+// ⚙️ Índices útiles para cron / lecturas
+// - Ya tenés unique en patente (implícito).
+// - Agregamos índice por turno para acelerar { turno: true, patente: { $nin: [...] } }
+vehiculoSchema.index({ turno: 1 });
 
 // Handler de error por duplicado
 vehiculoSchema.post('save', function (error, doc, next) {
@@ -55,9 +60,10 @@ vehiculoSchema.post('save', function (error, doc, next) {
 
 const Vehiculo = mongoose.model('Vehiculo', vehiculoSchema);
 
-// Sincronizar índices una vez cargado el modelo
-Vehiculo.syncIndexes().catch(err => {
-  console.error('[Vehiculo] Error sincronizando índices únicos:', err);
+// 🚫 Evitar dropear índices ajenos del cluster.
+// ✅ Crear los del schema si faltan.
+Vehiculo.createIndexes().catch(err => {
+  console.error('[Vehiculo] Error creando índices:', err);
 });
 
 module.exports = Vehiculo;

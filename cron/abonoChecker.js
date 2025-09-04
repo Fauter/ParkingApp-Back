@@ -26,11 +26,15 @@ async function runOnce() {
     const clienteIds = [...new Set(expirados.map(a => String(a.cliente)).filter(Boolean))];
     const vehiculoIds = expirados.map(a => a.vehiculo).filter(Boolean);
 
-    await Abono.updateMany({ _id: { $in: abonoIds } }, { $set: { activo: false } });
+    await Abono.updateMany(
+      { _id: { $in: abonoIds } },
+      { $set: { activo: false, updatedAt: new Date() } }
+    );
+
     if (vehiculoIds.length) {
       await Vehiculo.updateMany(
         { _id: { $in: vehiculoIds } },
-        { $set: { abonado: false }, $unset: { abono: "" } }
+        { $set: { abonado: false, updatedAt: new Date() }, $unset: { abono: "" } }
       );
     }
 
@@ -53,12 +57,12 @@ async function runOnce() {
         }
         await Cliente.updateOne(
           { _id: cid },
-          { $set: { abonado: true, finAbono: maxFin, precioAbono: tipo } }
+          { $set: { abonado: true, finAbono: maxFin, precioAbono: tipo, updatedAt: new Date() } }
         );
       } else {
         await Cliente.updateOne(
           { _id: cid },
-          { $set: { abonado: false, finAbono: null } }
+          { $set: { abonado: false, finAbono: null, updatedAt: new Date() } }
         );
       }
     }
@@ -73,6 +77,12 @@ async function runOnce() {
 }
 
 function startAbonoChecker() {
+  // 🔒 Singleton guard: evitá dobles timers si el módulo se carga dos veces
+  if (globalThis.__abonoCheckerStarted) {
+    return { runOnce };
+  }
+  globalThis.__abonoCheckerStarted = true;
+
   const intervalMs = Number(process.env.ABONO_CHECKER_INTERVAL_MS) || (15 * 60 * 1000); // 15 min
   // Primera pasada (un toque después de levantar el server)
   setTimeout(() => runOnce().catch(() => {}), 5000);

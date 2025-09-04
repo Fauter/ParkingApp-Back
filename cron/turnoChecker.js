@@ -20,7 +20,16 @@ async function runOnce() {
 
     // 2) Determinar patentes con turnos activos (no expirados, no usados, fin > ahora)
     const ahora = new Date();
-    const patentesActivas = await Turno.distinct('patente', { expirado: false, usado: false, fin: { $gt: ahora } });
+    const patentesActivasRaw = await Turno.distinct('patente', {
+      expirado: false,
+      usado: false,
+      fin: { $gt: ahora }
+    });
+
+    // ⚠️ Crítico: forzar UPPER para alinear con normalización de Turno y posibles datos viejos en Vehiculo
+    const patentesActivas = (patentesActivasRaw || []).map(p =>
+      String(p || '').trim().toUpperCase()
+    ).filter(Boolean);
 
     // 3) Setear Vehiculo.turno=true para esas patentes (solo si está en false)
     if (patentesActivas.length > 0) {

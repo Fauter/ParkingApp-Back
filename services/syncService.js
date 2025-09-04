@@ -29,11 +29,10 @@ const status = {
 // =======================
 // WATERMARK / SYNC STATE
 // =======================
-// Guardamos por colección el último "updatedAt" (o createdAt) remoto aplicado localmente.
 const SyncStateSchema = new mongoose.Schema({
   collection: { type: String, unique: true, required: true },
-  lastUpdatedAt: { type: Date }, // último updatedAt visto
-  lastObjectId: { type: String }, // fallback cuando no hay updatedAt/createdAt
+  lastUpdatedAt: { type: Date },
+  lastObjectId: { type: String },
   meta: { type: mongoose.Schema.Types.Mixed },
 }, { collection: 'sync_state', timestamps: true });
 
@@ -153,6 +152,7 @@ async function connectRemote(atlasUri, dbName) {
 // =======================
 // ALIASES / CLAVES NATURALES / CASTEOS
 // =======================
+// Relaciones para castear refs
 const REF_BY_COLL = {
   vehiculos: ['cliente', 'abono'],
   abonos: ['cliente', 'vehiculo'],
@@ -161,6 +161,7 @@ const REF_BY_COLL = {
   cierresdecajas: ['operador'],
 };
 
+// Claves naturales para dedupe/merge
 const NATURAL_KEYS = {
   tickets: ['ticket'],
   users: ['username', 'email'],
@@ -173,10 +174,15 @@ const NATURAL_KEYS = {
   cierresdecajas: ['fecha', 'hora', 'operador'],
 };
 
+// Aliases REMOTOS (nombres que pueden existir en Atlas)
 const REMOTE_ALIASES = {
   cierresdecajas: ['cierresDeCaja', 'cierredecajas', 'cierresdecaja', 'cierredecaja'],
   movimientoclientes: ['movimientosClientes', 'movimientoClientes', 'movimientocliente'],
-  tipovehiculos: ['tiposvehiculo', 'tipoVehiculos', 'tiposVehiculo', 'tipoVehiculo'],
+  tipovehiculos: ['tiposvehiculo', 'tipoVehiculos', 'tiposVehiculo', 'tipoVehiculo', 'tipos-vehiculo', 'tipo-vehiculo'],
+  tarifas: ['tarifa'],
+  promos: ['promociones', 'promo'],
+  precios: ['precio'],
+  parametros: ['parametro', 'parametros_app', 'parámetros']
 };
 
 function getRemoteNames(colName) {
@@ -193,6 +199,26 @@ function canonicalizeName(name) {
     if (aliases.some(a => a.toLowerCase() === lower)) return canon;
   }
   return lower;
+}
+
+// Intenta mapear a una colección local ya existente (para coincidir con lo que usan los modelos)
+let _localCollectionsCache = null; // Set<string>
+async function getLocalCollectionsSet(db) {
+  if (_localCollectionsCache) return _localCollectionsCache;
+  const cols = await db.db.listCollections().toArray();
+  _localCollectionsCache = new Set(cols.map(c => c.name));
+  return _localCollectionsCache;
+}
+
+async function resolveLocalCollectionName(db, canonName) {
+  const aliases = getRemoteNames(canonName);
+  const set = await getLocalCollectionsSet(db);
+  // Preferimos una que ya exista localmente (la que estén usando los modelos)
+  for (const name of aliases) {
+    if (set.has(name)) return name;
+  }
+  // Si ninguna existe, usamos el canon
+  return canonName;
 }
 
 function buildNaturalKeyFilter(colName, src) {
@@ -298,7 +324,6 @@ async function upsertRemoteDoc(remoteDb, colName, rawDoc) {
         if (nk) {
           await collection.updateOne(nk, { ...(Object.keys($set).length ? { $set } : {}), $setOnInsert }, { upsert: true });
         } else {
-          // Insert "puro" mantiene fecha tal como viene
           await collection.insertOne({ _id: cleaned._id, ...$setOnInsert, ...$set });
         }
       }
@@ -306,7 +331,7 @@ async function upsertRemoteDoc(remoteDb, colName, rawDoc) {
       continue;
     }
 
-    // Resto de colecciones (comportamiento original)
+    // Resto de colecciones
     if (_id instanceof ObjectId) {
       await collection.updateOne({ _id }, { $set: rest }, { upsert: true });
     } else {
@@ -319,7 +344,7 @@ async function upsertRemoteDoc(remoteDb, colName, rawDoc) {
   return pushed;
 }
 
-// Casos compuestos (registrar abono) — lo mantenemos
+// Casos compuestos (registrar abono)
 async function ensureCompositeRegistrarAbonoSynced(remoteDb, item) {
   const body = item?.document || {};
 
@@ -388,7 +413,6 @@ async function processOutboxItem(remoteDb, item) {
       const collection = remoteDb.collection(name);
 
       if (String(colName).toLowerCase() === 'movimientos') {
-        // 🔒 No sobrescribir fecha si ya existiera: sólo on-insert
         const $set = removeNulls(deepClone(rest));
         const $setOnInsert = {};
         if (Object.prototype.hasOwnProperty.call($set, 'fecha')) delete $set.fecha;
@@ -433,7 +457,6 @@ async function processOutboxItem(remoteDb, item) {
       if (setBody[k] === null) { $unset[k] = ""; delete $set[k]; }
     });
 
-    // 🔒 Protección 'fecha' sólo en movimientos (no pisar en updates)
     if (String(colName).toLowerCase() === 'movimientos') {
       if (Object.prototype.hasOwnProperty.call($set, 'fecha')) delete $set.fecha;
       const creationDate = doc.fecha || doc.createdAt || new Date();
@@ -507,8 +530,7 @@ async function processOutboxItem(remoteDb, item) {
 }
 
 // =======================
-// PULL REMOTO → LOCAL  (INCREMENTAL con watermark)
-// *En modo MIRROR, forzamos FULL SCAN para esa colección*
+// PULL REMOTO → LOCAL
 // =======================
 function buildDedupKey(collName, doc) {
   const keys = NATURAL_KEYS[collName?.toLowerCase()] || [];
@@ -553,7 +575,6 @@ async function upsertLocalDocWithConflictResolution(localCollection, collName, r
 
   Object.assign(setOps, removeNulls(rest));
 
-  // 🔒 Protección 'fecha' sólo para movimientos
   const isMovs = String(collName).toLowerCase() === 'movimientos';
   if (isMovs) {
     if (Object.prototype.hasOwnProperty.call(setOps, 'fecha')) delete setOps.fecha;
@@ -650,7 +671,6 @@ async function detectTemporalField(remoteDb, collName) {
   const key = `${remoteDb.databaseName}#${collName}`;
   if (_hasTemporalFieldCache.has(key)) return _hasTemporalFieldCache.get(key);
 
-  // Inspecciono una muestra mínima
   let field = null;
   try {
     const c = remoteDb.collection(collName);
@@ -700,6 +720,7 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
   collections = (collections || [])
     .filter(c => c !== 'counters')
     .filter(c => !skipConfigured.has(String(c).toLowerCase()))
+      // si hubo un bulk delete de esa colección en este tick, no tirar pull incremental en A
     .filter(c => !skipCollectionsSet.has(c));
 
   if (!collections.length) return resultCounts;
@@ -711,7 +732,7 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
       const union = [];
       const seen = new Set();
 
-      // ⚠️ IMPORTANTE: si esta colección está en modo MIRROR, forzamos FULL SCAN (sin watermark)
+      // ⚠️ mirror estricto para las colecciones marcadas
       const isMirrorThisCollection = !!(mirrorAll || new Set(mirrorCollections || []).has(coll));
       const st = await getSyncState(coll);
       const temporalField = await detectTemporalField(remoteDb, remoteNames[0]); // con 1 alias alcanza
@@ -723,10 +744,9 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
           const sort = {};
 
           if (isMirrorThisCollection) {
-            // → FULL SCAN para espejo: garantizamos conjunto completo para comparar y borrar
-            sort._id = 1;
+            sort._id = 1; // FULL SCAN
           } else {
-            // → INCREMENTAL clásico con watermark
+            // INCREMENTAL
             if (temporalField) {
               if (st.lastUpdatedAt) filter[temporalField] = { $gt: st.lastUpdatedAt };
               sort[temporalField] = 1;
@@ -734,11 +754,10 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
               filter._id = { $gt: safeObjectId(st.lastObjectId) };
               sort._id = 1;
             } else {
-              sort._id = 1; // primera vez: full scan, pero no se borra nada en este paso (no-mirror)
+              sort._id = 1; // primera vez (equivale a full scan)
             }
           }
 
-          let fetched = 0;
           let lastDoc = null;
           const cursor = rc.find(filter).sort(sort);
           while (await cursor.hasNext()) {
@@ -754,10 +773,8 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
               union.push(d);
               lastDoc = d;
             }
-            fetched += batch.length;
           }
 
-          // Actualizo watermark tentativamente para esta alias (se consolida más abajo)
           if (lastDoc) {
             if (temporalField && lastDoc[temporalField] instanceof Date) {
               st._tmpMaxDate = st._tmpMaxDate && st._tmpMaxDate > lastDoc[temporalField]
@@ -768,27 +785,30 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
             }
           }
         } catch (e) {
-          // si la variante no existe, continúo
+          // si la variante no existe en remoto, continúo
         }
       }
 
       stats.remoteTotal = union.length;
 
-      const localCollection = local.collection(coll);
+      // === RESOLVER nombre local real donde escribir (alias-aware) ===
+      const localName = await resolveLocalCollectionName(local, coll);
+      const localCollection = local.collection(localName);
+
       for (const raw of union) {
         await upsertLocalDocWithConflictResolution(localCollection, coll, raw, stats, { mirrorArrays: isMirrorThisCollection });
         stats.upsertedOrUpdated++;
       }
 
-      // ✅ Guardar watermark consolidado (solo si hubo docs)
-      if (union.length) {
+      // ✅ Guardar watermark consolidado (solo si hubo docs y no es mirror FULL)
+      if (union.length && !isMirrorThisCollection) {
         const patch = {};
         if (st._tmpMaxDate) patch.lastUpdatedAt = st._tmpMaxDate;
         else if (st._tmpMaxId) patch.lastObjectId = st._tmpMaxId;
         if (Object.keys(patch).length) await saveSyncState(coll, patch);
       }
 
-      // ❗ Borrado local SOLO en modo espejo (y ahora sí con conjunto remoto COMPLETO)
+      // ❗ Borrado local SOLO en modo espejo, usando la colección local RESUELTA
       if (isMirrorThisCollection) {
         const remoteIds = new Set(union.map(d => String(d._id)));
         const localIdsDocs = await localCollection.find({}, { projection: { _id: 1 } }).toArray();
@@ -875,13 +895,13 @@ async function syncTick(atlasUri, opts = {}, statusCb = () => {}) {
     status.online = true;
     statusCb(status);
 
-    // === A) PULL REMOTO → LOCAL (incremental)
+    // === A) PULL REMOTO → LOCAL (incremental para todas menos espejo) ===
     const pullOptsA = {
       pullAll: !!opts.pullAll,
-      mirrorAll: false,             // nunca borro en A
+      mirrorAll: false,
       mirrorCollections: [],
       skipCollections: opts.skipCollections || [],
-      skipCollectionsSet: new Set(), // nada bloqueado aún
+      skipCollectionsSet: new Set(),
     };
     const collectionsEnvA = Array.isArray(opts.pullCollections) ? opts.pullCollections.filter(Boolean) : [];
     const reqA = pullOptsA.pullAll ? collectionsEnvA : collectionsEnvA;
@@ -889,7 +909,7 @@ async function syncTick(atlasUri, opts = {}, statusCb = () => {}) {
     status.lastPullCounts = pullCountsA;
     statusCb(status);
 
-    // === B) PROCESAR OUTBOX (local → remoto)
+    // === B) PROCESAR OUTBOX (local → remoto) ===
     const pending = await Outbox.find({ status: 'pending' }).sort({ createdAt: 1 }).limit(200);
     status.pendingOutbox = pending.length;
     statusCb(status);
@@ -954,8 +974,7 @@ async function syncTick(atlasUri, opts = {}, statusCb = () => {}) {
       }
     }
 
-    // === C) MINI-PULL FINAL SOLO ESPEJOS (FULL SCAN por colección espejo)
-    // FIX: si mirrorAll=true => pullAll=true para listar todas las colecciones a espejar
+    // === C) MINI-PULL FINAL SOLO ESPEJOS (FULL SCAN y espejo estricto) ===
     const pullOptsC = {
       pullAll: !!opts.mirrorAll,
       mirrorAll: !!opts.mirrorAll,
@@ -963,11 +982,9 @@ async function syncTick(atlasUri, opts = {}, statusCb = () => {}) {
       skipCollections: opts.skipCollections || [],
       skipCollectionsSet: bulkDeletedCollections,
     };
-    // Si pullAll=true, no hace falta pasar lista; listCollections() se usa adentro
     const reqC = pullOptsC.pullAll ? [] : (pullOptsC.mirrorCollections || []);
     const pullCountsC = await pullCollectionsFromRemote(remoteDb, reqC, pullOptsC);
 
-    // combinamos métricas (sin pisar)
     status.lastPullCounts = { ...status.lastPullCounts, ...pullCountsC };
     status.lastError = null;
     statusCb(status);
@@ -984,8 +1001,6 @@ async function syncTick(atlasUri, opts = {}, statusCb = () => {}) {
 }
 
 // =======================
-// START / HANDLE
-// =======================
 function startPeriodicSync(atlasUri, opts = {}, statusCb = () => {}) {
   const intervalMs = opts.intervalMs || 30_000;
   console.log('[syncService] iniciando sincronizador. Intervalo:', intervalMs, 'ms');
@@ -994,7 +1009,6 @@ function startPeriodicSync(atlasUri, opts = {}, statusCb = () => {}) {
     console.log(`[syncService] DB remota seleccionada: "${SELECTED_REMOTE_DBNAME}"`);
   }
 
-  // Primer tick inmediato (no bloqueante)
   syncTick(atlasUri, opts, statusCb).catch(e => console.error('[syncService] primer tick falló:', e));
 
   const handle = setInterval(() => syncTick(atlasUri, opts, statusCb), intervalMs);
