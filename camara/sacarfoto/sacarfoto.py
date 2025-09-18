@@ -1,48 +1,158 @@
+#!/usr/bin/env python3
 import cv2
 import os
 import sys
-sys.stdout.reconfigure(encoding='utf-8')
+import time
+import subprocess
+import shutil
+import re
+
+# UTF-8 en stdout (para Windows)
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 
 def cargar_rtsp():
     config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "config.txt"))
     if not os.path.exists(config_path):
-        print("❌ No se encontró el archivo config.txt.")
-        print("ERROR")
+        print("❌ No se encontró el archivo config.txt.", flush=True)
         return None
-    with open(config_path, "r") as f:
+    with open(config_path, "r", encoding="utf-8") as f:
         for line in f:
-            if line.startswith("RTSP_URL="):
+            if line.strip().startswith("RTSP_URL="):
                 return line.strip().split("=", 1)[1]
-    print("❌ No se encontró RTSP_URL en config.txt.")
-    print("ERROR")
+    print("❌ No se encontró RTSP_URL en config.txt.", flush=True)
     return None
 
-def sacar_foto(nombre_archivo="captura.jpg"):
-    rtsp_url = cargar_rtsp()
-    if not rtsp_url:
-        return
+def sanitize_rtsp(rtsp):
+    # Corrige duplicados tipo :554:554 (si existieran) y espacios
+    if not rtsp:
+        return rtsp
+    rtsp = rtsp.strip()
+    rtsp = rtsp.replace("::", ":")
+    rtsp = re.sub(r":554:554", ":554", rtsp)
+    return rtsp
 
-    cap = cv2.VideoCapture(rtsp_url)
-    if not cap.isOpened():
-        print("❌ No se pudo abrir la cámara.")
-        print("ERROR")
-        return
+def try_opencv_capture(rtsp_url, output_path, timeout=8):
+    backends = []
+    # probar CAP_FFMPEG y CAP_GSTREAMER si están disponibles
+    if hasattr(cv2, "CAP_FFMPEG"):
+        backends.append(cv2.CAP_FFMPEG)
+    if hasattr(cv2, "CAP_GSTREAMER"):
+        backends.append(cv2.CAP_GSTREAMER)
+    backends.append(None)  # fallback al backend por defecto
 
-    ret, frame = cap.read()
-    if not ret:
-        print("❌ Error al capturar la imagen.")
+    for backend in backends:
+        try:
+            if backend is not None:
+                cap = cv2.VideoCapture(rtsp_url, backend)
+            else:
+                cap = cv2.VideoCapture(rtsp_url)
+        except Exception as e:
+            # si falla la creación, intentamos siguiente backend
+            print(f"⚠️ Error abriendo VideoCapture con backend {backend}: {e}", flush=True)
+            continue
+
+        start = time.time()
+        # esperar a que se abra (timeout)
+        opened = False
+        while time.time() - start < timeout:
+            if cap.isOpened():
+                opened = True
+                break
+            time.sleep(0.3)
+
+        if not opened:
+            cap.release()
+            print(f"⚠️ Backend {backend} no pudo abrir stream (timeout).", flush=True)
+            continue
+
+        # Opciones para reducir buffering
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
+        # Intentar leer algunos frames
+        read_start = time.time()
+        got_frame = False
+        while time.time() - read_start < timeout:
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                try:
+                    cv2.imwrite(output_path, frame)
+                    cap.release()
+                    return True
+                except Exception as e:
+                    print(f"❌ Error guardando imagen: {e}", flush=True)
+                    cap.release()
+                    return False
+            time.sleep(0.25)
+
         cap.release()
-        print("ERROR")
-        return
+        print(f"⚠️ Backend {backend} abrió stream pero no devolvió frame.", flush=True)
 
-    output_path = os.path.abspath(os.path.join(os.path.dirname(__file__), nombre_archivo))
-    cv2.imwrite(output_path, frame)
-    print(f"✅ Foto guardada en {output_path}")
-    cap.release()
-    print("OK")
+    return False
+
+def try_ffmpeg_capture(rtsp_url, output_path, timeout=12):
+    ffmpeg_bin = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    if not ffmpeg_bin:
+        print("⚠️ ffmpeg no está disponible en PATH. No se puede usar fallback.", flush=True)
+        return False
+
+    cmd = [
+        ffmpeg_bin,
+        "-rtsp_transport", "tcp",
+        "-y",
+        "-i", rtsp_url,
+        "-frames:v", "1",
+        "-q:v", "2",
+        output_path
+    ]
+
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        if proc.returncode == 0 and os.path.exists(output_path):
+            return True
+        else:
+            print("⚠️ ffmpeg fallo:", proc.returncode, proc.stderr.decode(errors="ignore")[:200], flush=True)
+            return False
+    except Exception as e:
+        print("❌ Error ejecutando ffmpeg:", e, flush=True)
+        return False
+
+def main():
+    filename = "captura.jpg"
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        filename = "capturaTest.jpg"
+
+    output_path = os.path.abspath(os.path.join(os.path.dirname(__file__), filename))
+
+    rtsp = cargar_rtsp()
+    if not rtsp:
+        print("ERROR", flush=True)
+        sys.exit(1)
+
+    rtsp = sanitize_rtsp(rtsp)
+
+    # Intento con OpenCV (varios backends)
+    print(f"🔍 Intentando capturar desde: {rtsp}", flush=True)
+    ok = try_opencv_capture(rtsp, output_path, timeout=8)
+
+    # Fallback a ffmpeg si OpenCV falla
+    if not ok:
+        print("🔁 Fallback a ffmpeg...", flush=True)
+        ok = try_ffmpeg_capture(rtsp, output_path, timeout=12)
+
+    if ok and os.path.exists(output_path):
+        print(f"✅ Foto guardada en {output_path}", flush=True)
+        print("OK", flush=True)
+        sys.exit(0)
+    else:
+        print("❌ No se pudo capturar la imagen.", flush=True)
+        print("ERROR", flush=True)
+        sys.exit(1)
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "test":
-        sacar_foto("capturaTest.jpg")
-    else:
-        sacar_foto("captura.jpg")
+    main()

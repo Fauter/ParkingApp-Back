@@ -141,6 +141,19 @@ app.use('/camara/sacarfoto', express.static(sacarfotoDir, {
   }
 }));
 
+/* =======================================================
+   LOGS PRECIOS (diagnóstico)
+   — Ubicado tras definir uploads y antes de montar rutas
+   — Consolidados para activar/desactivar fácil
+========================================================== */
+console.log('========== LOGS PRECIOS ==========');
+console.log(`[precios] PRECIOS_REMOTE_URL=${process.env.PRECIOS_REMOTE_URL || 'https://api.garageia.com/api/precios'}`);
+console.log(`[precios] PRECIOS_CACHE_FILE=${process.env.PRECIOS_CACHE_FILE || '(default under uploads/cache/precios.json)'}`);
+if (String(process.env.PRECIOS_DEBUG || '').trim() === '1') {
+  console.log('[precios] DEBUG habilitado (PRECIOS_DEBUG=1)');
+}
+console.log('==================================');
+
 // Health/status liviano del server (no del sync)
 let syncStatus = { lastRun: null, lastError: null, online: false, pendingOutbox: 0, lastPullCounts: {} };
 

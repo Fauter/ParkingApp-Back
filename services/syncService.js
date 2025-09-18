@@ -2,6 +2,8 @@
 const mongoose = require('mongoose');
 const { MongoClient, ObjectId } = require('mongodb');
 const dns = require('dns');
+const fs = require('fs');
+const path = require('path');
 
 // =======================
 // MODELOS LOCALES
@@ -27,6 +29,118 @@ const status = {
 };
 
 // =======================
+// CONFIG PRECIOS (HTTP+cache)
+// =======================
+const PRECIOS_REMOTE_URL = process.env.PRECIOS_REMOTE_URL || 'https://api.garageia.com/api/precios';
+const PRECIOS_CACHE_FILE =
+  process.env.PRECIOS_CACHE_FILE ||
+  path.join(process.cwd(), 'uploads', 'cache', 'precios.json');
+const PRECIOS_FETCH_TIMEOUT_MS = Number(process.env.PRECIOS_FETCH_TIMEOUT_MS || 5000);
+const PRECIOS_DEBUG = String(process.env.PRECIOS_DEBUG || '').trim() === '1';
+
+function logPrecios(...args) { if (PRECIOS_DEBUG) console.log('[precios]', ...args); }
+
+// fetch (compat Node 16/18)
+let _fetch = global.fetch;
+async function ensureFetch() {
+  if (_fetch) return _fetch;
+  const mod = await import('node-fetch');
+  _fetch = mod.default || mod;
+  return _fetch;
+}
+async function fetchJsonWithTimeout(url, ms = 5000) {
+  const f = await ensureFetch();
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), ms);
+  try {
+    const res = await f(url, { signal: controller.signal, headers: { Accept: 'application/json' } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } finally {
+    clearTimeout(t);
+  }
+}
+function ensureDirForFile(filePath) {
+  try {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    console.warn('[precios] no pude crear carpeta cache:', e.message);
+  }
+}
+function readPreciosCache() {
+  try {
+    if (!fs.existsSync(PRECIOS_CACHE_FILE)) return {};
+    const txt = fs.readFileSync(PRECIOS_CACHE_FILE, 'utf8');
+    return JSON.parse(txt || '{}');
+  } catch {
+    return {};
+  }
+}
+function writePreciosCache(obj) {
+  ensureDirForFile(PRECIOS_CACHE_FILE);
+  fs.writeFileSync(PRECIOS_CACHE_FILE, JSON.stringify(obj ?? {}, null, 2), 'utf8');
+}
+function fixInnerKey(k) {
+  const base = String(k || '').toLowerCase().trim();
+  if (base === 'media estadia') return 'media estadía';
+  if (base === 'dia') return 'día';
+  if (base === 'dias') return 'días';
+  if (base === '1 hora') return 'hora';
+  return base;
+}
+function normalizePreciosObject(obj) {
+  if (!obj || typeof obj !== 'object') return {};
+  const out = {};
+  for (const tipoRaw of Object.keys(obj)) {
+    const tabla = obj[tipoRaw] || {};
+    const fixed = {};
+    for (const k of Object.keys(tabla || {})) fixed[fixInnerKey(k)] = tabla[k];
+    out[String(tipoRaw || '').toLowerCase().trim()] = fixed;
+  }
+  return out;
+}
+// _id determinístico para mirror estricto
+function oidFromStringStable(s) {
+  try {
+    const crypto = require('crypto');
+    const hex = crypto.createHash('md5').update(String(s || '')).digest('hex').slice(0, 24);
+    return hex;
+  } catch {
+    return new ObjectId();
+  }
+}
+async function buildPreciosDocsFromObject(mapObj) {
+  const normalized = normalizePreciosObject(mapObj);
+  const docs = [];
+  for (const tipo of Object.keys(normalized)) {
+    docs.push({
+      _id: oidFromStringStable('precios:' + tipo),
+      tipo,
+      tabla: normalized[tipo],
+      updatedAt: new Date()
+    });
+  }
+  return docs;
+}
+async function fetchPreciosDocs() {
+  try {
+    const payload = await fetchJsonWithTimeout(PRECIOS_REMOTE_URL, PRECIOS_FETCH_TIMEOUT_MS);
+    const data = (payload && typeof payload === 'object' && payload.data && typeof payload.data === 'object')
+      ? payload.data : payload;
+    const docs = await buildPreciosDocsFromObject(data || {});
+    writePreciosCache(normalizePreciosObject(data || {}));
+    logPrecios('remote-ok', { url: PRECIOS_REMOTE_URL, tipos: docs.map(d => d.tipo) });
+    return { docs, source: 'remote', allowMirrorDelete: true };
+  } catch (e) {
+    const cached = readPreciosCache();
+    const docs = await buildPreciosDocsFromObject(cached || {});
+    logPrecios('remote-fail -> cache', { error: String(e && e.message || e), tipos: docs.map(d => d.tipo) });
+    return { docs, source: 'cache', allowMirrorDelete: false };
+  }
+}
+
+// =======================
 // WATERMARK / SYNC STATE
 // =======================
 const SyncStateSchema = new mongoose.Schema({
@@ -48,9 +162,7 @@ let SELECTED_REMOTE_DBNAME = null;
 // =======================
 // UTILS BÁSICOS
 // =======================
-function is24Hex(s) {
-  return typeof s === 'string' && /^[a-fA-F0-9]{24}$/.test(s);
-}
+function is24Hex(s) { return typeof s === 'string' && /^[a-fA-F0-9]{24}$/.test(s); }
 
 function bytesFromAny(x) {
   try {
@@ -126,9 +238,7 @@ function removeNulls(obj) {
 }
 
 async function hasInternet() {
-  return new Promise(resolve => {
-    dns.lookup('google.com', err => resolve(!err));
-  });
+  return new Promise(resolve => { dns.lookup('google.com', err => resolve(!err)); });
 }
 
 function getRemoteDbInstance() {
@@ -152,7 +262,6 @@ async function connectRemote(atlasUri, dbName) {
 // =======================
 // ALIASES / CLAVES NATURALES / CASTEOS
 // =======================
-// Relaciones para castear refs
 const REF_BY_COLL = {
   vehiculos: ['cliente', 'abono'],
   abonos: ['cliente', 'vehiculo'],
@@ -160,8 +269,6 @@ const REF_BY_COLL = {
   movimientoclientes: ['cliente', 'vehiculo', 'abono'],
   cierresdecajas: ['operador'],
 };
-
-// Claves naturales para dedupe/merge
 const NATURAL_KEYS = {
   tickets: ['ticket'],
   users: ['username', 'email'],
@@ -172,17 +279,16 @@ const NATURAL_KEYS = {
   promos: ['codigo'],
   alertas: ['codigo'],
   cierresdecajas: ['fecha', 'hora', 'operador'],
+  precios: ['tipo'],
 };
-
-// Aliases REMOTOS (nombres que pueden existir en Atlas)
 const REMOTE_ALIASES = {
-  cierresdecajas: ['cierresDeCaja', 'cierredecajas', 'cierresdecaja', 'cierredecaja'],
-  movimientoclientes: ['movimientosClientes', 'movimientoClientes', 'movimientocliente'],
-  tipovehiculos: ['tiposvehiculo', 'tipoVehiculos', 'tiposVehiculo', 'tipoVehiculo', 'tipos-vehiculo', 'tipo-vehiculo'],
+  cierresdecajas: ['cierresDeCaja','cierredecajas','cierresdecaja','cierredecaja'],
+  movimientoclientes: ['movimientosClientes','movimientoClientes','movimientocliente'],
+  tipovehiculos: ['tiposvehiculo','tipoVehiculos','tiposVehiculo','tipoVehiculo','tipos-vehiculo','tipo-vehiculo'],
   tarifas: ['tarifa'],
-  promos: ['promociones', 'promo'],
+  promos: ['promociones','promo'],
   precios: ['precio'],
-  parametros: ['parametro', 'parametros_app', 'parámetros']
+  parametros: ['parametro','parametros_app','parámetros']
 };
 
 function getRemoteNames(colName) {
@@ -191,7 +297,6 @@ function getRemoteNames(colName) {
   const all = [canon, ...aliases].filter(Boolean);
   return all.filter((v, i) => all.indexOf(v) === i);
 }
-
 function canonicalizeName(name) {
   const lower = String(name || '').toLowerCase();
   for (const [canon, aliases] of Object.entries(REMOTE_ALIASES)) {
@@ -201,26 +306,22 @@ function canonicalizeName(name) {
   return lower;
 }
 
-// Intenta mapear a una colección local ya existente (para coincidir con lo que usan los modelos)
-let _localCollectionsCache = null; // Set<string>
+// Intenta mapear a una colección local ya existente
+let _localCollectionsCache = null;
 async function getLocalCollectionsSet(db) {
   if (_localCollectionsCache) return _localCollectionsCache;
   const cols = await db.db.listCollections().toArray();
   _localCollectionsCache = new Set(cols.map(c => c.name));
   return _localCollectionsCache;
 }
-
 async function resolveLocalCollectionName(db, canonName) {
   const aliases = getRemoteNames(canonName);
   const set = await getLocalCollectionsSet(db);
-  // Preferimos una que ya exista localmente (la que estén usando los modelos)
   for (const name of aliases) {
     if (set.has(name)) return name;
   }
-  // Si ninguna existe, usamos el canon
   return canonName;
 }
-
 function buildNaturalKeyFilter(colName, src) {
   const keys = NATURAL_KEYS[colName?.toLowerCase()] || [];
   const filter = {};
@@ -231,7 +332,6 @@ function buildNaturalKeyFilter(colName, src) {
   }
   return Object.keys(filter).length ? filter : null;
 }
-
 function coerceRefIds(doc, colName) {
   if (!doc || typeof doc !== 'object') return doc;
   const fields = REF_BY_COLL[colName?.toLowerCase()] || [];
@@ -243,7 +343,6 @@ function coerceRefIds(doc, colName) {
   }
   return doc;
 }
-
 function normalizeIds(inputDoc, colName) {
   const clone = deepClone(inputDoc || {});
   if (clone._id != null) clone._id = safeObjectId(clone._id);
@@ -255,14 +354,12 @@ function normalizeIds(inputDoc, colName) {
       else clone[k] = safeObjectId(clone[k]);
     }
   }
-
   const maybeIdArrays = ['abonos','vehiculos','movimientos'];
   for (const k of maybeIdArrays) {
     if (Array.isArray(clone[k])) clone[k] = clone[k].map(safeObjectId);
   }
   return removeNulls(clone);
 }
-
 function getCollectionNameFromItem(item) {
   if (!item) return null;
   if (item.collection) return item.collection;
@@ -276,7 +373,6 @@ function getCollectionNameFromItem(item) {
   }
   return null;
 }
-
 function extractIdFromItem(item) {
   if (!item) return null;
   if (item.document && (item.document._id || item.document.id)) return item.document._id || item.document.id;
@@ -288,7 +384,6 @@ function extractIdFromItem(item) {
   }
   return null;
 }
-
 function looksLikeValidDocument(obj) {
   return !!(obj && typeof obj === 'object' && !Array.isArray(obj));
 }
@@ -309,7 +404,7 @@ async function upsertRemoteDoc(remoteDb, colName, rawDoc) {
   for (const name of names) {
     const collection = remoteDb.collection(name);
 
-    // 🔒 Protección de 'fecha' sólo para movimientos
+    // 🔒 Protección fecha movimientos
     if (String(colName).toLowerCase() === 'movimientos') {
       const $set = removeNulls(deepClone(rest));
       const $setOnInsert = {};
@@ -331,7 +426,6 @@ async function upsertRemoteDoc(remoteDb, colName, rawDoc) {
       continue;
     }
 
-    // Resto de colecciones
     if (_id instanceof ObjectId) {
       await collection.updateOne({ _id }, { $set: rest }, { upsert: true });
     } else {
@@ -660,13 +754,12 @@ async function upsertLocalDocWithConflictResolution(localCollection, collName, r
         : (isMovs ? { $setOnInsert: { fecha: new Date() } } : { $set: {} }),
       { upsert: true }
     );
-    if (stats) stats.conflictsResolved = (stats.conflictsResolved || 0) + 1;
     return true;
   }
 }
 
 // === Detección de campo temporal para incremental ===
-const _hasTemporalFieldCache = new Map(); // key: dbName#coll -> 'updatedAt'|'createdAt'|null
+const _hasTemporalFieldCache = new Map();
 async function detectTemporalField(remoteDb, collName) {
   const key = `${remoteDb.databaseName}#${collName}`;
   if (_hasTemporalFieldCache.has(key)) return _hasTemporalFieldCache.get(key);
@@ -688,7 +781,6 @@ async function getSyncState(collName) {
   if (!st) st = await SyncState.create({ collection: canon });
   return st;
 }
-
 async function saveSyncState(collName, patch) {
   const canon = canonicalizeName(collName);
   await SyncState.updateOne({ collection: canon }, { $set: patch }, { upsert: true });
@@ -720,22 +812,80 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
   collections = (collections || [])
     .filter(c => c !== 'counters')
     .filter(c => !skipConfigured.has(String(c).toLowerCase()))
-      // si hubo un bulk delete de esa colección en este tick, no tirar pull incremental en A
     .filter(c => !skipCollectionsSet.has(c));
 
   if (!collections.length) return resultCounts;
 
   for (const coll of collections) {
+    const canonName = canonicalizeName(coll);
     const stats = { remoteTotal: 0, upsertedOrUpdated: 0, deletedLocal: 0, conflictsResolved: 0 };
+
+    // ============================
+    // COLECCIÓN ESPECIAL: PRECIOS
+    // ============================
+    if (canonName === 'precios') {
+      try {
+        const isMirrorThisCollection = !!(mirrorAll || new Set(mirrorCollections || []).has('precios'));
+        const { docs, source, allowMirrorDelete } = await fetchPreciosDocs();
+
+        stats.remoteTotal = docs.length;
+
+        const localName = await resolveLocalCollectionName(mongoose.connection, 'precios');
+        const localCollection = mongoose.connection.collection(localName);
+
+        for (const d of docs) {
+          await upsertLocalDocWithConflictResolution(localCollection, 'precios', d, stats, { mirrorArrays: false });
+          stats.upsertedOrUpdated++;
+        }
+
+        if (isMirrorThisCollection) {
+          if (allowMirrorDelete) {
+            const remoteIds = new Set(docs.map(d => String(d._id)));
+            const localIdsDocs = await localCollection.find({}, { projection: { _id: 1 } }).toArray();
+            const toDeleteObjIds = [];
+            for (const ld of localIdsDocs) {
+              const idRaw = ld._id; const idStr = String(idRaw);
+              if (!remoteIds.has(idStr)) {
+                if (idRaw instanceof ObjectId) toDeleteObjIds.push(idRaw);
+                else if (typeof idRaw === 'string' && is24Hex(idRaw)) toDeleteObjIds.push(new ObjectId(idRaw));
+                else {
+                  const delOne = await localCollection.deleteOne({ _id: idRaw });
+                  if (delOne?.deletedCount) stats.deletedLocal += delOne.deletedCount;
+                }
+              }
+            }
+            if (toDeleteObjIds.length) {
+              const { deletedCount } = await localCollection.deleteMany({ _id: { $in: toDeleteObjIds } });
+              stats.deletedLocal += deletedCount || 0;
+            }
+          } else {
+            console.log('[syncService] precios: mirror FULL saltado (fuente=cache).');
+          }
+        }
+
+        resultCounts['precios'] = stats;
+        const mirrorFlag = isMirrorThisCollection ? '[mirror:FULL/http]' : '[http]';
+        console.log(
+          `[syncService] pulled precios (fuente=${source}) (db="${remoteDb.databaseName}"): ` +
+          `remote=${stats.remoteTotal}, upserted=${stats.upsertedOrUpdated}, deletedLocal=${stats.deletedLocal} ${mirrorFlag}`
+        );
+      } catch (err) {
+        console.warn('[syncService] no se pudo pull precios:', err.message || err);
+      }
+      continue; // siguiente coll
+    }
+
+    // ============================
+    // RESTO DE COLECCIONES (Atlas)
+    // ============================
     try {
-      const remoteNames = getRemoteNames(coll);
+      const remoteNames = getRemoteNames(canonName);
       const union = [];
       const seen = new Set();
 
-      // ⚠️ mirror estricto para las colecciones marcadas
-      const isMirrorThisCollection = !!(mirrorAll || new Set(mirrorCollections || []).has(coll));
-      const st = await getSyncState(coll);
-      const temporalField = await detectTemporalField(remoteDb, remoteNames[0]); // con 1 alias alcanza
+      const isMirrorThisCollection = !!(mirrorAll || new Set(mirrorCollections || []).has(canonName));
+      const st = await getSyncState(canonName);
+      const temporalField = await detectTemporalField(remoteDb, remoteNames[0]);
 
       for (const name of remoteNames) {
         try {
@@ -746,7 +896,6 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
           if (isMirrorThisCollection) {
             sort._id = 1; // FULL SCAN
           } else {
-            // INCREMENTAL
             if (temporalField) {
               if (st.lastUpdatedAt) filter[temporalField] = { $gt: st.lastUpdatedAt };
               sort[temporalField] = 1;
@@ -754,7 +903,7 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
               filter._id = { $gt: safeObjectId(st.lastObjectId) };
               sort._id = 1;
             } else {
-              sort._id = 1; // primera vez (equivale a full scan)
+              sort._id = 1;
             }
           }
 
@@ -767,7 +916,7 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
               batch.push(d);
             }
             for (const d of batch) {
-              const key = buildDedupKey(coll, d) + '##' + String(d._id);
+              const key = buildDedupKey(canonName, d) + '##' + String(d._id);
               if (seen.has(key)) continue;
               seen.add(key);
               union.push(d);
@@ -785,30 +934,27 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
             }
           }
         } catch (e) {
-          // si la variante no existe en remoto, continúo
+          // alias faltante -> ignoro
         }
       }
 
       stats.remoteTotal = union.length;
 
-      // === RESOLVER nombre local real donde escribir (alias-aware) ===
-      const localName = await resolveLocalCollectionName(local, coll);
-      const localCollection = local.collection(localName);
+      const localName = await resolveLocalCollectionName(mongoose.connection, canonName);
+      const localCollection = mongoose.connection.collection(localName);
 
       for (const raw of union) {
-        await upsertLocalDocWithConflictResolution(localCollection, coll, raw, stats, { mirrorArrays: isMirrorThisCollection });
+        await upsertLocalDocWithConflictResolution(localCollection, canonName, raw, stats, { mirrorArrays: isMirrorThisCollection });
         stats.upsertedOrUpdated++;
       }
 
-      // ✅ Guardar watermark consolidado (solo si hubo docs y no es mirror FULL)
       if (union.length && !isMirrorThisCollection) {
         const patch = {};
         if (st._tmpMaxDate) patch.lastUpdatedAt = st._tmpMaxDate;
         else if (st._tmpMaxId) patch.lastObjectId = st._tmpMaxId;
-        if (Object.keys(patch).length) await saveSyncState(coll, patch);
+        if (Object.keys(patch).length) await saveSyncState(canonName, patch);
       }
 
-      // ❗ Borrado local SOLO en modo espejo, usando la colección local RESUELTA
       if (isMirrorThisCollection) {
         const remoteIds = new Set(union.map(d => String(d._id)));
         const localIdsDocs = await localCollection.find({}, { projection: { _id: 1 } }).toArray();
@@ -832,16 +978,16 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
         }
       }
 
-      resultCounts[coll] = stats;
+      resultCounts[canonName] = stats;
       const aliasNote = remoteNames.length > 1 ? ` (aliases: ${remoteNames.join(', ')})` : '';
       const mirrorFlag = isMirrorThisCollection ? '[mirror:FULL]' : '';
       console.log(
-        `[syncService] pulled ${coll}${aliasNote} (db="${remoteDb.databaseName}"): ` +
+        `[syncService] pulled ${canonName}${aliasNote} (db="${remoteDb.databaseName}"): ` +
         `remote=${stats.remoteTotal}, upserted=${stats.upsertedOrUpdated}, deletedLocal=${stats.deletedLocal}` +
         `${stats.conflictsResolved ? `, conflictsResolved=${stats.conflictsResolved}` : ''} ${mirrorFlag}`
       );
     } catch (err) {
-      console.warn(`[syncService] no se pudo pull ${coll}:`, err.message || err);
+      console.warn(`[syncService] no se pudo pull ${canonName}:`, err.message || err);
     }
   }
 
@@ -856,6 +1002,52 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
   }
 
   return resultCounts;
+}
+
+// =======================
+// PRECIOS LOCAL-ONLY (HTTP) — SIEMPRE, AÚN SIN ATLAS
+// =======================
+async function syncPreciosLocalOnly({ mirrorAll = false, mirrorCollections = [] } = {}) {
+  try {
+    const { docs, source, allowMirrorDelete } = await fetchPreciosDocs();
+    const localName = await resolveLocalCollectionName(mongoose.connection, 'precios');
+    const localCollection = mongoose.connection.collection(localName);
+    let upserted = 0, deleted = 0;
+
+    for (const d of docs) {
+      await upsertLocalDocWithConflictResolution(localCollection, 'precios', d, null, { mirrorArrays: false });
+      upserted++;
+    }
+
+    const isMirrorThisCollection = !!(mirrorAll || new Set(mirrorCollections || []).has('precios'));
+    if (isMirrorThisCollection && allowMirrorDelete) {
+      const remoteIds = new Set(docs.map(d => String(d._id)));
+      const localIdsDocs = await localCollection.find({}, { projection: { _id: 1 } }).toArray();
+      const toDeleteObjIds = [];
+      for (const ld of localIdsDocs) {
+        const idRaw = ld._id; const idStr = String(idRaw);
+        if (!remoteIds.has(idStr)) {
+          if (idRaw instanceof ObjectId) toDeleteObjIds.push(idRaw);
+          else if (typeof idRaw === 'string' && is24Hex(idRaw)) toDeleteObjIds.push(new ObjectId(idRaw));
+          else {
+            const delOne = await localCollection.deleteOne({ _id: idRaw });
+            if (delOne?.deletedCount) deleted += delOne.deletedCount;
+          }
+        }
+      }
+      if (toDeleteObjIds.length) {
+        const { deletedCount } = await localCollection.deleteMany({ _id: { $in: toDeleteObjIds } });
+        deleted += deletedCount || 0;
+      }
+    } else if (isMirrorThisCollection && !allowMirrorDelete) {
+      console.log('[syncService] precios: espejo estricto saltado para borrado (fuente=cache).');
+    }
+
+    status.lastPullCounts = { ...status.lastPullCounts, precios: { remoteTotal: docs.length, upsertedOrUpdated: upserted, deletedLocal: deleted } };
+    console.log(`[syncService] precios local-only (${source}) -> upserted=${upserted}, deleted=${deleted}`);
+  } catch (e) {
+    console.warn('[syncService] precios local-only falló:', e.message || e);
+  }
 }
 
 // =======================
@@ -879,6 +1071,9 @@ async function syncTick(atlasUri, opts = {}, statusCb = () => {}) {
       return;
     }
 
+    // === precios: sync local-only regardless of Atlas ===
+    await syncPreciosLocalOnly({ mirrorAll: !!opts.mirrorAll, mirrorCollections: opts.mirrorCollections || [] });
+
     let remoteDb = null;
     try {
       SELECTED_REMOTE_DBNAME = opts.remoteDbName || SELECTED_REMOTE_DBNAME || null;
@@ -889,13 +1084,13 @@ async function syncTick(atlasUri, opts = {}, statusCb = () => {}) {
       status.lastError = `No se pudo conectar a Atlas: ${err.message || err}`;
       statusCb(status);
       console.warn('[syncService] Sin conexión a Atlas. Saltando sync:', err.message || err);
-      return;
+      return; // ojo: ya actualizamos precios localmente arriba
     }
 
     status.online = true;
     statusCb(status);
 
-    // === A) PULL REMOTO → LOCAL (incremental para todas menos espejo) ===
+    // === A) PULL REMOTO → LOCAL (incremental para todas menos espejo)
     const pullOptsA = {
       pullAll: !!opts.pullAll,
       mirrorAll: false,
@@ -909,7 +1104,7 @@ async function syncTick(atlasUri, opts = {}, statusCb = () => {}) {
     status.lastPullCounts = pullCountsA;
     statusCb(status);
 
-    // === B) PROCESAR OUTBOX (local → remoto) ===
+    // === B) OUTBOX local → remoto
     const pending = await Outbox.find({ status: 'pending' }).sort({ createdAt: 1 }).limit(200);
     status.pendingOutbox = pending.length;
     statusCb(status);
@@ -974,7 +1169,7 @@ async function syncTick(atlasUri, opts = {}, statusCb = () => {}) {
       }
     }
 
-    // === C) MINI-PULL FINAL SOLO ESPEJOS (FULL SCAN y espejo estricto) ===
+    // === C) MINI-PULL FINAL SOLO ESPEJOS
     const pullOptsC = {
       pullAll: !!opts.mirrorAll,
       mirrorAll: !!opts.mirrorAll,
