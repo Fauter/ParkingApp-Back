@@ -1,1 +1,6 @@
-RTSP_URL=rtsp://admin:admin@192.168.100.54:554/streaming/channels/1
+RTSP_URL=rtsp://sahb:54e3rx@192.168.100.54:554/streaming/channels/1
+RTSP_USER=sahb
+RTSP_PASS=54e3rx
+HOST=192.168.100.54
+PORT=554
+PATH=/streaming/channels/1

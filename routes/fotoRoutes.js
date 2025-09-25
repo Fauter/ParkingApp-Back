@@ -1,7 +1,18 @@
+// routes/fotoRoutes.js
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
+
 const router = express.Router();
+
+/**
+ * Usamos la MISMA base que server.js:
+ *  - UPLOADS_BASE || <back-end>/uploads
+ */
+const uploadsBase = process.env.UPLOADS_BASE || path.join(__dirname, '..', 'uploads');
+const uploadsDir = path.resolve(uploadsBase);
+const fotosDir = path.join(uploadsDir, 'fotos');
+const entradasDir = path.join(fotosDir, 'entradas');
 
 // Helper interno para borrar un archivo de forma segura
 async function deleteFileSafe(filePath) {
@@ -18,10 +29,23 @@ async function deleteFileSafe(filePath) {
   }
 }
 
-// Ruta para servir fotos de entradas
+// Diagnóstico opcional
+router.get('/where', (req, res) => {
+  res.json({
+    uploadsDir,
+    fotosDir,
+    entradasDir,
+    existsUploads: fs.existsSync(uploadsDir),
+    existsEntradas: fs.existsSync(entradasDir)
+  });
+});
+
+// Ruta para servir fotos de entradas (API explícita)
+// NOTA: esto sirve el MISMO archivo que se sirve por estático /uploads/fotos/entradas/...
 router.get('/entradas/:nombreFoto', (req, res) => {
   try {
-    const fotoPath = path.join(__dirname, '../uploads/fotos/entradas', req.params.nombreFoto);
+    const nombre = path.basename(req.params.nombreFoto);
+    const fotoPath = path.join(entradasDir, nombre);
 
     if (!fs.existsSync(fotoPath)) {
       return res.status(404).send('Foto no encontrada');
@@ -37,7 +61,8 @@ router.get('/entradas/:nombreFoto', (req, res) => {
 
 // Ruta para borrar fotos de entradas
 router.delete('/entradas/:nombreFoto', async (req, res) => {
-  const fotoPath = path.join(__dirname, '../uploads/fotos/entradas', req.params.nombreFoto);
+  const nombre = path.basename(req.params.nombreFoto);
+  const fotoPath = path.join(entradasDir, nombre);
   try {
     await deleteFileSafe(fotoPath);
     res.status(200).send('Foto eliminada');

@@ -1105,67 +1105,73 @@ async function syncTick(atlasUri, opts = {}, statusCb = () => {}) {
     statusCb(status);
 
     // === B) OUTBOX local → remoto
-    const pending = await Outbox.find({ status: 'pending' }).sort({ createdAt: 1 }).limit(200);
-    status.pendingOutbox = pending.length;
-    statusCb(status);
-
     const bulkDeletedCollections = new Set();
 
-    for (const item of pending) {
-      const preColName = getCollectionNameFromItem(item);
-      const preIsDelete = item.method === 'DELETE';
-      const preHasId = !!extractIdFromItem(item);
-      const preIsBulk = preIsDelete && (
-        (item.query && (item.query.__bulk === true || item.query.__bulk === 'true')) ||
-        (item.query && (item.query.all === true || item.query.all === 'true')) ||
-        item.bulk === true || item.bulk === 'true'
-      );
-      const shouldSkipPullThisTick = preIsDelete && !preHasId && preIsBulk && !!preColName;
+    if (process.env.SYNC_DISABLE_PUSH === '1') {
+      console.log('[syncService] push deshabilitado por env');
+      status.pendingOutbox = 0;
+      statusCb(status);
+    } else {
+      const pending = await Outbox.find({ status: 'pending' }).sort({ createdAt: 1 }).limit(200);
+      status.pendingOutbox = pending.length;
+      statusCb(status);
 
-      try {
-        await Outbox.updateOne({ _id: item._id }, { status: 'processing' });
-
-        if (!preColName && !/\/api\/abonos\/registrar-abono/i.test(item?.route || '')) {
-          await Outbox.updateOne({ _id: item._id }, { status: 'error', error: 'invalid_collection', retries: 6 });
-          continue;
-        }
-
-        if (['POST','PUT','PATCH'].includes(item.method) && !looksLikeValidDocument(item.document) && !/\/api\/abonos\/registrar-abono/i.test(item?.route || '')) {
-          await Outbox.updateOne({ _id: item._id }, { status: 'error', error: 'invalid_document', retries: 6 });
-          continue;
-        }
-
-        await processOutboxItem(remoteDb, item);
-        await Outbox.updateOne({ _id: item._id }, { status: 'synced', syncedAt: new Date(), error: null });
-      } catch (err) {
-        const errMsg = String(err?.message || err).slice(0, 1000);
-        const retries = (item.retries || 0) + 1;
-
-        const nonRetriableCodes = [
-          'invalid_collection',
-          'invalid_document',
-          'sin id en outbox',
-          'duplicate key',
-          11000,
-          'bulk_delete_not_allowed',
-          'bulk_delete_requires_filter',
-          'DELETE sin id ni bulk flag',
-          'composite_registrar_abono: no se encontraron docs locales para sincronizar'
-        ];
-        const isNonRetriable = nonRetriableCodes.some(code =>
-          (typeof code === 'string' && errMsg.includes(code)) ||
-          (typeof code === 'number' && err && err.code === code)
+      for (const item of pending) {
+        const preColName = getCollectionNameFromItem(item);
+        const preIsDelete = item.method === 'DELETE';
+        const preHasId = !!extractIdFromItem(item);
+        const preIsBulk = preIsDelete && (
+          (item.query && (item.query.__bulk === true || item.query.__bulk === 'true')) ||
+          (item.query && (item.query.all === true || item.query.all === 'true')) ||
+          item.bulk === true || item.bulk === 'true'
         );
+        const shouldSkipPullThisTick = preIsDelete && !preHasId && preIsBulk && !!preColName;
 
-        const update = {
-          error: errMsg,
-          retries,
-          status: isNonRetriable || retries >= 6 ? 'error' : 'pending'
-        };
-        await Outbox.updateOne({ _id: item._id }, update);
-        console.error('[syncService] error procesando outbox item', item._id, errMsg);
-      } finally {
-        if (shouldSkipPullThisTick && preColName) bulkDeletedCollections.add(canonicalizeName(preColName));
+        try {
+          await Outbox.updateOne({ _id: item._id }, { status: 'processing' });
+
+          if (!preColName && !/\/api\/abonos\/registrar-abono/i.test(item?.route || '')) {
+            await Outbox.updateOne({ _id: item._id }, { status: 'error', error: 'invalid_collection', retries: 6 });
+            continue;
+          }
+
+          if (['POST','PUT','PATCH'].includes(item.method) && !looksLikeValidDocument(item.document) && !/\/api\/abonos\/registrar-abono/i.test(item?.route || '')) {
+            await Outbox.updateOne({ _id: item._id }, { status: 'error', error: 'invalid_document', retries: 6 });
+            continue;
+          }
+
+          await processOutboxItem(remoteDb, item);
+          await Outbox.updateOne({ _id: item._id }, { status: 'synced', syncedAt: new Date(), error: null });
+        } catch (err) {
+          const errMsg = String(err?.message || err).slice(0, 1000);
+          const retries = (item.retries || 0) + 1;
+
+          const nonRetriableCodes = [
+            'invalid_collection',
+            'invalid_document',
+            'sin id en outbox',
+            'duplicate key',
+            11000,
+            'bulk_delete_not_allowed',
+            'bulk_delete_requires_filter',
+            'DELETE sin id ni bulk flag',
+            'composite_registrar_abono: no se encontraron docs locales para sincronizar'
+          ];
+          const isNonRetriable = nonRetriableCodes.some(code =>
+            (typeof code === 'string' && errMsg.includes(code)) ||
+            (typeof code === 'number' && err && err.code === code)
+          );
+
+          const update = {
+            error: errMsg,
+            retries,
+            status: isNonRetriable || retries >= 6 ? 'error' : 'pending'
+          };
+          await Outbox.updateOne({ _id: item._id }, update);
+          console.error('[syncService] error procesando outbox item', item._id, errMsg);
+        } finally {
+          if (shouldSkipPullThisTick && preColName) bulkDeletedCollections.add(canonicalizeName(preColName));
+        }
       }
     }
 

@@ -11,16 +11,28 @@ const fs = require('fs');
 const { MongoClient } = require('mongodb'); // para leer max remoto de tickets
 
 const { startLocalMongo, stopLocalMongo } = require('./services/localMongo');
-// ⬇️ IMPORTANTE: offlineMiddleware se monta DESPUÉS de los handlers especiales
 const offlineMiddleware = require('./middlewares/offlineMiddleware');
 const { startPeriodicSync } = require('./services/syncService');
 
 const app = express();
 app.disable('x-powered-by');
 
+// ---------- Resolver de API remota ----------
+function resolveRemoteApiBase() {
+  const explicit = (process.env.REMOTE_API_BASE || '').trim();
+  if (explicit) return explicit.replace(/\/+$/, '');
+  const dbname = (process.env.MONGO_DBNAME_REMOTE || process.env.MONGO_DBNAME || 'parking')
+                  .toLowerCase().trim();
+  const host = (dbname === 'prueba') ? 'apiprueba.garageia.com' : 'api.garageia.com';
+  return `https://${host}`;
+}
+if (!process.env.PRECIOS_REMOTE_URL) {
+  process.env.PRECIOS_REMOTE_URL = `${resolveRemoteApiBase()}/api/precios`;
+}
+
 // Helper: normaliza módulos de rutas que exportan {router}, default, etc.
 const normalizeRouter = (m) => {
-  if (typeof m === 'function') return m;               // ya es un Router
+  if (typeof m === 'function') return m;
   if (m && typeof m === 'object') {
     return m.router || m.default || m.routes || m.route || m;
   }
@@ -36,7 +48,6 @@ const DEFAULT_ALLOWED = [
   'http://localhost:5173',
   'https://admin.garageia.com',
   'https://operador.garageia.com',
-  // esquemas
   'app://',
   'file://',
   'capacitor://',
@@ -49,7 +60,6 @@ const ENV_ALLOWED = (process.env.CORS_ORIGINS || '')
 
 const allowedOrigins = [...new Set([...DEFAULT_ALLOWED, ...ENV_ALLOWED])];
 
-// Compila cada item a RegExp (soporta '*')
 function compileOriginPatterns(list) {
   return list.map(item => {
     const s = item.replace(/\/+$/, '');
@@ -88,32 +98,33 @@ app.use(cookieParser());
 app.use(express.json({ limit: BODY_LIMIT }));
 app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 
-// =====================
-// 📂 UPLOADS (estáticos) — una sola vez acá
-// =====================
-// Todo esto va a rutas ESCRIBIBLES. Electron main nos pasa UPLOADS_BASE y CAMARA_DIR.
-const baseUploads = process.env.UPLOADS_BASE || path.join(process.cwd(), 'uploads');
+// 📂 UPLOADS (estáticos)
+// **CORRECCIÓN CLAVE**: por defecto que apunte a `__dirname/uploads` (misma carpeta que usan tus rutas)
+// Si seteás UPLOADS_BASE en el .env del server, tiene prioridad.
+const baseUploads = process.env.UPLOADS_BASE || path.join(__dirname, 'uploads');
 const uploadsDir = path.resolve(baseUploads);
 const fotosDir = path.join(uploadsDir, 'fotos');
 const entradasDir = path.join(fotosDir, 'entradas');
 const auditoriasDir = path.join(uploadsDir, 'auditorias');
 
-// Cámara (sacarfoto) fuera del asar:
-const camaraBaseDir = process.env.CAMARA_DIR || path.join(uploadsDir, 'camara');
+// ✅ Cámara (sacarfoto) — siempre bajo back-end/camara/sacarfoto
+const camaraBaseDir = process.env.CAMARA_DIR || path.join(__dirname, 'camara');
 const sacarfotoDir = path.join(camaraBaseDir, 'sacarfoto');
 
 [uploadsDir, fotosDir, entradasDir, auditoriasDir, camaraBaseDir, sacarfotoDir].forEach(dir => {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
-app.use('/uploads', express.static(uploadsDir, {
-  index: false,
-  dotfiles: 'deny',
-  setHeaders: (res) => {
-    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-  }
-}));
+// 🔎 LOGS de diagnóstico de rutas reales
+console.log('========== PATHS UPLOADS ==========');
+console.log('[uploads] baseUploads =', uploadsDir);
+console.log('[uploads] fotosDir    =', fotosDir);
+console.log('[uploads] entradasDir =', entradasDir);
+console.log('[uploads] auditorias  =', auditoriasDir);
+console.log('[camara ] sacarfoto   =', sacarfotoDir);
+console.log('===================================');
 
+// ⚠️ Orden IMPORTA: primero /uploads/fotos (con CORS), luego /uploads
 app.use('/uploads/fotos', express.static(fotosDir, {
   index: false,
   dotfiles: 'deny',
@@ -132,7 +143,15 @@ app.use('/uploads/auditorias', express.static(auditoriasDir, {
   }
 }));
 
-// ⬅️ IMPORTANTÍSIMO: servir /camara/sacarfoto desde carpeta ESCRIBIBLE
+app.use('/uploads', express.static(uploadsDir, {
+  index: false,
+  dotfiles: 'deny',
+  setHeaders: (res) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  }
+}));
+
+// /camara/sacarfoto desde back-end/camara/sacarfoto
 app.use('/camara/sacarfoto', express.static(sacarfotoDir, {
   index: false,
   dotfiles: 'deny',
@@ -143,22 +162,20 @@ app.use('/camara/sacarfoto', express.static(sacarfotoDir, {
 
 /* =======================================================
    LOGS PRECIOS (diagnóstico)
-   — Ubicado tras definir uploads y antes de montar rutas
-   — Consolidados para activar/desactivar fácil
 ========================================================== */
 console.log('========== LOGS PRECIOS ==========');
-console.log(`[precios] PRECIOS_REMOTE_URL=${process.env.PRECIOS_REMOTE_URL || 'https://api.garageia.com/api/precios'}`);
+console.log(`[precios] REMOTE_API_BASE=${resolveRemoteApiBase()}`);
+console.log(`[precios] PRECIOS_REMOTE_URL=${process.env.PRECIOS_REMOTE_URL}`);
 console.log(`[precios] PRECIOS_CACHE_FILE=${process.env.PRECIOS_CACHE_FILE || '(default under uploads/cache/precios.json)'}`);
 if (String(process.env.PRECIOS_DEBUG || '').trim() === '1') {
   console.log('[precios] DEBUG habilitado (PRECIOS_DEBUG=1)');
 }
 console.log('==================================');
 
-// Health/status liviano del server (no del sync)
 let syncStatus = { lastRun: null, lastError: null, online: false, pendingOutbox: 0, lastPullCounts: {} };
 
 // =====================
-// 🔄 Sincronización de counters (local >= max(local, remoto))
+// 🔄 Sincronización de counters
 // =====================
 async function sincronizarCounters() {
   const Ticket = require('./models/Ticket');
@@ -178,7 +195,7 @@ async function sincronizarCounters() {
       ? localMaxDoc.ticket : 0;
   }
 
-  // Max remoto (si hay Atlas disponible)
+  // Max remoto
   const atlasUri = process.env.MONGO_URI;
   const remoteDbName = process.env.MONGO_DBNAME_REMOTE || process.env.MONGO_DBNAME || 'parking';
 
@@ -205,7 +222,7 @@ async function sincronizarCounters() {
   console.log(`✅ Counter 'ticket' sincronizado. seq actual: ${seqActual} (>= ${maxNumero})`);
 }
 
-// Exponer status básico
+// Health
 app.get('/api/status', (_req, res) => {
   res.json({
     online: true,
@@ -216,9 +233,7 @@ app.get('/api/status', (_req, res) => {
   });
 });
 
-/**
- * ⛑️ Handler ESPECIAL para borrar la foto temporal de la cámara.
- */
+// Foto temporal cámara
 app.delete('/api/vehiculos/eliminar-foto-temporal', (_req, res) => {
   try {
     const fotoPath = path.join(sacarfotoDir, 'captura.jpg');
@@ -233,9 +248,7 @@ app.delete('/api/vehiculos/eliminar-foto-temporal', (_req, res) => {
   }
 });
 
-/**
- * 🔔 Endpoint ESPECIAL para disparar el pull “YA”
- */
+// Sync manual
 let syncHandle = null;
 app.post('/api/sync/run-now', async (_req, res) => {
   try {
@@ -246,8 +259,6 @@ app.post('/api/sync/run-now', async (_req, res) => {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
-
-// Status del sincronizador (del handle)
 app.get('/api/sync/status', (_req, res) => {
   try {
     const handleStatus = syncHandle ? syncHandle.getStatus() : null;
@@ -256,10 +267,6 @@ app.get('/api/sync/status', (_req, res) => {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
-
-/**
- * 🔍 Diagnóstico remoto: contadores por colección y DB en uso
- */
 app.get('/api/sync/inspect', async (req, res) => {
   try {
     if (!syncHandle) return res.status(503).json({ error: 'sync deshabilitado' });
@@ -287,14 +294,14 @@ async function main() {
 
     await sincronizarCounters();
 
-    // ⏱️ Cron turnos: inicia y corre una vuelta (se auto-programa cada minuto)
+    // Cron
     require('./cron/turnoChecker');
     require('./cron/abonoChecker');
 
-    // ⬇️ A PARTIR DE ACÁ se capturan requests para Outbox
+    // A PARTIR DE ACÁ se capturan requests para Outbox
     app.use(offlineMiddleware);
 
-    // ---- Rutas ----
+    // Rutas
     const authRoutes               = require('./routes/authRoutes.js');
     const vehiculoRoutes           = require('./routes/vehiculoRoutes');
     const abonoRoutes              = require('./routes/abonoRoutes');
@@ -319,7 +326,6 @@ async function main() {
     const impresoraRoutes          = require('./routes/impresoraRoutes');
     const configRoutes             = require('./routes/configRoutes');
 
-    // Montaje con normalización defensiva
     app.use('/api/auth',               normalizeRouter(authRoutes));
     app.use('/api/vehiculos',          normalizeRouter(vehiculoRoutes));
     app.use('/api/abonos',             normalizeRouter(abonoRoutes));
@@ -339,8 +345,6 @@ async function main() {
     app.use('/api/auditorias',         normalizeRouter(auditoriaRoutes));
     app.use('/api/camara',             normalizeRouter(camaraRoutes));
     app.use('/api/webcam',             require('./routes/webcam'));
-    // ⬇️ esta ruta ya está montada arriba con 'sacarfotoDir'; la dejo por compat pero no sirve archivos:
-    // app.use('/camara/sacarfoto', express.static(path.join(__dirname, 'camara', 'sacarfoto'), { index: false, dotfiles: 'deny' }));
     app.use('/api/fotos',              normalizeRouter(fotoRoutes));
     app.use('/api/tickets',            normalizeRouter(ticketRoutes));
     app.use('/api/ticket',             normalizeRouter(ticketRoutes));
@@ -348,11 +352,8 @@ async function main() {
     app.use('/api/impresoras',         normalizeRouter(impresoraRoutes));
     app.use('/api/config',             normalizeRouter(configRoutes));
 
-    // =====================
     // Front estático (producción para Electron)
-    // =====================
     if ((process.env.NODE_ENV || '').toLowerCase() === 'production') {
-      // En el paquete, front-end/dist queda como hermano de back-end
       const clientPath = path.join(__dirname, '..', 'front-end', 'dist');
       const indexPath = path.join(clientPath, 'index.html');
 
@@ -370,23 +371,20 @@ async function main() {
       }
     }
 
-    // Handler de errores global de Express
+    // Handler global
     app.use((err, req, res, next) => {
       console.error('[GLOBAL ERROR]', err);
       if (res.headersSent) return;
       res.status(err.status || 500).json({ error: err.message || 'Error del servidor' });
     });
 
-    // Hard-crashes también loggean
     process.on('uncaughtException', (e) => { console.error('[UNCAUGHT]', e); });
     process.on('unhandledRejection', (e) => { console.error('[UNHANDLED REJECTION]', e); });
 
     const PORT = process.env.PORT || 5000;
     app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Servidor corriendo en http://0.0.0.0:${PORT}`));
 
-    // ⬇️ Arrancar el sincronizador y GUARDAR EL HANDLE
     if (process.env.MONGO_URI) {
-      // === NUEVO: defaults “liberados” ===
       const envPull = (process.env.SYNC_PULL || '').trim();
       const pullAll = (envPull === '' || envPull === '*' || envPull.toUpperCase() === 'ALL');
       const pullCollections = pullAll ? [] : envPull.split(',').map(s => s.trim()).filter(Boolean);
@@ -397,21 +395,17 @@ async function main() {
 
       const syncOpts = {
         intervalMs: Number(process.env.SYNC_INTERVAL_MS) || 30000,
-
-        // ✅ por defecto: pull all (si SYNC_PULL no está o está vacío/*/ALL)
         pullCollections,
         pullAll,
-
-        // ✅ por defecto: mirror all (si SYNC_MIRROR no está o está vacío/*/ALL)
         mirrorAll,
         mirrorCollections,
-
         remoteDbName: process.env.MONGO_DBNAME_REMOTE || process.env.MONGO_DBNAME || 'parking',
         skipCollections: (process.env.SYNC_BLOCKLIST || '')
           .split(',').map(s => s.trim()).filter(Boolean)
       };
 
       console.log(`[server] SYNC config => pullAll=${syncOpts.pullAll}, mirrorAll=${syncOpts.mirrorAll}, mirrorCollections=[${syncOpts.mirrorCollections.join(', ')}]`);
+      const { startPeriodicSync } = require('./services/syncService');
       syncHandle = startPeriodicSync(process.env.MONGO_URI, syncOpts, (s) => {
         syncStatus = {
           lastRun: s.lastRun,

@@ -209,7 +209,7 @@ exports.renovarAbono = async (req, res) => {
       await session.abortTransaction();
       return res.status(400).json({ message: 'Precio inválido o faltante' });
     }
-    if (!metodoPago || !['Efectivo', 'Débito', 'Crédito', 'QR'].includes(metodoPago)) {
+    if (!metodoPago || !['Efectivo', 'Transferencia', 'Débito', 'Crédito', 'QR'].includes(metodoPago)) {
       await session.abortTransaction();
       return res.status(400).json({ message: 'Método de pago inválido' });
     }
