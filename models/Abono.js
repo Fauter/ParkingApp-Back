@@ -35,6 +35,11 @@ const abonoSchema = new Schema({
   factura: String,
   tipoVehiculo: String,
 
+  // ===== NUEVO =====
+  cochera: { type: String, enum: ['Fija', 'Móvil', ''] , default: '' },
+  piso: { type: String, default: '' },
+  exclusiva: { type: Boolean, default: false },
+
   fechaCreacion: {
     type: Date,
     default: Date.now,

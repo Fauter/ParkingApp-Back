@@ -9,12 +9,20 @@ const {
   getAbonoPorId,
   registrarAbono,
   eliminarAbonos,
-  agregarAbono
+  agregarAbono,
+  previewAbono,
+  previewRenovacion,
+  renovarAbono,
+  actualizarAbono,           // NUEVO
+  setExclusiva,              // NUEVO
+  getAbonosPorCliente,       // NUEVO
+  getAbonosPorPatente,       // NUEVO
+  getCatalogoCocherasYPisos, // NUEVO
 } = require('../controllers/abonoControllers');
 
 const router = express.Router();
 
-// Base de uploads (coincide con server.js)
+// === UPLOADS ===
 const BASE_UPLOADS = process.env.UPLOADS_BASE
   ? path.resolve(process.env.UPLOADS_BASE)
   : path.resolve(__dirname, '..', 'uploads');
@@ -33,10 +41,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: {
-    fileSize: 5 * 1024 * 1024, // 5 MB por archivo
-    files: 3
-  },
+  limits: { fileSize: 5 * 1024 * 1024, files: 3 },
   fileFilter: (_req, file, cb) => {
     const ok = ['.jpg', '.jpeg', '.png', '.webp', '.bmp'].includes(
       (path.extname(file.originalname || '') || '').toLowerCase()
@@ -64,10 +69,37 @@ function mapUploadedPaths(req, _res, next) {
   next();
 }
 
+// === RUTAS ===
+
+// Listado con filtros & paginación
 router.get('/', getAbonos);
+
+// Catálogo de valores de cochera/pisos (distintos + conteos)
+router.get('/catalogo/cocheras-pisos', getCatalogoCocherasYPisos);
+
+// Previews (antes que "/:id")
+router.get('/preview', previewAbono);
+router.get('/preview-renovacion', previewRenovacion);
+
+// Búsquedas útiles (antes de "/:id")
+router.get('/by-cliente/:clienteId', getAbonosPorCliente);
+router.get('/by-patente/:patente',   getAbonosPorPatente);
+
+// Detalle por id
 router.get('/:id', getAbonoPorId);
+
+// Altas
 router.post('/registrar-abono', uploadFields, mapUploadedPaths, registrarAbono);
-router.post('/agregar-abono', uploadFields, mapUploadedPaths, agregarAbono);
+router.post('/agregar-abono',   uploadFields, mapUploadedPaths, agregarAbono);
+
+// Renovación
+router.post('/renovar', renovarAbono);
+
+// Updates
+router.patch('/:id', uploadFields, mapUploadedPaths, actualizarAbono);
+router.patch('/:id/exclusiva', setExclusiva);
+
+// Borrado masivo
 router.delete('/', eliminarAbonos);
 
 module.exports = router;
