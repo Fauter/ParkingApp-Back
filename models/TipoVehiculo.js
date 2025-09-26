@@ -1,3 +1,4 @@
+// models/TipoVehiculo.js
 const mongoose = require('mongoose');
 
 const TipoVehiculoSchema = new mongoose.Schema({
@@ -7,6 +8,5 @@ const TipoVehiculoSchema = new mongoose.Schema({
   mensual:{ type: Boolean, default: false }
 }, { timestamps: true });
 
-TipoVehiculoSchema.index({ nombre: 1 }, { unique: true });
 
 module.exports = mongoose.model('TipoVehiculo', TipoVehiculoSchema);

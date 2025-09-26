@@ -143,8 +143,9 @@ async function fetchPreciosDocs() {
 // =======================
 // WATERMARK / SYNC STATE
 // =======================
+// 🔁 NUEVO: usamos `canon` (no `collection`) y migramos en caliente
 const SyncStateSchema = new mongoose.Schema({
-  collection: { type: String, unique: true, required: true },
+  canon: { type: String, unique: true, required: true },
   lastUpdatedAt: { type: Date },
   lastObjectId: { type: String },
   meta: { type: mongoose.Schema.Types.Mixed },
@@ -775,15 +776,32 @@ async function detectTemporalField(remoteDb, collName) {
   return field;
 }
 
+// 🔁 NUEVAS funciones con migración en caliente desde el campo legado `collection`
 async function getSyncState(collName) {
   const canon = canonicalizeName(collName);
-  let st = await SyncState.findOne({ collection: canon });
-  if (!st) st = await SyncState.create({ collection: canon });
+  let st = await SyncState.findOne({ canon });
+
+  if (!st) {
+    // migración: si existe con "collection", lo renombro
+    const legacy = await SyncState.findOne({ collection: canon }).lean();
+    if (legacy) {
+      await SyncState.updateOne(
+        { _id: legacy._id },
+        { $set: { canon }, $unset: { collection: "" } }
+      );
+      st = await SyncState.findOne({ canon });
+    }
+  }
+  if (!st) st = await SyncState.create({ canon });
   return st;
 }
 async function saveSyncState(collName, patch) {
   const canon = canonicalizeName(collName);
-  await SyncState.updateOne({ collection: canon }, { $set: patch }, { upsert: true });
+  await SyncState.updateOne(
+    { canon },
+    { $set: { ...patch, canon }, $unset: { collection: "" } },
+    { upsert: true }
+  );
 }
 
 async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], opts = {}) {
