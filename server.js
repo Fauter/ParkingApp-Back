@@ -98,28 +98,41 @@ app.use(cookieParser());
 app.use(express.json({ limit: BODY_LIMIT }));
 app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 
-// 📂 UPLOADS (estáticos)
-// **CORRECCIÓN CLAVE**: por defecto que apunte a `__dirname/uploads` (misma carpeta que usan tus rutas)
+/* =======================================================
+   📂 UPLOADS (estáticos) — con carpeta webcamPromos
+   ======================================================= */
+// Por defecto que apunte a `__dirname/uploads` (misma carpeta que usan tus rutas).
 // Si seteás UPLOADS_BASE en el .env del server, tiene prioridad.
 const baseUploads = process.env.UPLOADS_BASE || path.join(__dirname, 'uploads');
 const uploadsDir = path.resolve(baseUploads);
 const fotosDir = path.join(uploadsDir, 'fotos');
 const entradasDir = path.join(fotosDir, 'entradas');
+const webcamPromosDir = path.join(fotosDir, 'webcamPromos'); // ✅ NUEVO (fotos de la webcam para promos)
 const auditoriasDir = path.join(uploadsDir, 'auditorias');
 
 // ✅ Cámara (sacarfoto) — siempre bajo back-end/camara/sacarfoto
 const camaraBaseDir = process.env.CAMARA_DIR || path.join(__dirname, 'camara');
 const sacarfotoDir = path.join(camaraBaseDir, 'sacarfoto');
 
-[uploadsDir, fotosDir, entradasDir, auditoriasDir, camaraBaseDir, sacarfotoDir].forEach(dir => {
+// Asegurar directorios
+[
+  uploadsDir,
+  fotosDir,
+  entradasDir,
+  webcamPromosDir, // ✅ asegurar carpeta
+  auditoriasDir,
+  camaraBaseDir,
+  sacarfotoDir
+].forEach(dir => {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
-// 🔎 LOGS de diagnóstico de rutas reales
+// Logs de diagnóstico de rutas reales
 console.log('========== PATHS UPLOADS ==========');
 console.log('[uploads] baseUploads =', uploadsDir);
 console.log('[uploads] fotosDir    =', fotosDir);
 console.log('[uploads] entradasDir =', entradasDir);
+console.log('[uploads] webcamPromo =', webcamPromosDir); // ✅ log nuevo
 console.log('[uploads] auditorias  =', auditoriasDir);
 console.log('[camara ] sacarfoto   =', sacarfotoDir);
 console.log('===================================');

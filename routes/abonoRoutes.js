@@ -1,3 +1,4 @@
+// routes/abonoRoutes.js
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
@@ -34,7 +35,7 @@ const upload = multer({
   storage,
   limits: {
     fileSize: 5 * 1024 * 1024, // 5 MB por archivo
-    files: 4
+    files: 3
   },
   fileFilter: (_req, file, cb) => {
     const ok = ['.jpg', '.jpeg', '.png', '.webp', '.bmp'].includes(
@@ -49,11 +50,10 @@ const uploadFields = upload.fields([
   { name: 'fotoSeguro', maxCount: 1 },
   { name: 'fotoDNI', maxCount: 1 },
   { name: 'fotoCedulaVerde', maxCount: 1 },
-  { name: 'fotoCedulaAzul', maxCount: 1 },
 ]);
 
 function mapUploadedPaths(req, _res, next) {
-  const expected = ['fotoSeguro', 'fotoDNI', 'fotoCedulaVerde', 'fotoCedulaAzul'];
+  const expected = ['fotoSeguro', 'fotoDNI', 'fotoCedulaVerde'];
   expected.forEach((field) => {
     const f = req.files && req.files[field] && req.files[field][0];
     if (f) {

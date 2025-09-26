@@ -23,14 +23,16 @@ function movCreatedTs(m) {
 }
 
 /** ============================
- *  Manejo de foto del movimiento
+ *  Manejo de fotos
  *  ============================
  */
 const UPLOADS_BASE = process.env.UPLOADS_BASE || path.join(__dirname, '..', 'uploads');
 const ENTRADAS_DIR = path.join(UPLOADS_BASE, 'fotos', 'entradas');
+const WEBCAM_PROMOS_DIR = path.join(UPLOADS_BASE, 'fotos', 'webcamPromos');
 
 function ensureDirs() {
   try { fs.mkdirSync(ENTRADAS_DIR, { recursive: true }); } catch {}
+  try { fs.mkdirSync(WEBCAM_PROMOS_DIR, { recursive: true }); } catch {}
 }
 
 function isDataUrl(s) {
@@ -44,16 +46,28 @@ function extFromDataUrl(s) {
   return t === 'png' ? 'png' : 'jpg';
 }
 
-function persistDataUrlToEntradas(dataUrl, patente) {
+function persistDataUrlToDir(dataUrl, dir, filenameBase) {
   ensureDirs();
   const ext = extFromDataUrl(dataUrl);
   const base64 = dataUrl.replace(/^data:image\/[a-zA-Z]+;base64,/, '');
   const buf = Buffer.from(base64, 'base64');
-  const safePat = String(patente || 'foto').toUpperCase().replace(/[^A-Z0-9]/g, '');
-  const filename = `${safePat}_${Date.now()}_mov.${ext}`;
-  const abs = path.join(ENTRADAS_DIR, filename);
+  const safeBase = String(filenameBase || 'foto').toUpperCase().replace(/[^A-Z0-9_]/g, '');
+  const filename = `${safeBase}_${Date.now()}.${ext}`;
+  const abs = path.join(dir, filename);
   fs.writeFileSync(abs, buf);
-  return `/uploads/fotos/entradas/${filename}`;
+  // devolver ruta HTTP servida por /uploads/...
+  const rel = path.relative(UPLOADS_BASE, abs).replace(/\\/g, '/');
+  return `/uploads/${rel}`;
+}
+
+function persistDataUrlToEntradas(dataUrl, patente) {
+  const safe = `MOV_${String(patente || 'FOTO').toUpperCase().replace(/[^A-Z0-9]/g, '')}`;
+  return persistDataUrlToDir(dataUrl, ENTRADAS_DIR, safe);
+}
+
+function persistDataUrlToWebcamPromos(dataUrl, patente) {
+  const safe = `PROMO_${String(patente || 'FOTO').toUpperCase().replace(/[^A-Z0-9]/g, '')}`;
+  return persistDataUrlToDir(dataUrl, WEBCAM_PROMOS_DIR, safe);
 }
 
 function normalizeFotoUrl(raw) {
@@ -85,9 +99,9 @@ exports.registrarMovimiento = async (req, res) => {
       tipoTarifa,
       ticket,
       cliente,
-      promo,       // Mixed opcional
-      fotoUrl: fotoUrlInBody, // puede venir como dataURL o ruta
-      foto: fotoInBody        // alias aceptado
+      promo,              // Mixed opcional: { _id, nombre, descuento, (fotoUrl?: dataURL|ruta) }
+      fotoUrl: fotoUrlInBody, // foto del movimiento (no promo)
+      foto: fotoInBody
     } = req.body;
 
     if (!patente || !tipoVehiculo || !metodoPago || !factura || monto == null || !descripcion) {
@@ -96,7 +110,7 @@ exports.registrarMovimiento = async (req, res) => {
 
     const operador = getOperadorNombre(req);
 
-    // === FOTO: priorizamos body.fotoUrl / body.foto; si no, reciclamos la del vehículo ===
+    // === FOTO del MOVIMIENTO ===
     let fotoCandidate = fotoUrlInBody || fotoInBody || null;
     let fotoUrl = null;
 
@@ -108,12 +122,11 @@ exports.registrarMovimiento = async (req, res) => {
       }
     }
 
-    // Sin foto en el body: intentamos del vehículo (estadiaActual o historial)
+    // Sin foto en el body: intentamos del vehículo
     if (!fotoUrl) {
       try {
         if (!Vehiculo) Vehiculo = require('../models/Vehiculo');
 
-        // Traemos foto de estadía actual + historial para fallback por ticket o última con foto
         const v = await Vehiculo.findOne({ patente: String(patente).toUpperCase() })
           .select('estadiaActual.fotoUrl historialEstadias.ticket historialEstadias.fotoUrl')
           .lean();
@@ -123,7 +136,7 @@ exports.registrarMovimiento = async (req, res) => {
           fotoUrl = normalizeFotoUrl(v.estadiaActual.fotoUrl);
         }
 
-        // 2) historial por ticket (si mandaron ticket y aún no resolvimos foto)
+        // 2) historial por ticket
         if (!fotoUrl && Number.isFinite(ticket) && Array.isArray(v?.historialEstadias)) {
           const match = v.historialEstadias.find(e => Number(e?.ticket) === Number(ticket) && e?.fotoUrl);
           if (match?.fotoUrl) {
@@ -143,6 +156,19 @@ exports.registrarMovimiento = async (req, res) => {
       }
     }
 
+    // === FOTO de la PROMO (si viene en promo.fotoUrl como dataURL, la persistimos en /fotos/webcamPromos) ===
+    let promoObj = promo && typeof promo === 'object' ? { ...promo } : (promo ?? null);
+    if (promoObj && typeof promoObj === 'object' && promoObj.fotoUrl) {
+      if (isDataUrl(promoObj.fotoUrl)) {
+        // Guardar en carpeta dedicada
+        const saved = persistDataUrlToWebcamPromos(promoObj.fotoUrl, patente);
+        promoObj.fotoUrl = saved;
+      } else {
+        // Normalizar si vino ruta o URL
+        promoObj.fotoUrl = normalizeFotoUrl(promoObj.fotoUrl);
+      }
+    }
+
     // ⛔ No aceptamos `fecha`, `createdAt`, `updatedAt` desde el body.
     const nuevoMovimiento = new Movimiento({
       ...(cliente ? { cliente } : {}),
@@ -155,7 +181,7 @@ exports.registrarMovimiento = async (req, res) => {
       descripcion,
       tipoTarifa,
       ...(Number.isFinite(ticket) ? { ticket } : {}),
-      ...(promo ? { promo } : {}),
+      ...(promoObj ? { promo: promoObj } : {}),
       ...(fotoUrl ? { fotoUrl } : {})
     });
 

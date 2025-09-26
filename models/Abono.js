@@ -1,3 +1,4 @@
+// models/Abono.js
 const mongoose = require('mongoose');
 const { Schema } = mongoose;
 
@@ -43,7 +44,6 @@ const abonoSchema = new Schema({
   fotoSeguro: String,
   fotoDNI: String,
   fotoCedulaVerde: String,
-  fotoCedulaAzul: String,
 
   activo: {
     type: Boolean,

@@ -136,7 +136,6 @@ exports.registrarAbono = async (req, res) => {
     const fotoSeguro       = buildFotoPath(req, 'fotoSeguro');
     const fotoDNI          = buildFotoPath(req, 'fotoDNI');
     const fotoCedulaVerde  = buildFotoPath(req, 'fotoCedulaVerde');
-    const fotoCedulaAzul   = buildFotoPath(req, 'fotoCedulaAzul');
 
     const cliente = await findClienteFlexible(clienteId, sopt);
     if (!cliente) throw new Error('Cliente no encontrado');
@@ -189,7 +188,6 @@ exports.registrarAbono = async (req, res) => {
       fotoSeguro,
       fotoDNI,
       fotoCedulaVerde,
-      fotoCedulaAzul,
       cliente: cliente._id,
       vehiculo: vehiculo._id
     });
@@ -218,7 +216,7 @@ exports.registrarAbono = async (req, res) => {
     const MovimientoCliente = require('../models/MovimientoCliente');
 
     const mov = new Movimiento({
-      cliente: cliente._id,                 // ⬅️ IMPORTANTE
+      cliente: cliente._id,
       patente: pat,
       operador: operadorNombre,
       tipoVehiculo,
