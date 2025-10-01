@@ -32,9 +32,22 @@ const status = {
 // CONFIG PRECIOS (HTTP+cache)
 // =======================
 const PRECIOS_REMOTE_URL = process.env.PRECIOS_REMOTE_URL || 'https://api.garageia.com/api/precios';
+
+// ✅ helper para construir la URL con ?metodo=...
+function appendMetodo(url, metodo) {
+  const u = String(url || '').trim();
+  if (!u) return '';
+  return u.includes('?') ? `${u}&metodo=${metodo}` : `${u}?metodo=${metodo}`;
+}
+
+// ✅ NUEVO: URL remota para el bucket "otros"
+const PRECIOS_REMOTE_URL_OTROS =
+  process.env.PRECIOS_REMOTE_URL_OTROS || appendMetodo(PRECIOS_REMOTE_URL, 'otros');
+
 const PRECIOS_CACHE_FILE =
   process.env.PRECIOS_CACHE_FILE ||
   path.join(process.cwd(), 'uploads', 'cache', 'precios.json');
+
 const PRECIOS_FETCH_TIMEOUT_MS = Number(process.env.PRECIOS_FETCH_TIMEOUT_MS || 5000);
 const PRECIOS_DEBUG = String(process.env.PRECIOS_DEBUG || '').trim() === '1';
 
@@ -68,18 +81,37 @@ function ensureDirForFile(filePath) {
     console.warn('[precios] no pude crear carpeta cache:', e.message);
   }
 }
+// Estructura canonical de cache en disco:
+// { efectivo: { <vehiculo>: {tarifas...} }, otros: { <vehiculo>: {tarifas...} } }
 function readPreciosCache() {
   try {
-    if (!fs.existsSync(PRECIOS_CACHE_FILE)) return {};
+    if (!fs.existsSync(PRECIOS_CACHE_FILE)) return { efectivo: {}, otros: {} };
     const txt = fs.readFileSync(PRECIOS_CACHE_FILE, 'utf8');
-    return JSON.parse(txt || '{}');
+    const parsed = JSON.parse(txt || '{}');
+
+    // Soporta legado plano (sin buckets)
+    const looksBucketed = parsed && typeof parsed === 'object' &&
+                          (Object.prototype.hasOwnProperty.call(parsed, 'efectivo') ||
+                           Object.prototype.hasOwnProperty.call(parsed, 'otros'));
+    if (!looksBucketed) {
+      return { efectivo: normalizePreciosObject(parsed || {}), otros: {} };
+    }
+    return {
+      efectivo: normalizePreciosObject(parsed.efectivo || {}),
+      otros: normalizePreciosObject(parsed.otros || {})
+    };
   } catch {
-    return {};
+    return { efectivo: {}, otros: {} };
   }
 }
-function writePreciosCache(obj) {
+
+function writePreciosCache(store) {
   ensureDirForFile(PRECIOS_CACHE_FILE);
-  fs.writeFileSync(PRECIOS_CACHE_FILE, JSON.stringify(obj ?? {}, null, 2), 'utf8');
+  const canonical = {
+    efectivo: normalizePreciosObject(store?.efectivo || {}),
+    otros: normalizePreciosObject(store?.otros || {})
+  };
+  fs.writeFileSync(PRECIOS_CACHE_FILE, JSON.stringify(canonical, null, 2), 'utf8');
 }
 function fixInnerKey(k) {
   const base = String(k || '').toLowerCase().trim();
@@ -110,12 +142,15 @@ function oidFromStringStable(s) {
     return new ObjectId();
   }
 }
-async function buildPreciosDocsFromObject(mapObj) {
+
+// ahora recibe tb el bucket/metodo: 'efectivo' | 'otros'
+async function buildPreciosDocsFromObject(mapObj, metodo = 'efectivo') {
   const normalized = normalizePreciosObject(mapObj);
   const docs = [];
   for (const tipo of Object.keys(normalized)) {
     docs.push({
-      _id: oidFromStringStable('precios:' + tipo),
+      _id: oidFromStringStable(`precios:${metodo}:${tipo}`), // ✅ incluye metodo en el hash
+      metodo,                                                // ✅ nuevo campo
       tipo,
       tabla: normalized[tipo],
       updatedAt: new Date()
@@ -125,17 +160,61 @@ async function buildPreciosDocsFromObject(mapObj) {
 }
 async function fetchPreciosDocs() {
   try {
-    const payload = await fetchJsonWithTimeout(PRECIOS_REMOTE_URL, PRECIOS_FETCH_TIMEOUT_MS);
-    const data = (payload && typeof payload === 'object' && payload.data && typeof payload.data === 'object')
-      ? payload.data : payload;
-    const docs = await buildPreciosDocsFromObject(data || {});
-    writePreciosCache(normalizePreciosObject(data || {}));
-    logPrecios('remote-ok', { url: PRECIOS_REMOTE_URL, tipos: docs.map(d => d.tipo) });
-    return { docs, source: 'remote', allowMirrorDelete: true };
+    // Traer EFECTIVO y OTROS desde remoto (en paralelo), con fallback a cache por-bucket
+    const [effRes, otrRes] = await Promise.allSettled([
+      fetchJsonWithTimeout(PRECIOS_REMOTE_URL, PRECIOS_FETCH_TIMEOUT_MS),
+      fetchJsonWithTimeout(PRECIOS_REMOTE_URL_OTROS, PRECIOS_FETCH_TIMEOUT_MS)
+    ]);
+
+    const effOk = effRes.status === 'fulfilled';
+    const otrOk = otrRes.status === 'fulfilled';
+
+    const effData = effOk
+      ? ((effRes.value && effRes.value.data && typeof effRes.value.data === 'object')
+          ? effRes.value.data : effRes.value)
+      : null;
+
+    const otrData = otrOk
+      ? ((otrRes.value && otrRes.value.data && typeof otrRes.value.data === 'object')
+          ? otrRes.value.data : otrRes.value)
+      : null;
+
+    // Cache anterior (para fallback fino por-bucket)
+    const prev = readPreciosCache();
+
+    // Construir docs: cada bucket usa remoto si vino OK, sino su cache previa
+    const effDocs = await buildPreciosDocsFromObject(effOk ? (effData || {}) : (prev.efectivo || {}), 'efectivo');
+    const otrDocs = await buildPreciosDocsFromObject(otrOk ? (otrData || {}) : (prev.otros || {}),    'otros');
+
+    // Escribir cache combinada
+    const nextStore = {
+      efectivo: effOk ? normalizePreciosObject(effData || {}) : (prev.efectivo || {}),
+      otros:    otrOk ? normalizePreciosObject(otrData || {}) : (prev.otros || {})
+    };
+    writePreciosCache(nextStore);
+
+    logPrecios('remote(fetch)/ok-per-bucket', {
+      urlEfectivo: PRECIOS_REMOTE_URL,
+      urlOtros: PRECIOS_REMOTE_URL_OTROS,
+      tiposEfectivo: effDocs.map(d => d.tipo),
+      tiposOtros: otrDocs.map(d => d.tipo)
+    });
+
+    // Permitir mirror delete SOLO si ambos buckets vinieron del remoto
+    const bothRemote = effOk && otrOk;
+    return { docs: [...effDocs, ...otrDocs], source: bothRemote ? 'remote' : 'mixed', allowMirrorDelete: bothRemote };
   } catch (e) {
+    // Fallback total a cache
     const cached = readPreciosCache();
-    const docs = await buildPreciosDocsFromObject(cached || {});
-    logPrecios('remote-fail -> cache', { error: String(e && e.message || e), tipos: docs.map(d => d.tipo) });
+    const effDocs = await buildPreciosDocsFromObject(cached.efectivo || {}, 'efectivo');
+    const otrDocs = await buildPreciosDocsFromObject(cached.otros || {},    'otros');
+    const docs = [...effDocs, ...otrDocs];
+
+    logPrecios('remote-fail -> cache', {
+      error: String(e && e.message || e),
+      tiposEfectivo: effDocs.map(d => d.tipo),
+      tiposOtros: otrDocs.map(d => d.tipo)
+    });
     return { docs, source: 'cache', allowMirrorDelete: false };
   }
 }
@@ -280,7 +359,7 @@ const NATURAL_KEYS = {
   promos: ['codigo'],
   alertas: ['codigo'],
   cierresdecajas: ['fecha', 'hora', 'operador'],
-  precios: ['tipo'],
+  precios: ['tipo', 'metodo'],
 };
 const REMOTE_ALIASES = {
   cierresdecajas: ['cierresDeCaja','cierredecajas','cierresdecaja','cierredecaja'],
@@ -293,18 +372,21 @@ const REMOTE_ALIASES = {
 };
 
 function getRemoteNames(colName) {
-  const canon = String(colName || '').trim().toLowerCase();
+  const canon = canonicalizeName(colName);
   const aliases = REMOTE_ALIASES[canon] || [];
   const all = [canon, ...aliases].filter(Boolean);
   return all.filter((v, i) => all.indexOf(v) === i);
 }
 function canonicalizeName(name) {
   const lower = String(name || '').toLowerCase();
+  // ✅ quitar querystring y fragmento, y barritas finales
+  const clean = lower.split('?')[0].split('#')[0].replace(/\/+$/, '');
+
   for (const [canon, aliases] of Object.entries(REMOTE_ALIASES)) {
-    if (lower === canon) return canon;
-    if (aliases.some(a => a.toLowerCase() === lower)) return canon;
+    if (clean === canon) return canon;
+    if (aliases.some(a => a.toLowerCase() === clean)) return canon;
   }
-  return lower;
+  return clean;
 }
 
 // Intenta mapear a una colección local ya existente
@@ -323,6 +405,25 @@ async function resolveLocalCollectionName(db, canonName) {
   }
   return canonName;
 }
+// === Índice único para precios (tipo, metodo) ===
+// Lo intentamos apenas la conexión esté "open". Si ya está abierta, lo hacemos ya.
+(async () => {
+  try {
+    const ensure = async () => {
+      const localName = await resolveLocalCollectionName(mongoose.connection, 'precios');
+      await mongoose.connection
+        .collection(localName)
+        .createIndex({ tipo: 1, metodo: 1 }, { unique: true });
+      console.log('[syncService] ensured unique index precios(tipo,metodo)');
+    };
+
+    if (mongoose.connection.readyState === 1) {
+      await ensure();
+    } else {
+      mongoose.connection.once('open', () => { ensure().catch(() => {}); });
+    }
+  } catch (_) {}
+})();
 function buildNaturalKeyFilter(colName, src) {
   const keys = NATURAL_KEYS[colName?.toLowerCase()] || [];
   const filter = {};
@@ -364,8 +465,10 @@ function normalizeIds(inputDoc, colName) {
 function getCollectionNameFromItem(item) {
   if (!item) return null;
   if (item.collection) return item.collection;
-  if (item.route) {
-    const parts = item.route.split('/').filter(Boolean);
+    if (item.route) {
+    const raw = String(item.route || '');
+    const routePath = raw.split('?')[0].split('#')[0];   // ✅ limpia query/fragment
+    const parts = routePath.split('/').filter(Boolean);
     const apiIndex = parts.indexOf('api');
     if (apiIndex >= 0 && parts.length > apiIndex + 1) return parts[apiIndex + 1];
     const last = parts[parts.length - 1];
@@ -481,6 +584,17 @@ async function ensureCompositeRegistrarAbonoSynced(remoteDb, item) {
   if (!pushed) throw new Error('composite_registrar_abono: no se encontraron docs locales para sincronizar');
 }
 
+// --- helpers mirror/push ---
+function toCanonSet(arr = []) {
+  return new Set((arr || []).map(s => canonicalizeName(s)));
+}
+function isMirrorBlockedCollection(name, opts = {}) {
+  if (!name) return false;
+  const canon = canonicalizeName(name);
+  if (opts.mirrorAll) return true; // si espejás todo, bloquea push de todo
+  const set = toCanonSet(opts.mirrorCollections || []);
+  return set.has(canon);
+}
 async function processOutboxItem(remoteDb, item) {
   const isComposite = /\/api\/abonos\/registrar-abono/i.test(item?.route || '');
   if (isComposite) { await ensureCompositeRegistrarAbonoSynced(remoteDb, item); return; }
@@ -845,6 +959,8 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
       try {
         const isMirrorThisCollection = !!(mirrorAll || new Set(mirrorCollections || []).has('precios'));
         const { docs, source, allowMirrorDelete } = await fetchPreciosDocs();
+        const preciosReadonly = String(process.env.PRECIOS_READONLY || '').trim() === '1';
+        const canDelete = allowMirrorDelete && !preciosReadonly;
 
         stats.remoteTotal = docs.length;
 
@@ -857,7 +973,7 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
         }
 
         if (isMirrorThisCollection) {
-          if (allowMirrorDelete) {
+          if (canDelete) {
             const remoteIds = new Set(docs.map(d => String(d._id)));
             const localIdsDocs = await localCollection.find({}, { projection: { _id: 1 } }).toArray();
             const toDeleteObjIds = [];
@@ -877,15 +993,15 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
               stats.deletedLocal += deletedCount || 0;
             }
           } else {
-            console.log('[syncService] precios: mirror FULL saltado (fuente=cache).');
+            console.log('[syncService] precios: mirror FULL saltado (cache o readonly).');
           }
         }
 
         resultCounts['precios'] = stats;
-        const mirrorFlag = isMirrorThisCollection ? '[mirror:FULL/http]' : '[http]';
+        const mirrorFlag = isMirrorThisCollection ? (allowMirrorDelete ? '[mirror:FULL/http]' : '[http/cache-no-delete]') : '[http]';
         console.log(
           `[syncService] pulled precios (fuente=${source}) (db="${remoteDb.databaseName}"): ` +
-          `remote=${stats.remoteTotal}, upserted=${stats.upsertedOrUpdated}, deletedLocal=${stats.deletedLocal} ${mirrorFlag}`
+          `remote=${stats.remoteTotal}, upserted=${stats.upsertedOrUpdated}, deletedLocal=${stats.deletedLocal} ${mirrorFlag} (buckets: efectivo+otros)`
         );
       } catch (err) {
         console.warn('[syncService] no se pudo pull precios:', err.message || err);
@@ -1062,7 +1178,7 @@ async function syncPreciosLocalOnly({ mirrorAll = false, mirrorCollections = [] 
     }
 
     status.lastPullCounts = { ...status.lastPullCounts, precios: { remoteTotal: docs.length, upsertedOrUpdated: upserted, deletedLocal: deleted } };
-    console.log(`[syncService] precios local-only (${source}) -> upserted=${upserted}, deleted=${deleted}`);
+    console.log(`[syncService] precios local-only (${source}) -> upserted=${upserted}, deleted=${deleted} (buckets: efectivo+otros)`);
   } catch (e) {
     console.warn('[syncService] precios local-only falló:', e.message || e);
   }
@@ -1080,6 +1196,8 @@ async function syncTick(atlasUri, opts = {}, statusCb = () => {}) {
   statusCb(status);
 
   try {
+    //✅ SIEMPRE: hidratar precios al local (HTTP + cache), incluso sin internet
+    await syncPreciosLocalOnly({ mirrorAll: !!opts.mirrorAll, mirrorCollections: opts.mirrorCollections || [] });
     const internet = await hasInternet();
     if (!internet) {
       status.online = false;
@@ -1088,9 +1206,6 @@ async function syncTick(atlasUri, opts = {}, statusCb = () => {}) {
       console.warn('[syncService] No hay conexion, salteando SYNC');
       return;
     }
-
-    // === precios: sync local-only regardless of Atlas ===
-    await syncPreciosLocalOnly({ mirrorAll: !!opts.mirrorAll, mirrorCollections: opts.mirrorCollections || [] });
 
     let remoteDb = null;
     try {
@@ -1148,11 +1263,20 @@ async function syncTick(atlasUri, opts = {}, statusCb = () => {}) {
         try {
           await Outbox.updateOne({ _id: item._id }, { status: 'processing' });
 
+          // ⛔️ BLOQUEO DE PUSH para colecciones espejadas (SYNC_MIRROR)
+          if (preColName && isMirrorBlockedCollection(preColName, opts)) {
+            await Outbox.updateOne(
+              { _id: item._id },
+              { status: 'synced', syncedAt: new Date(), error: null, note: 'push_blocked_by_mirror' }
+            );
+            console.log(`[syncService] push bloqueado por mirror para "${canonicalizeName(preColName)}" (${item.method})`);
+            continue; // NO empujar al remoto
+          }
+
           if (!preColName && !/\/api\/abonos\/registrar-abono/i.test(item?.route || '')) {
             await Outbox.updateOne({ _id: item._id }, { status: 'error', error: 'invalid_collection', retries: 6 });
             continue;
           }
-
           if (['POST','PUT','PATCH'].includes(item.method) && !looksLikeValidDocument(item.document) && !/\/api\/abonos\/registrar-abono/i.test(item?.route || '')) {
             await Outbox.updateOne({ _id: item._id }, { status: 'error', error: 'invalid_document', retries: 6 });
             continue;

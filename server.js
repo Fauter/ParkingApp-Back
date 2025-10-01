@@ -26,9 +26,31 @@ function resolveRemoteApiBase() {
   const host = (dbname === 'prueba') ? 'apiprueba.garageia.com' : 'api.garageia.com';
   return `https://${host}`;
 }
-if (!process.env.PRECIOS_REMOTE_URL) {
-  process.env.PRECIOS_REMOTE_URL = `${resolveRemoteApiBase()}/api/precios`;
-}
+
+// ---------- Config estándar de precios (efectivo + otros) ----------
+(function ensurePreciosEnv() {
+  // Base API (prod/prueba) → /api/precios
+  const base = `${resolveRemoteApiBase()}/api/precios`;
+
+  if (!process.env.PRECIOS_REMOTE_URL) {
+    process.env.PRECIOS_REMOTE_URL = base;
+  }
+  if (!process.env.PRECIOS_REMOTE_URL_OTROS) {
+    process.env.PRECIOS_REMOTE_URL_OTROS = `${base}?metodo=otros`;
+  }
+
+  const inferredUploads = process.env.UPLOADS_BASE || path.join(__dirname, 'uploads');
+  const preciosCacheDefault = path.join(inferredUploads, 'cache', 'precios.json');
+  if (!process.env.PRECIOS_CACHE_FILE) {
+    process.env.PRECIOS_CACHE_FILE = preciosCacheDefault;
+  }
+
+  // ✅ fallback de seguridad: si no hay MONGO_URI, arrancar solo con cache
+  if (!process.env.MONGO_URI) {
+    process.env.PRECIOS_READONLY = '1';
+    console.warn('[server] PRECIOS en modo solo-lectura (sin MONGO_URI)');
+  }
+})();
 
 // Helper: normaliza módulos de rutas que exportan {router}, default, etc.
 const normalizeRouter = (m) => {
@@ -137,6 +159,19 @@ console.log('[uploads] auditorias  =', auditoriasDir);
 console.log('[camara ] sacarfoto   =', sacarfotoDir);
 console.log('===================================');
 
+/* =======================================================
+   LOGS PRECIOS (diagnóstico)
+========================================================== */
+console.log('========== LOGS PRECIOS ==========');
+console.log(`[precios] REMOTE_API_BASE=${resolveRemoteApiBase()}`);
+console.log(`[precios] PRECIOS_REMOTE_URL=${process.env.PRECIOS_REMOTE_URL}`);
+console.log(`[precios] PRECIOS_REMOTE_URL_OTROS=${process.env.PRECIOS_REMOTE_URL_OTROS}`);
+console.log(`[precios] PRECIOS_CACHE_FILE=${process.env.PRECIOS_CACHE_FILE}`);
+if (String(process.env.PRECIOS_DEBUG || '').trim() === '1') {
+  console.log('[precios] DEBUG habilitado (PRECIOS_DEBUG=1)');
+}
+console.log('===================================');
+
 // ⚠️ Orden IMPORTA: primero /uploads/fotos (con CORS), luego /uploads
 app.use('/uploads/fotos', express.static(fotosDir, {
   index: false,
@@ -172,18 +207,6 @@ app.use('/camara/sacarfoto', express.static(sacarfotoDir, {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   }
 }));
-
-/* =======================================================
-   LOGS PRECIOS (diagnóstico)
-========================================================== */
-console.log('========== LOGS PRECIOS ==========');
-console.log(`[precios] REMOTE_API_BASE=${resolveRemoteApiBase()}`);
-console.log(`[precios] PRECIOS_REMOTE_URL=${process.env.PRECIOS_REMOTE_URL}`);
-console.log(`[precios] PRECIOS_CACHE_FILE=${process.env.PRECIOS_CACHE_FILE || '(default under uploads/cache/precios.json)'}`);
-if (String(process.env.PRECIOS_DEBUG || '').trim() === '1') {
-  console.log('[precios] DEBUG habilitado (PRECIOS_DEBUG=1)');
-}
-console.log('==================================');
 
 let syncStatus = { lastRun: null, lastError: null, online: false, pendingOutbox: 0, lastPullCounts: {} };
 
