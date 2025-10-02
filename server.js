@@ -29,7 +29,6 @@ function resolveRemoteApiBase() {
 
 // ---------- Config estándar de precios (efectivo + otros) ----------
 (function ensurePreciosEnv() {
-  // Base API (prod/prueba) → /api/precios
   const base = `${resolveRemoteApiBase()}/api/precios`;
 
   if (!process.env.PRECIOS_REMOTE_URL) {
@@ -45,7 +44,6 @@ function resolveRemoteApiBase() {
     process.env.PRECIOS_CACHE_FILE = preciosCacheDefault;
   }
 
-  // ✅ fallback de seguridad: si no hay MONGO_URI, arrancar solo con cache
   if (!process.env.MONGO_URI) {
     process.env.PRECIOS_READONLY = '1';
     console.warn('[server] PRECIOS en modo solo-lectura (sin MONGO_URI)');
@@ -94,7 +92,7 @@ function compileOriginPatterns(list) {
 const originPatterns = compileOriginPatterns(allowedOrigins);
 
 function isAllowedOrigin(origin) {
-  if (!origin) return true;
+  if (!origin) return true; // requests sin Origin (curl, same-origin) => OK
   if (origin === 'null') return true;
   for (const rule of originPatterns) {
     if (rule.type === 'null' && origin === 'null') return true;
@@ -104,15 +102,32 @@ function isAllowedOrigin(origin) {
   return false;
 }
 
-app.use(cors({
+const corsConfig = {
   origin: function (origin, callback) {
     if (isAllowedOrigin(origin)) return callback(null, true);
     return callback(new Error('No permitido por CORS'));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
-}));
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-Requested-With',
+    'Accept',
+    'Origin',
+    'Cache-Control',
+    'Pragma'
+  ],
+  exposedHeaders: [
+    'Content-Disposition',
+    'X-Request-Id'
+  ]
+};
+
+app.use(cors(corsConfig));
+app.options('*', cors(corsConfig)); // preflights
+
+console.log('[CORS] allowed origins:', allowedOrigins);
 
 // Body parsers
 const BODY_LIMIT = process.env.BODY_LIMIT || '50mb';
@@ -123,25 +138,21 @@ app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 /* =======================================================
    📂 UPLOADS (estáticos) — con carpeta webcamPromos
    ======================================================= */
-// Por defecto que apunte a `__dirname/uploads` (misma carpeta que usan tus rutas).
-// Si seteás UPLOADS_BASE en el .env del server, tiene prioridad.
 const baseUploads = process.env.UPLOADS_BASE || path.join(__dirname, 'uploads');
 const uploadsDir = path.resolve(baseUploads);
 const fotosDir = path.join(uploadsDir, 'fotos');
 const entradasDir = path.join(fotosDir, 'entradas');
-const webcamPromosDir = path.join(fotosDir, 'webcamPromos'); // ✅ NUEVO (fotos de la webcam para promos)
+const webcamPromosDir = path.join(fotosDir, 'webcamPromos');
 const auditoriasDir = path.join(uploadsDir, 'auditorias');
 
-// ✅ Cámara (sacarfoto) — siempre bajo back-end/camara/sacarfoto
 const camaraBaseDir = process.env.CAMARA_DIR || path.join(__dirname, 'camara');
 const sacarfotoDir = path.join(camaraBaseDir, 'sacarfoto');
 
-// Asegurar directorios
 [
   uploadsDir,
   fotosDir,
   entradasDir,
-  webcamPromosDir, // ✅ asegurar carpeta
+  webcamPromosDir,
   auditoriasDir,
   camaraBaseDir,
   sacarfotoDir
@@ -149,12 +160,11 @@ const sacarfotoDir = path.join(camaraBaseDir, 'sacarfoto');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
-// Logs de diagnóstico de rutas reales
 console.log('========== PATHS UPLOADS ==========');
 console.log('[uploads] baseUploads =', uploadsDir);
 console.log('[uploads] fotosDir    =', fotosDir);
 console.log('[uploads] entradasDir =', entradasDir);
-console.log('[uploads] webcamPromo =', webcamPromosDir); // ✅ log nuevo
+console.log('[uploads] webcamPromo =', webcamPromosDir);
 console.log('[uploads] auditorias  =', auditoriasDir);
 console.log('[camara ] sacarfoto   =', sacarfotoDir);
 console.log('===================================');
@@ -172,7 +182,7 @@ if (String(process.env.PRECIOS_DEBUG || '').trim() === '1') {
 }
 console.log('===================================');
 
-// ⚠️ Orden IMPORTA: primero /uploads/fotos (con CORS), luego /uploads
+// ⚠️ Orden IMPORTA
 app.use('/uploads/fotos', express.static(fotosDir, {
   index: false,
   dotfiles: 'deny',
@@ -199,7 +209,6 @@ app.use('/uploads', express.static(uploadsDir, {
   }
 }));
 
-// /camara/sacarfoto desde back-end/camara/sacarfoto
 app.use('/camara/sacarfoto', express.static(sacarfotoDir, {
   index: false,
   dotfiles: 'deny',

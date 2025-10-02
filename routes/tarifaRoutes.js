@@ -1,10 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const {
-    getTarifas,
-    createTarifa,
-    updateTarifa,
-    deleteTarifa
+  getTarifas,
+  createTarifa,
+  updateTarifa,
+  deleteTarifa
 } = require('../controllers/tarifaControllers');
 
 router.get('/', getTarifas);

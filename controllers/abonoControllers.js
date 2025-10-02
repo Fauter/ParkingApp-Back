@@ -6,24 +6,116 @@ const Abono = require('../models/Abono');
 const Vehiculo = require('../models/Vehiculo');
 const Cliente = require('../models/Cliente');
 
-function leerPrecios() {
+/* =======================================================
+   🔧 Utilidades de precios (catálogo por método)
+======================================================= */
+
+/** Lee JSON si existe, si no devuelve null */
+function readJsonIfExists(absPath) {
   try {
-    const p = path.join(__dirname, '../data/precios.json');
-    return JSON.parse(fs.readFileSync(p, 'utf8') || '{}');
+    if (absPath && fs.existsSync(absPath)) {
+      const raw = fs.readFileSync(absPath, 'utf8');
+      return JSON.parse(raw || '{}');
+    }
+  } catch (e) {
+    // ignore
+  }
+  return null;
+}
+
+/** GET local por HTTP al propio server (Node >=18 tiene fetch) */
+async function httpGetJsonLocal(pathAndQuery, timeoutMs = 2000) {
+  if (typeof fetch !== 'function') return null;
+  const port = process.env.PORT || 5000;
+  const url = `http://127.0.0.1:${port}${pathAndQuery}`;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal, headers: { 'Accept': 'application/json' } });
+    if (!r.ok) return null;
+    return await r.json();
   } catch {
-    return {};
+    return null;
+  } finally {
+    clearTimeout(t);
   }
 }
 
-// === Helpers de precios/fechas ===
-function getBaseMensual(tipoVehiculo) {
-  const precios = leerPrecios();
-  const tv = (tipoVehiculo || '').toLowerCase();
-  const cfg = precios[tv] || {};
-  const fallback = { auto: 100000, camioneta: 160000, moto: 50000 }[tv];
-  const base = Number(cfg.mensual) || (fallback != null ? fallback : 100000);
-  return { base, precios };
+/** Carga catálogo por método, con múltiples fallbacks */
+async function loadCatalogForMetodo(metodoPago = 'Efectivo') {
+  const isCash = String(metodoPago).trim().toLowerCase() === 'efectivo';
+  // 1) HTTP local
+  const apiPath = isCash ? '/api/precios' : '/api/precios?metodo=otros';
+  const viaHttp = await httpGetJsonLocal(apiPath, 2000);
+  if (viaHttp && typeof viaHttp === 'object') return viaHttp;
+
+  // 2) Cache en disco (opcional)
+  const baseCache = process.env.PRECIOS_CACHE_FILE || null;
+  let cachePath = baseCache;
+  if (baseCache && !isCash) {
+    const { dir, name, ext } = path.parse(baseCache);
+    cachePath = path.join(dir, `${name}_otros${ext || '.json'}`);
+  }
+  const viaCache = readJsonIfExists(cachePath);
+  if (viaCache) return viaCache;
+
+  // 3) data local (repo)
+  const dataDir = path.join(__dirname, '../data');
+  const localData = isCash
+    ? readJsonIfExists(path.join(dataDir, 'precios.json'))
+    : (readJsonIfExists(path.join(dataDir, 'precios_otros.json')) ||
+       readJsonIfExists(path.join(dataDir, 'precios.json')));
+  if (localData) return localData;
+
+  // 4) fallback duro -> vacío (NO inventar precios)
+  return {};
 }
+
+/** Carga ambos catálogos (efectivo + otros) */
+async function loadCatalogsBoth() {
+  const [efectivo, otros] = await Promise.all([
+    loadCatalogForMetodo('Efectivo'),
+    loadCatalogForMetodo('Otros')
+  ]);
+  return { efectivo, otros };
+}
+
+/* === Tier helpers (sin inventar precios) === */
+function getTierName(cochera, exclusiva) {
+  const c = String(cochera || '').toLowerCase(); // 'fija' | 'móvil' | ''
+  if (c === 'fija') return exclusiva ? 'exclusiva' : 'fija';
+  return 'móvil';
+}
+
+/** Lee precio por TIER desde un catálogo dado. SIN fallback numérico. */
+function precioTierFromCatalog(catalog, tipoVehiculo, cochera, exclusiva) {
+  const tv = String(tipoVehiculo || '').toLowerCase();
+  const tier = getTierName(cochera, exclusiva); // 'móvil' | 'fija' | 'exclusiva'
+  if (!catalog || !catalog[tv]) {
+    throw new Error(`No hay catálogo para tipo "${tv}"`);
+  }
+  // compat móvil con/sin tilde
+  const val =
+    catalog[tv][tier] ??
+    (tier === 'móvil' ? catalog[tv]['movil'] : undefined);
+
+  const num = Number(val);
+  if (!Number.isFinite(num) || num <= 0) {
+    throw new Error(`No hay precio para tipo "${tv}" en tier "${tier}"`);
+  }
+  return num;
+}
+
+/** Precio por método + tier (Efectivo vs Otros) utilizando catálogos precargados */
+function getPrecioByMetodoFromCatalogs(catalogs, tipoVehiculo, metodoPago, cochera, exclusiva) {
+  const isCash = String(metodoPago || '').trim().toLowerCase() === 'efectivo';
+  const pick = isCash ? (catalogs.efectivo || {}) : (catalogs.otros || {});
+  return precioTierFromCatalog(pick, tipoVehiculo, cochera, exclusiva);
+}
+
+/* =======================================================
+   ⏱️ Helpers de fechas / prorrateo
+======================================================= */
 
 function getUltimoDiaMes(hoy = new Date()) {
   const d = new Date(hoy.getFullYear(), hoy.getMonth() + 1, 0);
@@ -35,14 +127,18 @@ function prorratearMonto(base, hoy = new Date()) {
   const ultimoDiaMes = getUltimoDiaMes(hoy);
   const totalDiasMes = ultimoDiaMes.getDate();
   const diaActual = hoy.getDate();
+  // Día 1 => cobro mes completo
   const diasRestantes = (diaActual === 1) ? totalDiasMes : (totalDiasMes - diaActual + 1);
   const factor = diasRestantes / totalDiasMes;
   const proporcional = Math.round(base * factor);
   return { proporcional, ultimoDiaMes, totalDiasMes, diasRestantes, factor };
 }
 
-// Máximo “base mensual” ya abonado por el cliente en el mes vigente
-async function getClienteMaxBaseMensualVigente(clienteId, hoy = new Date(), sopt) {
+/* =======================================================
+   📈 Máximo “base mensual” ya abonado por el cliente (mes vigente)
+======================================================= */
+
+async function getClienteMaxBaseMensualVigente(clienteId, hoy = new Date(), sopt, catalogs) {
   if (!clienteId) return { maxBase: 0 };
 
   const inicioMes = new Date(hoy.getFullYear(), hoy.getMonth(), 1);
@@ -52,30 +148,41 @@ async function getClienteMaxBaseMensualVigente(clienteId, hoy = new Date(), sopt
     cliente: clienteId,
     activo: true,
     fechaExpiracion: { $gte: inicioMes, $lte: finMes }
-  }, null, sopt).lean();
+  }, { tipoVehiculo: 1, metodoPago: 1, cochera: 1, exclusiva: 1 }, sopt).lean();
 
   if (!abonos || !abonos.length) return { maxBase: 0 };
 
-  const { precios } = getBaseMensual(); // sólo para acceder a mapa
-  const baseDe = (tipo) => {
-    const tv = (tipo || '').toLowerCase();
-    const cfg = (precios || {})[tv] || {};
-    const fallback = { auto: 100000, camioneta: 160000, moto: 50000 }[tv];
-    return Number(cfg.mensual) || (fallback != null ? fallback : 100000);
-  };
-
   let maxBase = 0;
   for (const a of abonos) {
-    const b = baseDe(a.tipoVehiculo);
-    if (b > maxBase) maxBase = b;
+    let base = 0;
+    try {
+      base = getPrecioByMetodoFromCatalogs(
+        catalogs,
+        a.tipoVehiculo,
+        a.metodoPago || 'Efectivo',
+        a.cochera || 'Móvil',
+        a.cochera === 'Fija' ? Boolean(a.exclusiva) : false
+      );
+    } catch {
+      base = 0; // si un abono viejo no matchea catálogo actual, lo ignoramos para el "máximo"
+    }
+    if (base > maxBase) maxBase = base;
   }
   return { maxBase };
 }
+
+/* =======================================================
+   🖼️ Helpers de fotos
+======================================================= */
 
 function buildFotoPath(req, field) {
   const f = req.files?.[field]?.[0]?.filename;
   return f ? `/uploads/fotos/${f}` : (req.body?.[field] || '');
 }
+
+/* =======================================================
+   ⚙️ Soporte transacciones y búsqueda flexible de Cliente
+======================================================= */
 
 async function supportsTransactions() {
   try {
@@ -94,6 +201,7 @@ async function findClienteFlexible(id, sopt) {
   if (!id) return null;
   const rawId = String(id);
 
+  // 1) _id guardado como string
   try {
     const first = await Cliente.collection.findOne(
       { _id: rawId },
@@ -102,11 +210,13 @@ async function findClienteFlexible(id, sopt) {
     if (first) return new Cliente(first);
   } catch {}
 
+  // 2) _id ObjectId válido
   if (mongoose.Types.ObjectId.isValid(rawId)) {
     const byObj = await Cliente.findById(rawId, null, sopt);
     if (byObj) return byObj;
   }
 
+  // 3) _id-string raro (coincidencia por $toString)
   try {
     const agg = await Cliente.aggregate([
       { $addFields: { _idStr: { $toString: '$_id' } } },
@@ -122,17 +232,73 @@ async function findClienteFlexible(id, sopt) {
   return null;
 }
 
+/* =======================================================
+   👤 Alta/obtención de cliente en backend (id o DNI)
+======================================================= */
+
+async function ensureClienteBackend(payload, sopt) {
+  const clienteId = payload.cliente || payload.clienteId;
+  const dni = String(payload.dniCuitCuil || '').trim();
+
+  // 1) Si vino un ID, lo intentamos
+  if (clienteId) {
+    const byId = await findClienteFlexible(clienteId, sopt);
+    if (byId) return byId;
+  }
+
+  // 2) Si hay DNI, buscamos por DNI
+  if (dni) {
+    const byDni = await Cliente.findOne({ dniCuitCuil: dni }, null, sopt);
+    if (byDni) return byDni;
+  }
+
+  // 3) Crear cliente con los datos provistos
+  if (!dni) throw new Error('Falta dniCuitCuil para crear cliente');
+  if (!String(payload.nombreApellido || '').trim()) throw new Error('Falta nombreApellido para crear cliente');
+  if (!String(payload.email || '').trim()) throw new Error('Falta email para crear cliente');
+
+  const cliente = new Cliente({
+    nombreApellido: String(payload.nombreApellido).trim(),
+    dniCuitCuil: dni,
+    domicilio: payload.domicilio || '',
+    localidad: payload.localidad || '',
+    telefonoParticular: payload.telefonoParticular || '',
+    telefonoEmergencia: payload.telefonoEmergencia || '',
+    domicilioTrabajo: payload.domicilioTrabajo || '',
+    telefonoTrabajo: payload.telefonoTrabajo || '',
+    email: String(payload.email).trim(),
+    abonado: false,
+    finAbono: null,
+    precioAbono: String(payload.tipoVehiculo || '').toLowerCase(),
+    abonos: [],
+    vehiculos: [],
+    movimientos: []
+  });
+  await cliente.save(sopt);
+  return cliente;
+}
+
 /* =========================
    PREVIEWS
 ========================= */
 
-// GET /api/abonos/preview?clienteId=...&tipoVehiculo=... (&dniCuitCuil=...)
+// GET /api/abonos/preview?clienteId=...&tipoVehiculo=...&metodoPago=...&cochera=Fija|Móvil&exclusiva=true|false (&dniCuitCuil=...)
 exports.previewAbono = async (req, res) => {
   try {
-    let { clienteId, tipoVehiculo, dniCuitCuil } = req.query;
+    let {
+      clienteId,
+      tipoVehiculo,
+      dniCuitCuil,
+      metodoPago = 'Efectivo',
+      cochera = 'Móvil',
+      exclusiva = 'false'
+    } = req.query;
+
     if (!tipoVehiculo) {
       return res.status(400).json({ error: 'Falta tipoVehiculo' });
     }
+
+    const exBool = String(exclusiva) === 'true';
 
     // Resolver cliente por id o por dni (opcional)
     let cliente = null;
@@ -142,13 +308,22 @@ exports.previewAbono = async (req, res) => {
       cliente = await Cliente.findOne({ dniCuitCuil: String(dniCuitCuil).trim() }).lean();
     }
 
+    const catalogs = await loadCatalogsBoth();
     const hoy = new Date();
-    const { base: baseNuevo } = getBaseMensual(tipoVehiculo);
-    let baseActual = 0;
 
+    // base del nuevo abono (según método + tier)
+    let baseNuevo = 0;
+    try {
+      baseNuevo = getPrecioByMetodoFromCatalogs(catalogs, tipoVehiculo, metodoPago, cochera, cochera === 'Fija' ? exBool : false);
+    } catch (e) {
+      return res.status(400).json({ error: e.message || 'Precio no disponible para el tier elegido' });
+    }
+
+    // máximo base ya abonado este mes (respetando método/tier históricas)
+    let baseActual = 0;
     if (cliente && cliente._id) {
-      const { maxBase } = await getClienteMaxBaseMensualVigente(cliente._id, hoy, null);
-      baseActual = maxBase || 0;
+      const r = await getClienteMaxBaseMensualVigente(cliente._id, hoy, null, catalogs);
+      baseActual = r.maxBase || 0;
     }
 
     const diffBase = Math.max(0, baseNuevo - baseActual);
@@ -156,6 +331,9 @@ exports.previewAbono = async (req, res) => {
 
     return res.json({
       ok: true,
+      metodoPago,
+      cochera,
+      exclusiva: cochera === 'Fija' ? exBool : false,
       baseActual,
       baseNuevo,
       diffBase,
@@ -177,33 +355,49 @@ exports.previewAbono = async (req, res) => {
   }
 };
 
-// GET /api/abonos/preview-renovacion?clienteId=...
+// GET /api/abonos/preview-renovacion?clienteId=...&metodoPago=...&cochera=...&exclusiva=...
 exports.previewRenovacion = async (req, res) => {
   try {
-    const { clienteId } = req.query;
+    const { clienteId, metodoPago = 'Efectivo' } = req.query;
+    let { cochera = 'Móvil', exclusiva = 'false' } = req.query;
+    const exBool = String(exclusiva) === 'true';
+
     if (!clienteId) return res.status(400).json({ error: 'Falta clienteId' });
 
     const cliente = await findClienteFlexible(clienteId, null);
     if (!cliente) return res.status(404).json({ error: 'Cliente no encontrado' });
 
-    // Tier a renovar
+    // Tipo a renovar
     let tipo = (cliente.precioAbono || '').toLowerCase();
     if (!tipo) {
-      // inferimos del último abono activo o por fecha
       const ultimo = await Abono.findOne({ cliente: cliente._id })
         .sort({ fechaExpiracion: -1, createdAt: -1 })
         .lean();
       tipo = (ultimo?.tipoVehiculo || '').toLowerCase();
+      // si tampoco hay cochera/exclusiva, tomamos las del último abono
+      if (!req.query.cochera && ultimo?.cochera) cochera = ultimo.cochera;
+      if (!req.query.exclusiva && typeof ultimo?.exclusiva === 'boolean') exclusiva = String(ultimo.exclusiva);
     }
     if (!tipo) return res.status(400).json({ error: 'No hay tipo asignado para renovar' });
 
+    const catalogs = await loadCatalogsBoth();
     const hoy = new Date();
-    const { base: baseNuevo } = getBaseMensual(tipo);
+
+    let baseNuevo;
+    try {
+      baseNuevo = getPrecioByMetodoFromCatalogs(catalogs, tipo, metodoPago, cochera, cochera === 'Fija' ? exBool : false);
+    } catch (e) {
+      return res.status(400).json({ error: e.message || 'Precio no disponible para el tier elegido' });
+    }
+
     const { proporcional, ultimoDiaMes, totalDiasMes, diasRestantes, factor } = prorratearMonto(baseNuevo, hoy);
 
     return res.json({
       ok: true,
+      metodoPago,
       tipoVehiculo: tipo,
+      cochera,
+      exclusiva: cochera === 'Fija' ? exBool : false,
       baseNuevo,
       diasRestantes,
       totalDiasMes,
@@ -237,9 +431,9 @@ exports.renovarAbono = async (req, res) => {
       factura='CC',
       operador,
       patente,
-      cochera = '',     // NUEVO: opcional
-      piso = '',        // NUEVO: opcional
-      exclusiva = false // NUEVO: opcional
+      cochera = 'Móvil',
+      piso = '',
+      exclusiva = false
     } = req.body;
     if (!clienteId) throw new Error('Falta clienteId');
 
@@ -253,11 +447,24 @@ exports.renovarAbono = async (req, res) => {
         .sort({ fechaExpiracion: -1, createdAt: -1 })
         .lean();
       tipo = (ultimo?.tipoVehiculo || '').toLowerCase();
+      // si body no trae cochera/exclusiva, heredamos del último
+      if (!req.body.cochera && ultimo?.cochera) req.body.cochera = ultimo.cochera;
+      if (!('exclusiva' in req.body) && typeof ultimo?.exclusiva === 'boolean') req.body.exclusiva = ultimo.exclusiva;
     }
     if (!tipo) throw new Error('El cliente no tiene tipo asociado para renovar');
 
+    const catalogs = await loadCatalogsBoth();
     const hoy = new Date();
-    const { base: baseNuevo } = getBaseMensual(tipo);
+
+    let baseNuevo;
+    try {
+      baseNuevo = getPrecioByMetodoFromCatalogs(
+        catalogs, tipo, metodoPago, cochera, cochera === 'Fija' ? Boolean(exclusiva) : false
+      );
+    } catch (e) {
+      throw new Error(e.message || 'Precio no disponible para el tier elegido');
+    }
+
     const { proporcional, ultimoDiaMes, totalDiasMes } = prorratearMonto(baseNuevo, hoy);
     const monto = proporcional;
 
@@ -280,10 +487,9 @@ exports.renovarAbono = async (req, res) => {
       fechaExpiracion: ultimoDiaMes,
       cliente: cliente._id,
       activo: true,
-      // NUEVO:
       cochera: ['Fija','Móvil'].includes(String(cochera)) ? cochera : '',
       piso: String(piso || ''),
-      exclusiva: Boolean(exclusiva)
+      exclusiva: cochera === 'Fija' ? Boolean(exclusiva) : false
     });
     await abono.save(sopt);
 
@@ -347,7 +553,7 @@ exports.renovarAbono = async (req, res) => {
   } catch (error) {
     console.error('renovarAbono error:', error);
     if (session) { try { await session.abortTransaction(); } catch {} session.endSession(); }
-    return res.status(500).json({ error: error.message || 'Error al renovar abono' });
+    return res.status(400).json({ error: error.message || 'Error al renovar abono' });
   }
 };
 
@@ -363,7 +569,7 @@ exports.registrarAbono = async (req, res) => {
   if (session) session.startTransaction();
   const sopt = session ? { session } : {};
 
-  const created = { vehiculo: null, abono: null, mov: null, movCli: null };
+  const created = { cliente: null, vehiculo: null, abono: null, mov: null, movCli: null };
 
   try {
     const {
@@ -388,32 +594,45 @@ exports.registrarAbono = async (req, res) => {
       cliente: clienteIdBody,
       clienteId: clienteIdAlt,
       operador,
-      // NUEVO:
-      cochera = '',
+      cochera = 'Móvil',
       piso = '',
       exclusiva = false
     } = req.body;
 
-    const clienteId = clienteIdBody || clienteIdAlt;
-
+    // Validaciones mínimas de datos base (cliente se resuelve/crea abajo)
     if (!String(nombreApellido || '').trim()) throw new Error('Falta nombreApellido');
     if (!String(email || '').trim()) throw new Error('Falta email');
     if (!String(patente || '').trim()) throw new Error('Falta patente');
     if (!String(tipoVehiculo || '').trim()) throw new Error('Falta tipoVehiculo');
     if (!String(dniCuitCuil || '').trim()) throw new Error('Falta dniCuitCuil');
-    if (!clienteId) throw new Error('Falta cliente (ObjectId)');
 
     const pat = String(patente).trim().toUpperCase();
     const operadorNombre = req.user?.nombre || operador || 'Sistema';
+
+    // 🧠 Cliente: buscar por id/dni o crear
+    let cliente = await ensureClienteBackend(
+      {
+        cliente: clienteIdBody || clienteIdAlt,
+        nombreApellido,
+        dniCuitCuil,
+        domicilio,
+        localidad,
+        telefonoParticular,
+        telefonoEmergencia,
+        domicilioTrabajo,
+        telefonoTrabajo,
+        email,
+        tipoVehiculo
+      },
+      sopt
+    );
+    if (!cliente) throw new Error('No se pudo obtener/crear cliente');
+    if (!session) created.cliente = cliente;
 
     // Fotos
     const fotoSeguro       = buildFotoPath(req, 'fotoSeguro');
     const fotoDNI          = buildFotoPath(req, 'fotoDNI');
     const fotoCedulaVerde  = buildFotoPath(req, 'fotoCedulaVerde');
-
-    // Cliente
-    const cliente = await findClienteFlexible(clienteId, sopt);
-    if (!cliente) throw new Error('Cliente no encontrado');
 
     // Vehículo (crear o actualizar)
     let vehiculo = await Vehiculo.findOne({ patente: pat }, null, sopt);
@@ -439,10 +658,22 @@ exports.registrarAbono = async (req, res) => {
       console.log('🔗 Vehículo actualizado/vinculado:', vehiculo._id);
     }
 
-    // Cálculo diferencia
+    // === Cálculo diferencia usando catálogos por método + TIER ===
+    const catalogs = await loadCatalogsBoth();
     const hoy = new Date();
-    const { base: baseNuevo } = getBaseMensual(tipoVehiculo);
-    const { maxBase } = await getClienteMaxBaseMensualVigente(cliente._id, hoy, sopt);
+
+    // base del nuevo abono (según método seleccionado y tier)
+    let baseNuevo;
+    try {
+      baseNuevo = getPrecioByMetodoFromCatalogs(
+        catalogs, tipoVehiculo, metodoPago, cochera, cochera === 'Fija' ? Boolean(exclusiva) : false
+      );
+    } catch (e) {
+      throw new Error(e.message || 'Precio no disponible para el tier elegido');
+    }
+
+    // máximo base ya abonado este mes por el cliente (respetando método/tier previos)
+    const { maxBase } = await getClienteMaxBaseMensualVigente(cliente._id, hoy, sopt, catalogs);
 
     const diffBase = Math.max(0, baseNuevo - maxBase);
     const { proporcional, ultimoDiaMes, totalDiasMes } = prorratearMonto(diffBase, hoy);
@@ -476,10 +707,9 @@ exports.registrarAbono = async (req, res) => {
       fotoCedulaVerde,
       cliente: cliente._id,
       vehiculo: vehiculo._id,
-      // === NUEVO ===
       cochera: ['Fija','Móvil'].includes(String(cochera)) ? cochera : '',
       piso: String(piso || ''),
-      exclusiva: Boolean(exclusiva)
+      exclusiva: cochera === 'Fija' ? Boolean(exclusiva) : false
     });
     await AbonoModelo.save(sopt);
     if (!session) created.abono = AbonoModelo;
@@ -492,7 +722,7 @@ exports.registrarAbono = async (req, res) => {
     cliente.abonado = true;
     cliente.finAbono = ultimoDiaMes;
 
-    // Actualizar tier del cliente si corresponde
+    // Actualizar "tipo" del cliente si corresponde (nos quedamos con el más caro del mes)
     if (baseNuevo >= maxBase) {
       cliente.precioAbono = (tipoVehiculo || '').toLowerCase();
     }
@@ -589,13 +819,14 @@ exports.registrarAbono = async (req, res) => {
         if (created.mov)    await Movimiento.deleteOne({ _id: created.mov._id });
         if (created.abono)  await Abono.deleteOne({ _id: created.abono._id });
         if (created.vehiculo) await Vehiculo.deleteOne({ _id: created.vehiculo._id });
+        if (created.cliente) await Cliente.deleteOne({ _id: created.cliente._id });
         console.log('🧹 Rollback compensatorio ejecutado');
       } catch (e) {
         console.warn('⚠️ Fallo en rollback compensatorio:', e?.message || e);
       }
     }
 
-    return res.status(500).json({ message: 'Error al registrar abono', error: error.message });
+    return res.status(400).json({ message: 'Error al registrar abono', error: error.message });
   }
 };
 
@@ -622,12 +853,12 @@ exports.getAbonos = async (req, res) => {
       skip = 0,
       clienteId,
       patente,
-      paginated // << NUEVO toggle
+      paginated
     } = req.query;
 
     const q = {};
 
-    // Filtros opcionales (no filtra si no los mandás)
+    // Filtros opcionales
     if (cochera !== undefined) {
       const c = String(cochera);
       if (['Fija', 'Móvil', ''].includes(c)) q.cochera = c;
@@ -659,7 +890,6 @@ exports.getAbonos = async (req, res) => {
       Abono.countDocuments(q)
     ]);
 
-    // 🔙 Back-compat: por defecto devolvemos ARRAY
     if (String(paginated) === 'true') {
       return res.status(200).json({ total, limit: lim, skip: sk, items });
     }
@@ -769,7 +999,7 @@ exports.getAbonoPorId = async (req, res) => {
   }
 };
 
-// PATCH /api/abonos/:id  (permite actualizar cochera/piso/exclusiva y fotos; NO rompe campos previos)
+// PATCH /api/abonos/:id
 exports.actualizarAbono = async (req, res) => {
   try {
     const { id } = req.params;
@@ -783,9 +1013,7 @@ exports.actualizarAbono = async (req, res) => {
       'domicilioTrabajo','telefonoTrabajo','email','dniCuitCuil','patente','marca','modelo',
       'color','anio','companiaSeguro','precio','metodoPago','factura','tipoVehiculo',
       'activo',
-      // NUEVOS:
       'cochera','piso','exclusiva',
-      // Fotos:
       'fotoSeguro','fotoDNI','fotoCedulaVerde'
     ];
 

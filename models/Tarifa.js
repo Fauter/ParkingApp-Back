@@ -7,6 +7,9 @@ const TarifaSchema = new mongoose.Schema({
   horas: { type: Number, default: 0 },
   minutos: { type: Number, default: 0 },
   tolerancia: { type: Number, default: 0 },
+
+  // NUEVO: para proteger tarifas del sistema (abonos fijos)
+  editable: { type: Boolean, default: true },
 }, { timestamps: true });
 
 module.exports = mongoose.model('Tarifa', TarifaSchema);
