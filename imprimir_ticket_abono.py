@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Ticket común: imprime encabezado fijo y un código de barras Code128 con el número recibido.
+Ticket ABONO: SIN código de barras. Muestra Pago Proporcional y pie especial.
 - Si la impresora es "Microsoft Print to PDF" (o contiene "print to pdf"):
   NO imprime: guarda PREVIEW en PNG y PDF con el mismo layout y lo abre.
-- Debajo del barcode: "Valor de Hora: ..." y "Patente: ...".
+
+Entrada:
+  argv[1]: puede ser un identificador de operación (no se imprime).
+  argv[2] (JSON opcional) o variables de entorno:
+    - proporcional  (o PROPORCIONAL)  -> string/importe para "Pago Proporcional: $..."
+    - patente       (o PATENTE)       -> opcional: se puede mostrar debajo como referencia
 """
 
 import os, sys, json
@@ -30,15 +35,13 @@ except Exception as e:
     PIL_OK = False
     PIL_VERSION = "N/A"
 
-# Barcode
-try:
-    from barcode import Code128
-    from barcode.writer import ImageWriter
-    BARCODE_OK = True
-except Exception:
-    BARCODE_OK = False
-
 COMPANY_NAME = "Eleven Park S.A."
+
+# ------------------------- Constantes de layout -------------------------
+GAP = 6                     # gap vertical base
+PAD_AFTER_FECHA = 10        # padding extra debajo de "Fecha"
+PAD_AFTER_PATENTE = 20      # padding extra debajo de "Patente"
+LEGAL_GAP = 10              # separación entre líneas legales (más aire)
 
 # ------------------------- Utils -------------------------
 
@@ -59,7 +62,7 @@ def _ensure_dir(p):
 
 def _debug_env():
     print("==== DEBUG ENTORNO ====")
-    print(f"PIL_OK={PIL_OK} (Pillow {PIL_VERSION})  BARCODE_OK={BARCODE_OK}")
+    print(f"PIL_OK={PIL_OK} (Pillow {PIL_VERSION})")
     print(f"Python: {sys.executable}")
     print("=======================")
 
@@ -154,13 +157,13 @@ def _is_preview_printer(printer_name: str) -> bool:
 # ---------------------- Render (PIL) ----------------------
 
 def _load_font(size):
-    try:
-        return ImageFont.truetype("consola.ttf", size)
-    except Exception:
-        try:
-            return ImageFont.truetype("DejaVuSans.ttf", size)
-        except Exception:
-            return ImageFont.load_default()
+  try:
+      return ImageFont.truetype("consola.ttf", size)
+  except Exception:
+      try:
+          return ImageFont.truetype("DejaVuSans.ttf", size)
+      except Exception:
+          return ImageFont.load_default()
 
 def _text_wh(draw, text, font):
     bbox = draw.textbbox((0, 0), text, font=font)
@@ -177,26 +180,9 @@ def _draw_left(draw, text, y, font, x_left, fill=0):
     draw.text((x_left, y), text, fill=fill, font=font)
     return y + h
 
-def _make_barcode_image(number: str, target_w: int):
-    if not BARCODE_OK:
-        raise RuntimeError("python-barcode no disponible (pip install python-barcode)")
-    temp_dir = os.environ.get("TEMP", r"C:\Temp")
-    _ensure_dir(temp_dir)
-    tmp_base = os.path.join(temp_dir, f"barcode_{number}")
-    barcode_path = Code128(number, writer=ImageWriter()).save(
-        tmp_base,
-        {"write_text": False, "module_width": 0.45, "module_height": 20, "quiet_zone": 2}
-    )
-    img_bar = Image.open(barcode_path).convert("L")
-    if img_bar.width > target_w:
-        ratio = target_w / float(img_bar.width)
-        h = max(1, int(img_bar.height * ratio))
-        img_bar = img_bar.resize((target_w, h), Image.LANCZOS)
-    return img_bar
-
-def render_ticket_canvas(lines, barcode_number, valor_hora: str = "", patente: str = ""):
+def render_ticket_canvas(lines, proporcional: str = "", patente: str = ""):
     """
-    Devuelve un PIL.Image 'L' (grises) del ticket común.
+    Devuelve un PIL.Image 'L' (grises) del ticket de ABONO (sin barcode).
     """
     if not PIL_OK:
         raise RuntimeError("Pillow (PIL) no disponible")
@@ -206,8 +192,7 @@ def render_ticket_canvas(lines, barcode_number, valor_hora: str = "", patente: s
     margin_top   = 10
     margin_side  = 10
     margin_bottom = 3
-    usable_w = canvas_w - 2 * margin_side
-    gap      = 6
+    gap      = GAP
 
     font_title_size  = 29
     font_body_size   = 22
@@ -224,50 +209,45 @@ def render_ticket_canvas(lines, barcode_number, valor_hora: str = "", patente: s
     dummy = Image.new("L", (1, 1), 255)
     d     = ImageDraw.Draw(dummy)
 
-    # Altura estimada del texto
+    # Alturas
     _, h_header = _text_wh(d, header, font_title)
     est_text_h  = h_header + gap
     est_text_h += 2 + gap  # separador fino bajo el título
-    est_text_h += gap       # padding extra antes del cuerpo
+    est_text_h += gap
 
     for t in body:
         _, h = _text_wh(d, t, font_body)
         est_text_h += h + gap
-    est_text_h += 10  # antes del área del barcode
+        if t.startswith("Fecha:"):
+            est_text_h += PAD_AFTER_FECHA  # padding extra bajo "Fecha"
 
-    # Código de barras
-    img_bar = None
-    try:
-        img_bar = _make_barcode_image(barcode_number, usable_w)
-        bar_h = img_bar.height
-    except Exception as be:
-        print(f"WARNING: No se pudo generar Code128 real: {be}. Se omitirá el barcode.")
-        bar_h = 0
-        img_bar = None
-
-    # Footer y legal
-    footer_texts = ["¡Gracias por su visita!"]
-    legal_texts  = ["Aceptación Contrato (Adm.) – Jurisdicción: Tribunales CABA"]
+    # Footer especial abono (sin "Gracias por su visita")
+    footer_texts = []  # vacío
+    legal_texts  = [
+        "Gracias por confiar en nosotros, recuerde que la mensualidad",
+        "se paga del 1 al 10 de cada mes",
+        "Ticket sin valor fiscal",
+    ]
 
     h_footer_total = 0
     for t in footer_texts:
         _, h = _text_wh(d, t, font_footer)
         h_footer_total += h + 10
+
+    # Altura de legal con más separación (LEGAL_GAP)
     h_legal_total = 0
     for t in legal_texts:
         _, h = _text_wh(d, t, font_small)
-        h_legal_total += gap + h
+        h_legal_total += LEGAL_GAP + h
 
-    # Altura extra por líneas debajo del barcode
-    _, h_body_line = _text_wh(d, "X", font_body)
-    after_bar_extra = (h_body_line + gap) * 2  # Valor de Hora + Patente
+    # Altura de la línea "Patente" (si aplica) + su padding extra
+    after_patente = 0
+    if patente:
+        _, hpat = _text_wh(d, f"Patente: {patente}", font_body)
+        after_patente = gap + hpat + PAD_AFTER_PATENTE
 
-    canvas_h = (margin_top + est_text_h +
-                ((bar_h + gap) if img_bar is not None else (gap)) +
-                after_bar_extra +
-                h_footer_total +
-                h_legal_total +
-                margin_bottom)
+    canvas_h = (margin_top + est_text_h + after_patente +
+                h_footer_total + h_legal_total + margin_bottom)
 
     canvas   = Image.new("L", (canvas_w, canvas_h), 255)
     draw     = ImageDraw.Draw(canvas)
@@ -284,36 +264,31 @@ def render_ticket_canvas(lines, barcode_number, valor_hora: str = "", patente: s
     # Cuerpo
     for t in body:
         y = _draw_left(draw, t, y, font_body, margin_side)
-    y += 10
-
-    # Barcode
-    if img_bar is not None:
-        x_bar = margin_side + (usable_w - img_bar.width)//2
-        canvas.paste(img_bar, (x_bar, y))
-        y += img_bar.height + gap
-    else:
         y += gap
+        if t.startswith("Fecha:"):
+            y += PAD_AFTER_FECHA  # **padding 10px debajo de Fecha**
 
-    # Debajo del barcode
-    y = _draw_left(draw, f"Valor de Hora: {valor_hora or ''}", y, font_body, margin_side); y += gap
-    y = _draw_left(draw, f"Patente: {patente or ''}",       y, font_body, margin_side); y += gap
+    # Patente (opcional) con padding extra
+    if patente:
+        y = _draw_left(draw, f"Patente: {patente}", y, font_body, margin_side)
+        y += PAD_AFTER_PATENTE  # **padding 20px debajo de Patente**
 
-    # Footer
+    # Footer (no se usa en abono, pero se deja por consistencia)
     for t in footer_texts:
         y += 10
         y = _draw_center(draw, t, y, font_footer, canvas_w)
         y += 10
 
-    # Legal
+    # Legal / pie pequeño — queda abajo de todo con más aire entre líneas
     for t in legal_texts:
-        y += gap
+        y += LEGAL_GAP
         _ = _draw_center(draw, t, y, font_small, canvas_w)
 
     return canvas
 
 # ---------------------- Impresión GDI ---------------------
 
-def _start_doc(dc, title="Ticket"):
+def _start_doc(dc, title="Ticket Abono"):
     dc.StartDoc(str(title))
     dc.StartPage()
 
@@ -329,7 +304,7 @@ def _end_doc(dc):
 def _print_bitmap_via_gdi(printer_name, pil_image_rgb):
     hDC = win32ui.CreateDC()
     hDC.CreatePrinterDC(printer_name)
-    _start_doc(hDC, title="Ticket")
+    _start_doc(hDC, title="Ticket Abono")
     dib_hw = ImageWin.Dib(pil_image_rgb)
     w, h = pil_image_rgb.size
     dib_hw.draw(hDC.GetHandleOutput(), (0, 0, w, h))
@@ -345,7 +320,7 @@ def _print_text_gdi(printer_name, lines, font_name="Consolas", font_height=18, l
         hDC.SetMapMode(win32con.MM_TEXT)
         lf = win32ui.CreateFont({"name": font_name, "height": -font_height, "weight": 400})
         hDC.SelectObject(lf)
-        _start_doc(hDC, title="Ticket")
+        _start_doc(hDC, title="Ticket Abono")
         x, y = left, top
         for line in lines:
             hDC.TextOut(x, y, line)
@@ -364,13 +339,14 @@ def _print_text_gdi(printer_name, lines, font_name="Consolas", font_height=18, l
 
 # ---------------------- Build & Main ----------------------
 
-def build_ticket_lines(ticket_str: str):
+def build_ticket_lines(proporcional: str):
     """
-    Devuelve (lines, numero_barcode).
+    Devuelve (lines).
     Formato:
       - Eleven Park S.A.
       - Aguero 265
       - Fecha: YYYY-MM-DD HH:MM:SS
+      - Pago Proporcional: $<proporcional>
       - (línea en blanco)
     """
     now = _now_str()
@@ -378,16 +354,16 @@ def build_ticket_lines(ticket_str: str):
         COMPANY_NAME,
         "Aguero 265",
         f"Fecha:  {now}",
+        f"Pago Proporcional: ${proporcional or ''}",
         "",
     ]
-    number = str(ticket_str or "000000")
-    return lines, number
+    return lines
 
-def _save_preview(canvas_img, number_to_encode):
+def _save_preview(canvas_img):
     out_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)),
                            "tickets_preview", _today_str())
     _ensure_dir(out_dir)
-    base = os.path.join(out_dir, f"Ticket_{number_to_encode or 'PREVIEW'}")
+    base = os.path.join(out_dir, f"Ticket_ABONO")
     png_path = base + ".png"
     pdf_path = base + ".pdf"
 
@@ -403,11 +379,11 @@ def _save_preview(canvas_img, number_to_encode):
 def _parse_optional_meta():
     """
     Lee meta opcional desde argv[2] (JSON) o desde variables de entorno:
-      - valorHora  (o VALOR_HORA)
-      - patente    (o PATENTE)
+      - proporcional (o PROPORCIONAL)
+      - patente      (o PATENTE)  -> opcional, se muestra como referencia
     """
-    valor_hora = os.environ.get("VALOR_HORA", "").strip()
-    patente    = os.environ.get("PATENTE", "").strip()
+    proporcional = os.environ.get("PROPORCIONAL", "").strip()
+    patente      = os.environ.get("PATENTE", "").strip()
 
     if len(sys.argv) >= 3:
         raw = (sys.argv[2] or "").strip()
@@ -415,37 +391,32 @@ def _parse_optional_meta():
             try:
                 obj = json.loads(raw)
                 if isinstance(obj, dict):
-                    valor_hora = str(obj.get("valorHora", valor_hora) or "").strip()
-                    patente    = str(obj.get("patente",   patente)    or "").strip()
+                    proporcional = str(obj.get("proporcional", proporcional) or "").strip()
+                    patente      = str(obj.get("patente",      patente)      or "").strip()
             except Exception as e:
                 print(f"WARNING: argv[2] no es JSON válido ({e}). Se ignora.")
 
-    return valor_hora, patente
+    return proporcional, patente
 
 def main():
     _debug_env()
 
-    ticket_str = str(sys.argv[1]).strip() if len(sys.argv) >= 2 else "0000000000"
+    _ = str(sys.argv[1]).strip() if len(sys.argv) >= 2 else ""  # id/placeholder no usado
     printer_name = get_resolved_printer_name()
 
-    # Meta
-    valor_hora, patente = _parse_optional_meta()
+    proporcional, patente = _parse_optional_meta()
 
     # Build
-    lines, number_to_encode = build_ticket_lines(ticket_str)
+    lines = build_ticket_lines(proporcional)
 
     # PREVIEW (PDF)
     if _is_preview_printer(printer_name):
         if not PIL_OK:
             print("ERROR: Para PREVIEW se requiere Pillow instalado.")
             raise SystemExit(1)
-        if not BARCODE_OK:
-            print("ERROR: Para PREVIEW con código de barras se requiere 'python-barcode'.")
-            print("Sugerido: pip install python-barcode")
-            raise SystemExit(1)
         try:
-            canvas = render_ticket_canvas(lines, number_to_encode, valor_hora=valor_hora, patente=patente)
-            _save_preview(canvas, number_to_encode)
+            canvas = render_ticket_canvas(lines, proporcional=proporcional, patente=patente)
+            _save_preview(canvas)
             return
         except Exception as e:
             print(f"ERROR: Falló PREVIEW: {e}")
@@ -455,7 +426,7 @@ def main():
     try:
         if not PIL_OK:
             raise RuntimeError("Pillow no disponible")
-        canvas = render_ticket_canvas(lines, number_to_encode, valor_hora=valor_hora, patente=patente)
+        canvas = render_ticket_canvas(lines, proporcional=proporcional, patente=patente)
         _print_bitmap_via_gdi(printer_name, canvas.convert("RGB"))
         return
     except Exception as e:
@@ -470,5 +441,5 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:
-        print(f"ERROR: excepción no controlada en imprimir_ticket.py: {e}")
+        print(f"ERROR: excepción no controlada en imprimir_ticket_abono.py: {e}")
         raise

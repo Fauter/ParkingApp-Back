@@ -4,20 +4,22 @@ const Counter = require('../models/Counter');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
+const { execFile } = require('child_process');
 
-// Configuración de directorios
+// =====================
+// Paths de fotos
+// =====================
 const FOTOS_DIR = path.join(__dirname, '../uploads/fotos');
 const FOTOS_ENTRADAS_DIR = path.join(FOTOS_DIR, 'entradas');
 const FOTOS_TICKETS_DIR = path.join(FOTOS_DIR, 'tickets');
 
-// Crear directorios si no existen
 [FOTOS_DIR, FOTOS_ENTRADAS_DIR, FOTOS_TICKETS_DIR].forEach(dir => {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
-// Función para guardar foto
+// =====================
+// Helpers
+// =====================
 async function guardarFotoTicket(ticketId, fotoUrl) {
   if (!fotoUrl || !fotoUrl.includes('captura.jpg')) return null;
 
@@ -43,13 +45,33 @@ async function guardarFotoTicket(ticketId, fotoUrl) {
   }
 }
 
-// Crear ticket
+function runPython(scriptPath, args, res, okMsg, errMsg) {
+  const pythonProcess = execFile('python', [scriptPath, ...args], {
+    encoding: 'utf8',
+    windowsHide: true
+  }, (error, stdout, stderr) => {
+    if (error) {
+      console.error(`❌ ${errMsg}:`, error);
+      return res.status(500).send(`❌ ${errMsg}`);
+    }
+    console.log(`✅ Salida Python: ${stdout}`);
+    if (stderr) console.error(`⚠ Python stderr: ${stderr}`);
+    return res.send(okMsg);
+  });
+
+  pythonProcess.stdout.on('data', (data) => console.log(`Python stdout: ${data}`));
+  pythonProcess.stderr.on('data', (data) => console.error(`Python stderr: ${data}`));
+}
+
+// =====================
+// Controllers de dominio
+// =====================
 exports.crearTicket = async (req, res) => {
   try {
-    // 🔹 Obtener un número de ticket único usando Counter
+    // nuevo número con Counter
     let nuevoNumero = await Counter.increment('ticket');
 
-    // 🔒 Verificación extra por si existiera duplicado (muy improbable)
+    // protección extra por si existiera duplicado
     while (await Ticket.exists({ ticket: nuevoNumero })) {
       console.warn(`⚠️ Ticket ${nuevoNumero} ya existe, avanzando al siguiente`);
       nuevoNumero = await Counter.increment('ticket');
@@ -69,24 +91,17 @@ exports.crearTicket = async (req, res) => {
         ticketFormateado: String(nuevoTicket.ticket).padStart(10, '0')
       }
     });
-
   } catch (err) {
     console.error('❌ Error al crear ticket:', err);
-    res.status(500).json({ 
-      msg: 'Error del servidor', 
-      error: err.message 
-    });
+    res.status(500).json({ msg: 'Error del servidor', error: err.message });
   }
 };
 
-// Obtener último ticket pendiente
-exports.obtenerUltimoTicketPendiente = async (req, res) => {
+exports.obtenerUltimoTicketPendiente = async (_req, res) => {
   try {
     const ticket = await Ticket.findOne({ estado: 'pendiente' }).sort({ creadoEn: -1 });
 
-    if (!ticket) {
-      return res.status(404).json({ msg: 'No hay tickets pendientes' });
-    }
+    if (!ticket) return res.status(404).json({ msg: 'No hay tickets pendientes' });
 
     res.json({
       ...ticket.toObject(),
@@ -98,7 +113,6 @@ exports.obtenerUltimoTicketPendiente = async (req, res) => {
   }
 };
 
-// Asociar ticket a vehículo
 exports.asociarTicketAVehiculo = async (req, res) => {
   try {
     const { id } = req.params;
@@ -133,7 +147,6 @@ exports.asociarTicketAVehiculo = async (req, res) => {
   }
 };
 
-// Actualizar foto del ticket
 exports.actualizarFotoTicket = async (req, res) => {
   try {
     const { ticketId } = req.params;
@@ -158,4 +171,66 @@ exports.actualizarFotoTicket = async (req, res) => {
     console.error('Error al actualizar foto del ticket:', err);
     res.status(500).json({ msg: 'Error del servidor' });
   }
+};
+
+// =====================
+// 🖨️ Impresión (nuevo)
+// =====================
+
+// Ticket común (barcode) -> imprimir_ticket.py
+exports.imprimirTicket = (req, res) => {
+  // no enviar a outbox
+  res.locals.__skipOutbox = true;
+
+  let { texto, ticketNumero, valorHora, patente } = req.body || {};
+
+  if (ticketNumero !== undefined) {
+    texto = String(ticketNumero).padStart(10, '0');
+  }
+  if (!texto) {
+    return res.status(400).send('Falta texto o ticketNumero para imprimir');
+  }
+
+  const scriptPath = path.join(__dirname, '..', 'imprimir_ticket.py');
+  const arg1 = String(texto).replace(/\n/g, '\\n'); // argv[1]
+  const meta = {
+    valorHora: valorHora ? String(valorHora) : '',
+    patente:   patente   ? String(patente)   : ''
+  };
+  const arg2 = JSON.stringify(meta);               // argv[2]
+
+  runPython(
+    scriptPath,
+    [arg1, arg2],
+    res,
+    '✅ Ticket impreso correctamente',
+    'Error al imprimir ticket'
+  );
+};
+
+// Ticket de abono (SIN barcode) -> imprimir_ticket_abono.py
+exports.imprimirTicketAbono = (req, res) => {
+  // no enviar a outbox
+  res.locals.__skipOutbox = true;
+
+  const { proporcional, patente } = req.body || {};
+  if (proporcional === undefined || proporcional === null || String(proporcional).trim() === '') {
+    return res.status(400).send('Falta "proporcional" para imprimir ticket de abono');
+  }
+
+  const scriptPath = path.join(__dirname, '..', 'imprimir_ticket_abono.py');
+  const arg1 = 'abono'; // placeholder
+  const meta = {
+    proporcional: String(proporcional),
+    patente: patente ? String(patente) : ''
+  };
+  const arg2 = JSON.stringify(meta);
+
+  runPython(
+    scriptPath,
+    [arg1, arg2],
+    res,
+    '✅ Ticket de abono impreso correctamente',
+    'Error al imprimir ticket de abono'
+  );
 };
