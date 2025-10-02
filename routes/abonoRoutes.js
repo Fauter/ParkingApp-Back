@@ -13,11 +13,11 @@ const {
   previewAbono,
   previewRenovacion,
   renovarAbono,
-  actualizarAbono,           // NUEVO
-  setExclusiva,              // NUEVO
-  getAbonosPorCliente,       // NUEVO
-  getAbonosPorPatente,       // NUEVO
-  getCatalogoCocherasYPisos, // NUEVO
+  actualizarAbono,
+  setExclusiva,
+  getAbonosPorCliente,
+  getAbonosPorPatente,
+  getCatalogoCocherasYPisos,
 } = require('../controllers/abonoControllers');
 
 const router = express.Router();
@@ -27,15 +27,78 @@ const BASE_UPLOADS = process.env.UPLOADS_BASE
   ? path.resolve(process.env.UPLOADS_BASE)
   : path.resolve(__dirname, '..', 'uploads');
 
-const FOTOS_DIR = path.join(BASE_UPLOADS, 'fotos');
-fs.mkdirSync(FOTOS_DIR, { recursive: true });
+// Aseguro la carpeta base /uploads/fotos/abonosFotos
+const FOTOS_BASE_DIR = path.join(BASE_UPLOADS, 'fotos', 'abonosFotos');
+fs.mkdirSync(FOTOS_BASE_DIR, { recursive: true });
+
+// Helpers de path/archivo
+function sanitizePatente(p) {
+  return String(p || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '') || 'SINPATENTE';
+}
+
+function derivePatente(req, file) {
+  // 1) Lo normal: viene en el body (FormData)
+  let pat = sanitizePatente(req.body?.patente || '');
+
+  // 2) Fallback: si no llegó aún en body, intento leer de originalname con patrón PATENTE_...
+  if (!pat && file?.originalname) {
+    const m = String(file.originalname).match(/^([A-Z0-9]{5,8})_/i);
+    if (m) pat = sanitizePatente(m[1]);
+  }
+
+  return pat || 'SINPATENTE';
+}
+
+function ensureDirForPatente(pat) {
+  const dir = path.join(FOTOS_BASE_DIR, pat);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function timestamp() {
+  // YYYYMMDDHHmmss
+  const d = new Date();
+  const s = (n) => String(n).padStart(2, '0');
+  return (
+    d.getFullYear().toString() +
+    s(d.getMonth() + 1) +
+    s(d.getDate()) +
+    s(d.getHours()) +
+    s(d.getMinutes()) +
+    s(d.getSeconds())
+  );
+}
+
+function makeFilename(dir, fieldname, originalname) {
+  const ext = (path.extname(originalname || '') || '.jpg').toLowerCase();
+  const base = `${fieldname}${ext}`;
+  const full = path.join(dir, base);
+  if (!fs.existsSync(full)) return base;
+  // Si existe, no piso: agrego sufijo timestamp
+  return `${fieldname}-${timestamp()}${ext}`;
+}
 
 const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, FOTOS_DIR),
-  filename: (_req, file, cb) => {
-    const ext = (path.extname(file.originalname || '') || '').toLowerCase();
-    const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
-    cb(null, unique);
+  destination: (req, file, cb) => {
+    try {
+      const pat = derivePatente(req, file);
+      const dir = ensureDirForPatente(pat);
+      cb(null, dir);
+    } catch (e) {
+      cb(e);
+    }
+  },
+  filename: (req, file, cb) => {
+    try {
+      const pat = derivePatente(req, file);
+      const dir = ensureDirForPatente(pat);
+      const fname = makeFilename(dir, file.fieldname || 'foto', file.originalname || '');
+      cb(null, fname);
+    } catch (e) {
+      cb(e);
+    }
   }
 });
 
@@ -57,15 +120,24 @@ const uploadFields = upload.fields([
   { name: 'fotoCedulaVerde', maxCount: 1 },
 ]);
 
+/**
+ * Mapea las rutas físicas a rutas web relativas bajo /uploads
+ * En vez de inventar '/uploads/fotos/...' tomamos el path real retornado por multer
+ * y construimos la URL web a partir de BASE_UPLOADS.
+ */
 function mapUploadedPaths(req, _res, next) {
   const expected = ['fotoSeguro', 'fotoDNI', 'fotoCedulaVerde'];
+
   expected.forEach((field) => {
     const f = req.files && req.files[field] && req.files[field][0];
-    if (f) {
-      const fileName = f.filename || path.basename(f.path);
-      req.body[field] = `/uploads/fotos/${fileName}`;
+    if (f && f.path) {
+      // f.path apunta a .../uploads/fotos/abonosFotos/<PATENTE>/<field>.(ext)
+      const rel = path.relative(BASE_UPLOADS, f.path).split(path.sep).join('/');
+      // => 'fotos/abonosFotos/<PATENTE>/<field>.ext'
+      req.body[field] = `/uploads/${rel}`;
     }
   });
+
   next();
 }
 
@@ -95,7 +167,7 @@ router.post('/agregar-abono',   uploadFields, mapUploadedPaths, agregarAbono);
 // Renovación
 router.post('/renovar', renovarAbono);
 
-// Updates
+// Updates (con upload opcional)
 router.patch('/:id', uploadFields, mapUploadedPaths, actualizarAbono);
 router.patch('/:id/exclusiva', setExclusiva);
 

@@ -175,9 +175,9 @@ async function getClienteMaxBaseMensualVigente(clienteId, hoy = new Date(), sopt
    🖼️ Helpers de fotos
 ======================================================= */
 
+// AHORA: el mapUploadedPaths en las rutas ya pone el path web final en req.body[field]
 function buildFotoPath(req, field) {
-  const f = req.files?.[field]?.[0]?.filename;
-  return f ? `/uploads/fotos/${f}` : (req.body?.[field] || '');
+  return req.body?.[field] || '';
 }
 
 /* =======================================================
@@ -416,8 +416,6 @@ exports.previewRenovacion = async (req, res) => {
    RENOVAR ABONO
 ========================= */
 
-// POST /api/abonos/renovar
-// body: { clienteId, metodoPago, factura, operador, patente?, cochera?, piso?, exclusiva? }
 exports.renovarAbono = async (req, res) => {
   const canTx = await supportsTransactions();
   const session = canTx ? await mongoose.startSession() : null;
@@ -629,7 +627,7 @@ exports.registrarAbono = async (req, res) => {
     if (!cliente) throw new Error('No se pudo obtener/crear cliente');
     if (!session) created.cliente = cliente;
 
-    // Fotos
+    // Fotos (YA VIENEN MAPEADAS A RUTA WEB FINAL POR mapUploadedPaths)
     const fotoSeguro       = buildFotoPath(req, 'fotoSeguro');
     const fotoDNI          = buildFotoPath(req, 'fotoDNI');
     const fotoCedulaVerde  = buildFotoPath(req, 'fotoCedulaVerde');
@@ -1038,14 +1036,10 @@ exports.actualizarAbono = async (req, res) => {
       updates.cochera = ['Fija','Móvil',''].includes(c) ? c : '';
     }
 
-    // Si vinieron a través de multer:
-    const fotoSeguro       = req.files?.fotoSeguro?.[0]?.filename ? `/uploads/fotos/${req.files.fotoSeguro[0].filename}` : null;
-    const fotoDNI          = req.files?.fotoDNI?.[0]?.filename ? `/uploads/fotos/${req.files.fotoDNI[0].filename}` : null;
-    const fotoCedulaVerde  = req.files?.fotoCedulaVerde?.[0]?.filename ? `/uploads/fotos/${req.files.fotoCedulaVerde[0].filename}` : null;
-
-    if (fotoSeguro) updates.fotoSeguro = fotoSeguro;
-    if (fotoDNI) updates.fotoDNI = fotoDNI;
-    if (fotoCedulaVerde) updates.fotoCedulaVerde = fotoCedulaVerde;
+    // Fotos: ya vienen mapeadas a path web en req.body por el middleware mapUploadedPaths
+    // Si no se subió nada nuevo, no viene en body y no se toca.
+    // (El código anterior por req.files se reemplaza por este enfoque)
+    // -> Nada extra que hacer aquí.
 
     const updated = await Abono.findByIdAndUpdate(id, { $set: updates }, { new: true });
     if (!updated) return res.status(404).json({ message: 'Abono no encontrado' });

@@ -23,7 +23,7 @@ router.put('/:id/actualizar-precio-abono', actualizarPrecioAbono);
 router.put('/:id/desabonar', desabonarCliente);
 router.post('/:id/renovar-abono', renovarAbono);
 
-// NUEVO: update básico (nombre, contactos, etc.)
+// Update básico (nombre, contactos, cochera/exclusiva/piso)
 router.put('/:id', actualizarClienteBasico);
 
 router.delete('/', async (_req, res) => {

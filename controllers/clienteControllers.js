@@ -4,6 +4,21 @@ const Vehiculo = require('../models/Vehiculo');
 const Movimiento = require('../models/Movimiento');
 const MovimientoCliente = require('../models/MovimientoCliente');
 
+// ---------- Helpers de normalización ----------
+function normCochera(raw) {
+  const v = String(raw || '').trim().toLowerCase();
+  if (v === 'fija') return 'Fija';
+  if (v === 'movil' || v === 'móvil') return 'Móvil';
+  return ''; // vacío si no vino/indefinida
+}
+function normExclusiva(raw, cochera) {
+  // Solo permitimos exclusiva=true si la cochera es Fija
+  return (cochera === 'Fija') && Boolean(raw);
+}
+function normPiso(raw) {
+  return String(raw || '').trim();
+}
+
 // === Derivar estado de abono por fecha (no persiste, solo adorna la respuesta) ===
 function deriveEstadoAbono(doc) {
   if (!doc) return doc;
@@ -46,6 +61,11 @@ exports.crearClienteSiNoExiste = async (req, res) => {
     const email = String(datos.email || '').trim().toLowerCase();
     const nombre = String(nombreApellido || '').trim();
 
+    // Normalización de los nuevos campos
+    const cochera = normCochera(datos.cochera);
+    const exclusiva = normExclusiva(datos.exclusiva, cochera);
+    const piso = normPiso(datos.piso);
+
     // 🔎 buscar por DNI o email; si nada, fallback a nombre
     let cliente = await Cliente.findOne({
       $or: [
@@ -66,13 +86,17 @@ exports.crearClienteSiNoExiste = async (req, res) => {
         domicilioTrabajo: String(datos.domicilioTrabajo || ''),
         telefonoTrabajo: String(datos.telefonoTrabajo || ''),
         email,
-        precioAbono: String(datos.precioAbono || '')
+        precioAbono: String(datos.precioAbono || ''),
+        // NUEVO: guardamos estado de cochera del cliente
+        cochera,
+        exclusiva,
+        piso
       });
       await cliente.save();
       return res.status(201).json(cliente);
     }
 
-    // si existe, actualizar datos básicos (no tocamos arrays/abonado)
+    // si existe, actualizar datos básicos (ahora también cochera/exclusiva/piso)
     const campos = [
       'dniCuitCuil','domicilio','localidad','telefonoParticular','telefonoEmergencia',
       'domicilioTrabajo','telefonoTrabajo','email','nombreApellido'
@@ -82,6 +106,20 @@ exports.crearClienteSiNoExiste = async (req, res) => {
         cliente[k] = String(datos[k]).trim();
       }
     });
+
+    // Actualizamos cochera/exclusiva/piso si vinieron
+    if (datos.cochera !== undefined) {
+      cliente.cochera = cochera;
+      // Si cochera cambió a no-Fija, forzamos exclusiva=false
+      if (cliente.cochera !== 'Fija') cliente.exclusiva = false;
+    }
+    if (datos.exclusiva !== undefined) {
+      cliente.exclusiva = normExclusiva(datos.exclusiva, cliente.cochera);
+    }
+    if (datos.piso !== undefined) {
+      cliente.piso = piso;
+    }
+
     await cliente.save();
     return res.status(200).json(cliente);
 
@@ -205,6 +243,14 @@ exports.renovarAbono = async (req, res) => {
     const { id } = req.params;
     const { precio, metodoPago, factura, operador, patente, tipoVehiculo } = req.body;
 
+    // === NUEVO: permitimos actualizar cochera/exclusiva/piso si vienen en la renovación ===
+    const cocheraBody = normCochera(req.body.cochera);
+    // Si el body no trae cochera, dejaremos la existente del cliente; si la trae, normalizamos exclusiva en base a eso
+    const exclusivaBody = (req.body.exclusiva !== undefined)
+      ? Boolean(req.body.exclusiva)
+      : undefined;
+    const pisoBody = (req.body.piso !== undefined) ? normPiso(req.body.piso) : undefined;
+
     if (!precio || isNaN(precio)) {
       await session.abortTransaction();
       return res.status(400).json({ message: 'Precio inválido o faltante' });
@@ -248,6 +294,24 @@ exports.renovarAbono = async (req, res) => {
     cliente.finAbono = ultimoDiaMes;
     cliente.precioAbono = tipoVehiculo;
     cliente.updatedAt = new Date();
+
+    // === NUEVO: actualización coherente de cochera/exclusiva/piso ===
+    if (cocheraBody !== '') {
+      cliente.cochera = cocheraBody;
+      // si cambiamos cochera a no-Fija, forzamos exclusiva=false
+      if (cliente.cochera !== 'Fija') cliente.exclusiva = false;
+      // si el body también trajo exclusiva, la normalizamos con la nueva cochera
+      if (exclusivaBody !== undefined) {
+        cliente.exclusiva = normExclusiva(exclusivaBody, cliente.cochera);
+      }
+    } else if (exclusivaBody !== undefined) {
+      // si no vino cochera pero sí exclusiva, normalizamos contra la cochera actual
+      cliente.exclusiva = normExclusiva(exclusivaBody, cliente.cochera);
+    }
+    if (pisoBody !== undefined) {
+      cliente.piso = pisoBody;
+    }
+
     await cliente.save({ session });
 
     const movimiento = new Movimiento({
@@ -311,28 +375,47 @@ exports.eliminarTodosLosClientes = async (_req, res) => {
 exports.actualizarClienteBasico = async (req, res) => {
   try {
     const { id } = req.params;
+
+    // permitimos actualizar datos básicos + cochera/exclusiva/piso
     const campos = [
       'nombreApellido','dniCuitCuil','domicilio','localidad',
       'telefonoParticular','telefonoEmergencia','domicilioTrabajo',
       'telefonoTrabajo','email'
     ];
+
     const data = {};
     campos.forEach(k => { if (k in req.body) data[k] = req.body[k]; });
 
-    let cliente = await Cliente.findByIdAndUpdate(id, data, { new: true });
+    // Normalizamos cochera/exclusiva/piso si vinieron
+    const cRaw = (req.body.cochera !== undefined) ? normCochera(req.body.cochera) : undefined;
+    const pRaw = (req.body.piso !== undefined) ? normPiso(req.body.piso) : undefined;
+    const eRawPresent = (req.body.exclusiva !== undefined);
+
+    let cliente = await Cliente.findById(id);
     if (!cliente) {
       // Fallback: puede que _id sea string en la DB local
-      const upd = await Cliente.collection.findOneAndUpdate(
-        { _id: String(id) },
-        { $set: data },
-        { returnDocument: 'after' }
-      );
-      if (upd && upd.value) {
-        cliente = new Cliente(upd.value);
-      }
+      const doc = await Cliente.collection.findOne({ _id: String(id) });
+      if (doc) cliente = new Cliente(doc);
     }
     if (!cliente) return res.status(404).json({ message: 'Cliente no encontrado' });
-    res.json({ message: 'Cliente actualizado', cliente });
+
+    // Aplicamos cambios básicos
+    Object.keys(data).forEach(k => { cliente[k] = data[k]; });
+
+    // Aplicamos cochera/exclusiva/piso con coherencia
+    if (cRaw !== undefined) {
+      cliente.cochera = cRaw;
+      if (cliente.cochera !== 'Fija') cliente.exclusiva = false;
+    }
+    if (eRawPresent) {
+      cliente.exclusiva = normExclusiva(req.body.exclusiva, cliente.cochera);
+    }
+    if (pRaw !== undefined) {
+      cliente.piso = pRaw;
+    }
+
+    await cliente.save();
+    return res.json({ message: 'Cliente actualizado', cliente });
   } catch (err) {
     res.status(500).json({ message: 'Error al actualizar cliente', error: err.message });
   }
