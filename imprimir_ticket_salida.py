@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Ticket común: imprime encabezado fijo y un código de barras Code128 con el número recibido.
+Ticket SALIDA: imprime encabezado fijo y un código de barras Code128 con el número recibido.
 - Si la impresora es "Microsoft Print to PDF" (o contiene "print to pdf"):
   NO imprime: guarda PREVIEW en PNG y PDF con el mismo layout y lo abre.
-- Debajo del barcode: "Valor de Hora: ...", "Patente: ...", "Tipo de Vehículo: ...".
+- Debajo del barcode: "Valor Final: ...", "Patente: ...", "Tipo de Vehículo: ...".
 - Encabezado visual (en orden):
     [X]  (caja con cruz - "no es factura", con padding interno)
     Eleven Park S.A   (centrado)
     Aguero 256        (centrado, tamaño igual al anterior)
     [Línea separadora]
+    Ingreso: ...
+    Egreso: ...
     ... resto normal ...
 """
 
@@ -55,7 +57,7 @@ def _today_str():
     return datetime.now().strftime("%Y-%m-%d")
 
 def _now_str_ar():
-    # DD/MM/YYYY HH:MM:SS (no formato yanqui)
+    # DD/MM/YYYY HH:MM:SS
     return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
 def _ensure_dir(p):
@@ -230,10 +232,10 @@ def _make_barcode_image(number: str, target_w: int):
         img_bar = img_bar.resize((target_w, h), PILImage.LANCZOS)
     return img_bar
 
-def render_ticket_canvas(lines, barcode_number, valor_hora: str = "", patente: str = "", tipo_vehiculo: str = ""):
+def render_ticket_canvas(lines, barcode_number, valor_final: str = "", patente: str = "", tipo_vehiculo: str = ""):
     """
-    Devuelve un PIL.Image 'L' (grises) del ticket común.
-    Encabezado: [X] (centrado), COMPANY_NAME (centrado), LOCATION_TEXT (centrado), línea separadora.
+    Devuelve un PIL.Image 'L' (grises) del ticket de SALIDA.
+    Encabezado: [X], COMPANY_NAME, LOCATION_TEXT, línea separadora.
     """
     if not PIL_OK:
         raise RuntimeError("Pillow (PIL) no disponible")
@@ -242,7 +244,7 @@ def render_ticket_canvas(lines, barcode_number, valor_hora: str = "", patente: s
     canvas_w = 384
     margin_top   = 10
     margin_side  = 10
-    margin_bottom = 3  # margen extra para evitar cortes
+    margin_bottom = 3  # evitar cortes
     usable_w = canvas_w - 2 * margin_side
     gap      = 6
 
@@ -272,30 +274,25 @@ def render_ticket_canvas(lines, barcode_number, valor_hora: str = "", patente: s
 
     # Footer y legal
     footer_texts = [
-        "¡Gracias por elegirnos!",
-        "Por favor no pierda su ticket",
+        "¡Gracias por su visita!",
     ]
     legal_texts  = ["Aceptación Contrato (Adm.) – Jurisdicción: Tribunales CABA"]
 
-    # ==== NUEVO: espaciado del bloque footer (más juntas las 2 líneas) ====
-    footer_top_margin = 8      # margen por encima del bloque footer
-    footer_between    = 2      # espacio entre las dos líneas del footer (muy corto)
-    footer_bottom_margin = 8   # margen por debajo del bloque footer
+    # Footer compactado
+    footer_top_margin = 8
+    footer_between    = 2
+    footer_bottom_margin = 8
 
-    # cálculo de alto total del footer según las fuentes reales
     footer_heights = []
     for t in footer_texts:
         _, h = _text_wh(d, t, font_footer)
         footer_heights.append(h)
-    if footer_heights:
-        h_footer_total = (footer_top_margin +
-                          sum(footer_heights) +
-                          footer_between * max(0, (len(footer_heights) - 1)) +
-                          footer_bottom_margin)
-    else:
-        h_footer_total = 0
+    h_footer_total = (footer_top_margin +
+                      sum(footer_heights) +
+                      footer_between * max(0, (len(footer_heights) - 1)) +
+                      footer_bottom_margin) if footer_heights else 0
 
-    # Legal (mismo que antes)
+    # Legal
     h_legal_total = 0
     for t in legal_texts:
         _, h = _text_wh(d, t, font_small)
@@ -321,13 +318,13 @@ def render_ticket_canvas(lines, barcode_number, valor_hora: str = "", patente: s
 
     # Altura extra por líneas debajo del barcode
     _, h_body_line = _text_wh(d, "X", font_body)
-    # 3 líneas: Valor de Hora + Patente + Tipo de Vehículo
+    # 3 líneas: Valor Final + Patente + Tipo de Vehículo
     after_bar_extra = (h_body_line + gap) * 3
 
     # Caja con cruz
-    cross_size = 26   # px totales del cuadrado
-    cross_pad  = 6    # padding interno de la 'X'
-    cross_gap  = 8    # separación debajo de la caja
+    cross_size = 26
+    cross_pad  = 6
+    cross_gap  = 8
 
     canvas_h = (margin_top +
                 cross_size + cross_gap +
@@ -347,7 +344,7 @@ def render_ticket_canvas(lines, barcode_number, valor_hora: str = "", patente: s
 
     y = margin_top
 
-    # [X] caja con cruz, centrada, con padding
+    # [X] caja con cruz
     center_x = canvas_w // 2
     y = _draw_box_with_x(draw, center_x, y, cross_size, padding=cross_pad, stroke=2, color=0, fill=None)
     y += cross_gap
@@ -379,18 +376,14 @@ def render_ticket_canvas(lines, barcode_number, valor_hora: str = "", patente: s
         y += gap
 
     # Debajo del barcode (3 líneas)
-    y = _draw_left(draw, f"Valor de Hora: {valor_hora or ''}",              y, font_body, margin_side); y += gap
-    y = _draw_left(draw, f"Patente: {patente or ''}",                       y, font_body, margin_side); y += gap
+    y = _draw_left(draw, f"Valor Final: {valor_final or ''}",                 y, font_body, margin_side); y += gap
+    y = _draw_left(draw, f"Patente: {patente or ''}",                        y, font_body, margin_side); y += gap
     y = _draw_left(draw, f"Tipo de Vehículo: {(tipo_vehiculo or '').title()}", y, font_body, margin_side); y += gap
 
-    # ===== Footer (dos líneas, MÁS CERCANAS) =====
+    # ===== Footer =====
     if footer_texts:
         y += footer_top_margin
         y = _draw_center(draw, footer_texts[0], y, font_footer, canvas_w)
-        # interlineado muy corto entre las dos líneas
-        if len(footer_texts) > 1:
-            y += footer_between
-            y = _draw_center(draw, footer_texts[1], y, font_footer, canvas_w)
         y += footer_bottom_margin
 
     # Legal
@@ -417,7 +410,7 @@ def _end_doc(dc):
 def _print_bitmap_via_gdi(printer_name, pil_image_rgb):
     hDC = win32ui.CreateDC()
     hDC.CreatePrinterDC(printer_name)
-    _start_doc(hDC, title="Ticket")
+    _start_doc(hDC, title="Ticket SALIDA")
     dib_hw = ImageWin.Dib(pil_image_rgb)
     w, h = pil_image_rgb.size
     dib_hw.draw(hDC.GetHandleOutput(), (0, 0, w, h))
@@ -433,7 +426,7 @@ def _print_text_gdi(printer_name, lines, font_name="Consolas", font_height=18, l
         hDC.SetMapMode(win32con.MM_TEXT)
         lf = win32ui.CreateFont({"name": font_name, "height": -font_height, "weight": 400})
         hDC.SelectObject(lf)
-        _start_doc(hDC, title="Ticket")
+        _start_doc(hDC, title="Ticket SALIDA")
         x, y = left, top
         for line in lines:
             hDC.TextOut(x, y, line)
@@ -451,15 +444,20 @@ def _print_text_gdi(printer_name, lines, font_name="Consolas", font_height=18, l
             pass
 
 # ---------------------- Build & Main ----------------------
-def build_ticket_lines(ticket_str: str):
+def build_ticket_lines(ticket_str: str, ingreso: str = "", egreso: str = ""):
     """
     Devuelve (lines, numero_barcode).
+    - ingreso/egreso deben venir en formato DD/MM/YYYY HH:MM:SS si se pasan.
+      Si egreso no viene, se usa ahora. Ingreso puede quedar vacío.
     """
-    now = _now_str_ar()  # <- DD/MM/YYYY HH:MM:SS
+    ingreso_str = (ingreso or "").strip()
+    egreso_str  = (egreso or "").strip() or _now_str_ar()
+
     lines = [
-        COMPANY_NAME,       # header (centrado)
-        LOCATION_TEXT,      # se fuerza en el render y se centra
-        f"Ingreso:  {now}", # <-- cambio solicitado (antes "Fecha")
+        COMPANY_NAME,        # header (centrado)
+        LOCATION_TEXT,       # se fuerza en el render y se centra
+        f"Ingreso:  {ingreso_str}",   # puede ir vacío
+        f"Egreso:   {egreso_str}",
         "",
     ]
     number = str(ticket_str or "000000")
@@ -469,7 +467,7 @@ def _save_preview(canvas_img, number_to_encode):
     out_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)),
                            "tickets_preview", _today_str())
     _ensure_dir(out_dir)
-    base = os.path.join(out_dir, f"Ticket_{number_to_encode or 'PREVIEW'}")
+    base = os.path.join(out_dir, f"TicketSalida_{number_to_encode or 'PREVIEW'}")
     png_path = base + ".png"
     pdf_path = base + ".pdf"
 
@@ -485,13 +483,17 @@ def _save_preview(canvas_img, number_to_encode):
 def _parse_optional_meta():
     """
     Lee meta opcional desde argv[2] (JSON) o desde variables de entorno:
-      - valorHora     (o VALOR_HORA)
+      - valorFinal    (o VALOR_FINAL)
       - patente       (o PATENTE)
       - tipoVehiculo  (o TIPO_VEHICULO)
+      - ingreso       (o INGRESO)  -> DD/MM/YYYY HH:MM:SS (opcional)
+      - egreso        (o EGRESO)   -> DD/MM/YYYY HH:MM:SS (opcional; default: ahora)
     """
-    valor_hora    = os.environ.get("VALOR_HORA", "").strip()
+    valor_final   = os.environ.get("VALOR_FINAL", "").strip()
     patente       = os.environ.get("PATENTE", "").strip()
     tipo_vehiculo = os.environ.get("TIPO_VEHICULO", "").strip()
+    ingreso       = os.environ.get("INGRESO", "").strip()
+    egreso        = os.environ.get("EGRESO", "").strip()
 
     if len(sys.argv) >= 3:
         raw = (sys.argv[2] or "").strip()
@@ -499,13 +501,15 @@ def _parse_optional_meta():
             try:
                 obj = json.loads(raw)
                 if isinstance(obj, dict):
-                    valor_hora    = str(obj.get("valorHora",   valor_hora)    or "").strip()
+                    valor_final   = str(obj.get("valorFinal",   valor_final)   or "").strip()
                     patente       = str(obj.get("patente",     patente)       or "").strip()
                     tipo_vehiculo = str(obj.get("tipoVehiculo", tipo_vehiculo) or "").strip()
+                    ingreso       = str(obj.get("ingreso",      ingreso)       or "").strip()
+                    egreso        = str(obj.get("egreso",       egreso)        or "").strip()
             except Exception as e:
                 print(f"WARNING: argv[2] no es JSON válido ({e}). Se ignora.")
 
-    return valor_hora, patente, tipo_vehiculo
+    return valor_final, patente, tipo_vehiculo, ingreso, egreso
 
 def main():
     _debug_env()
@@ -514,10 +518,10 @@ def main():
     printer_name = get_resolved_printer_name()
 
     # Meta
-    valor_hora, patente, tipo_vehiculo = _parse_optional_meta()
+    valor_final, patente, tipo_vehiculo, ingreso, egreso = _parse_optional_meta()
 
     # Build
-    lines, number_to_encode = build_ticket_lines(ticket_str)
+    lines, number_to_encode = build_ticket_lines(ticket_str, ingreso=ingreso, egreso=egreso)
 
     # PREVIEW (PDF)
     if _is_preview_printer(printer_name):
@@ -531,7 +535,7 @@ def main():
         try:
             canvas = render_ticket_canvas(
                 lines, number_to_encode,
-                valor_hora=valor_hora, patente=patente, tipo_vehiculo=tipo_vehiculo
+                valor_final=valor_final, patente=patente, tipo_vehiculo=tipo_vehiculo
             )
             _save_preview(canvas, number_to_encode)
             return
@@ -545,7 +549,7 @@ def main():
             raise RuntimeError("Pillow no disponible")
         canvas = render_ticket_canvas(
             lines, number_to_encode,
-            valor_hora=valor_hora, patente=patente, tipo_vehiculo=tipo_vehiculo
+            valor_final=valor_final, patente=patente, tipo_vehiculo=tipo_vehiculo
         )
         _print_bitmap_via_gdi(printer_name, canvas.convert("RGB"))
         return
@@ -561,5 +565,5 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:
-        print(f"ERROR: excepción no controlada en imprimir_ticket.py: {e}")
+        print(f"ERROR: excepción no controlada en imprimir_ticket_salida.py: {e}")
         raise

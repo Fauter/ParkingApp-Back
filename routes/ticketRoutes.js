@@ -64,7 +64,7 @@ router.put('/:id/asociar', ticketController.asociarTicketAVehiculo);
 router.put('/:id/foto', async (req, res) => {
   try {
     const { id } = req.params;
-    const { fotoUrl } = req.body || {};
+    const { fotoUrl } = req.body;
     if (!fotoUrl) return res.status(400).json({ error: 'fotoUrl requerida' });
 
     const ticket = await Ticket.findById(id);
@@ -115,5 +115,8 @@ router.post('/imprimir', ticketController.imprimirTicket);
 
 // 🖨️ Imprimir ticket de ABONO (SIN barcode)
 router.post('/imprimir-abono', ticketController.imprimirTicketAbono);
+
+// 🖨️ Imprimir ticket de SALIDA (CON barcode)
+router.post('/imprimir-salida', ticketController.imprimirTicketSalida);
 
 module.exports = router;
