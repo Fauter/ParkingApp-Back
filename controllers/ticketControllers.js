@@ -89,7 +89,6 @@ function formatMontoAR(value) {
   if (value == null || value === '') return '';
   const num = Number(value);
   if (!isFinite(num)) return String(value);
-  // "$12.345,67"
   return '$' + num.toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
@@ -228,7 +227,7 @@ exports.imprimirTicket = (req, res) => {
     patente:      patente   ? String(patente)      : '',
     tipoVehiculo: tipoVehiculo ? String(tipoVehiculo) : ''
   };
-  const arg2 = JSON.stringify(meta);               // argv[2]
+  const arg2 = JSON.stringify(meta);
 
   runPython(
     scriptPath,
@@ -239,18 +238,11 @@ exports.imprimirTicket = (req, res) => {
   );
 };
 
-// Ticket de abono (SIN barcode) -> imprimir_ticket_abono.py
+// Ticket de ABONO (SIN barcode) -> imprimir_ticket_abono.py
 exports.imprimirTicketAbono = (req, res) => {
   // no enviar a outbox
   res.locals.__skipOutbox = true;
 
-  // Lo que puede venir del front:
-  // proporcional (string formateado)
-  // valorMensual (string formateado)
-  // baseMensual (number)
-  // proporcionalRaw (number)
-  // nombreApellido, metodoPago, tipoVehiculo, marca, modelo, patente
-  // cochera ("Fija" | "Móvil"), piso, exclusiva (bool), diasRestantes (number)
   const {
     proporcional,
     valorMensual,
@@ -268,7 +260,6 @@ exports.imprimirTicketAbono = (req, res) => {
     diasRestantes
   } = req.body || {};
 
-  // Validación mínima: debe llegar al menos proporcional (string) o proporcionalRaw (numérico)
   const tieneProporcionalString = typeof proporcional === 'string' && proporcional.trim() !== '';
   const tieneProporcionalNum = Number.isFinite(Number(proporcionalRaw));
 
@@ -277,18 +268,14 @@ exports.imprimirTicketAbono = (req, res) => {
   }
 
   const scriptPath = path.join(__dirname, '..', 'imprimir_ticket_abono.py');
-  const arg1 = 'abono'; // placeholder
+  const arg1 = 'abono';
 
-  // Armamos el meta respetando los nombres que consume el script Python
   const meta = {
-    // montos (si viene string formateado lo pasamos tal cual; si no, el script hace fallback con *_Raw/baseMensual)
     proporcional: tieneProporcionalString ? String(proporcional) : '',
     valorMensual: typeof valorMensual === 'string' ? valorMensual : '',
-    // respaldos numéricos (para que Python pueda formatear si no llegan strings)
     baseMensual: Number.isFinite(Number(baseMensual)) ? Number(baseMensual) : undefined,
     proporcionalRaw: Number.isFinite(Number(proporcionalRaw)) ? Number(proporcionalRaw) : undefined,
 
-    // datos del cuerpo
     nombreApellido: nombreApellido ? String(nombreApellido) : '',
     metodoPago: metodoPago ? String(metodoPago) : '',
     tipoVehiculo: tipoVehiculo ? String(tipoVehiculo) : '',
@@ -296,12 +283,10 @@ exports.imprimirTicketAbono = (req, res) => {
     modelo: modelo ? String(modelo) : '',
     patente: patente ? String(patente) : '',
 
-    // cochera
     cochera: cochera ? String(cochera) : '',
     piso: piso ? String(piso) : '',
     exclusiva: Boolean(exclusiva),
 
-    // por días
     diasRestantes: Number.isFinite(Number(diasRestantes)) ? Number(diasRestantes) : undefined
   };
 
@@ -317,49 +302,39 @@ exports.imprimirTicketAbono = (req, res) => {
 };
 
 // Ticket de SALIDA (CON barcode) -> imprimir_ticket_salida.py
-// Espera:
-//  - ticketNumero (o texto)  -> barcode
-//  - ingreso (ISO u otro)    -> "Ingreso:"
-//  - egreso  (ISO u otro)    -> "Egreso:"
-//  - totalConDescuento (num) -> "Valor Final:"
-//  - patente, tipoVehiculo   -> líneas bajo barcode
 exports.imprimirTicketSalida = (req, res) => {
   // no enviar a outbox
   res.locals.__skipOutbox = true;
 
   const {
-    texto,                 // opcional: si no viene ticketNumero
-    ticketNumero,          // recomendado
-    ingreso,               // ISO u otro parseable
-    egreso,                // ISO u otro parseable
-    totalConDescuento,     // number
+    texto,
+    ticketNumero,
+    ingreso,
+    egreso,
+    totalConDescuento,
     patente,
     tipoVehiculo
   } = req.body || {};
 
-  // Barcode
   const barcodeNum = padTicket10(ticketNumero != null ? ticketNumero : texto);
 
-  // Validación mínima
   if (!barcodeNum || !/^\d{10}$/.test(barcodeNum)) {
     return res.status(400).send('Falta ticketNumero/texto válido para barcode (10 dígitos)');
   }
 
-  // Mapeos & formateos
   const ingresoAR = formatIsoToAR(ingreso);
   const egresoAR  = formatIsoToAR(egreso);
   const valorFinalStr = formatMontoAR(totalConDescuento);
 
   const scriptPath = path.join(__dirname, '..', 'imprimir_ticket_salida.py');
-  const arg1 = barcodeNum; // argv[1] -> número del barcode
+  const arg1 = barcodeNum;
 
-  // argv[2] -> JSON meta según imprimir_ticket_salida.py
   const meta = {
     valorFinal:   valorFinalStr || (totalConDescuento != null ? String(totalConDescuento) : ''),
     patente:      patente ? String(patente).toUpperCase() : '',
     tipoVehiculo: tipoVehiculo ? String(tipoVehiculo) : '',
-    ingreso:      ingresoAR,  // "DD/MM/YYYY HH:MM:SS" (o '')
-    egreso:       egresoAR    // idem
+    ingreso:      ingresoAR,
+    egreso:       egresoAR
   };
 
   const arg2 = JSON.stringify(meta);
@@ -370,5 +345,62 @@ exports.imprimirTicketSalida = (req, res) => {
     res,
     '✅ Ticket de salida impreso correctamente',
     'Error al imprimir ticket de salida'
+  );
+};
+
+// Ticket de ANTICIPADO (CON barcode) -> imprimir_ticket_anticipado.py
+// Acepta (flexible para compat con front actual):
+//  - ticketNumero (o texto)         -> barcode
+//  - nombreTurno                    -> para la leyenda "(NombreTurno)"
+//  - valorAnticipado | precio | valorHora (string o number) -> "(precio)"
+//  - patente, tipoVehiculo          -> bajo barcode
+//  - (opcional) metodoPago, factura, operador, fin, duracionHoras (no se imprimen ahora, pero pueden viajar)
+exports.imprimirTicketAnticipado = (req, res) => {
+  // no enviar a outbox
+  res.locals.__skipOutbox = true;
+
+  const {
+    texto,
+    ticketNumero,
+    nombreTurno,
+    valorAnticipado,
+    precio,
+    valorHora,        // compat con lo que ya envía DatosAutoTurnos.jsx
+    patente,
+    tipoVehiculo
+  } = req.body || {};
+
+  // Número de barcode: aceptar 6..10 dígitos, pad a 10 (mismo criterio que salida para evitar sorpresas)
+  const barcodeNum = padTicket10(ticketNumero != null ? ticketNumero : texto);
+  if (!barcodeNum || !/^\d{10}$/.test(barcodeNum)) {
+    return res.status(400).send('Falta ticketNumero/texto válido para barcode (10 dígitos)');
+  }
+
+  // Precio textual amigable
+  let precioTxt = '';
+  if (valorAnticipado != null) precioTxt = String(valorAnticipado);
+  else if (precio != null)     precioTxt = String(precio);
+  else if (valorHora != null)  precioTxt = String(valorHora);
+
+  // Script Python
+  const scriptPath = path.join(__dirname, '..', 'imprimir_ticket_anticipado.py');
+  const arg1 = barcodeNum;
+
+  const meta = {
+    // el script acepta alias: valorAnticipado | precio | valorHora
+    valorAnticipado: precioTxt,
+    nombreTurno: nombreTurno ? String(nombreTurno) : '',
+    patente:      patente ? String(patente).toUpperCase() : '',
+    tipoVehiculo: tipoVehiculo ? String(tipoVehiculo) : ''
+  };
+
+  const arg2 = JSON.stringify(meta);
+
+  runPython(
+    scriptPath,
+    [arg1, arg2],
+    res,
+    '✅ Ticket de anticipado impreso correctamente',
+    'Error al imprimir ticket de anticipado'
   );
 };

@@ -119,4 +119,7 @@ router.post('/imprimir-abono', ticketController.imprimirTicketAbono);
 // 🖨️ Imprimir ticket de SALIDA (CON barcode)
 router.post('/imprimir-salida', ticketController.imprimirTicketSalida);
 
+// 🖨️ Imprimir ticket de ANTICIPADO (CON barcode y leyenda específica)
+router.post('/imprimir-anticipado', ticketController.imprimirTicketAnticipado);
+
 module.exports = router;
