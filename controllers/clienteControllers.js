@@ -1,3 +1,4 @@
+// controllers/clienteControllers.js
 const mongoose = require('mongoose');
 const Cliente = require('../models/Cliente');
 const Vehiculo = require('../models/Vehiculo');
@@ -17,6 +18,20 @@ function normExclusiva(raw, cochera) {
 }
 function normPiso(raw) {
   return String(raw || '').trim();
+}
+
+// === Fechas auxiliares ===
+function clampInt(n, min, max) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return min;
+  return Math.max(min, Math.min(max, Math.trunc(v)));
+}
+function getUltimoDiaMes(baseDate = new Date(), offsetMonths = 0) {
+  const y = baseDate.getFullYear();
+  const m = baseDate.getMonth() + 1 + offsetMonths;
+  const d = new Date(y, m, 0);
+  d.setHours(23, 59, 59, 999);
+  return d;
 }
 
 // === Derivar estado de abono por fecha (no persiste, solo adorna la respuesta) ===
@@ -243,9 +258,11 @@ exports.renovarAbono = async (req, res) => {
     const { id } = req.params;
     const { precio, metodoPago, factura, operador, patente, tipoVehiculo } = req.body;
 
+    // NUEVO: mesesAbonar para extender fecha
+    const mesesAbonar = clampInt(req.body?.mesesAbonar ?? 1, 1, 12);
+
     // === NUEVO: permitimos actualizar cochera/exclusiva/piso si vienen en la renovación ===
     const cocheraBody = normCochera(req.body.cochera);
-    // Si el body no trae cochera, dejaremos la existente del cliente; si la trae, normalizamos exclusiva en base a eso
     const exclusivaBody = (req.body.exclusiva !== undefined)
       ? Boolean(req.body.exclusiva)
       : undefined;
@@ -271,13 +288,13 @@ exports.renovarAbono = async (req, res) => {
     }
 
     const hoy = new Date();
-    const ultimoDiaMes = new Date(hoy.getFullYear(), hoy.getMonth() + 1, 0);
-    ultimoDiaMes.setHours(23, 59, 59, 999);
+    // ⬇️ Extiende hasta el último día del mes N-ésimo
+    const ultimoDiaMesExtendido = getUltimoDiaMes(hoy, mesesAbonar - 1);
 
     if (cliente.abonos?.length) {
       await Promise.all(cliente.abonos.map(async (abono) => {
         abono.activo = true;
-        abono.fechaExpiracion = ultimoDiaMes;
+        abono.fechaExpiracion = ultimoDiaMesExtendido;
         await abono.save({ session });
       }));
     }
@@ -291,21 +308,18 @@ exports.renovarAbono = async (req, res) => {
     }
 
     cliente.abonado = true;
-    cliente.finAbono = ultimoDiaMes;
+    cliente.finAbono = ultimoDiaMesExtendido;
     cliente.precioAbono = tipoVehiculo;
     cliente.updatedAt = new Date();
 
-    // === NUEVO: actualización coherente de cochera/exclusiva/piso ===
+    // === NUEVO: coherencia cochera/exclusiva/piso ===
     if (cocheraBody !== '') {
       cliente.cochera = cocheraBody;
-      // si cambiamos cochera a no-Fija, forzamos exclusiva=false
       if (cliente.cochera !== 'Fija') cliente.exclusiva = false;
-      // si el body también trajo exclusiva, la normalizamos con la nueva cochera
       if (exclusivaBody !== undefined) {
         cliente.exclusiva = normExclusiva(exclusivaBody, cliente.cochera);
       }
     } else if (exclusivaBody !== undefined) {
-      // si no vino cochera pero sí exclusiva, normalizamos contra la cochera actual
       cliente.exclusiva = normExclusiva(exclusivaBody, cliente.cochera);
     }
     if (pisoBody !== undefined) {
@@ -316,7 +330,7 @@ exports.renovarAbono = async (req, res) => {
 
     const movimiento = new Movimiento({
       cliente: id,
-      descripcion: `Renovación abono ${tipoVehiculo}`,
+      descripcion: `Renovación abono ${tipoVehiculo} (${mesesAbonar} mes${mesesAbonar>1?'es':''})`,
       monto: precio,
       tipoVehiculo,
       operador: operador || 'Sistema',
@@ -329,7 +343,7 @@ exports.renovarAbono = async (req, res) => {
 
     const movimientoCliente = new MovimientoCliente({
       cliente: id,
-      descripcion: `Renovación abono ${tipoVehiculo}`,
+      descripcion: `Renovación abono ${tipoVehiculo} (${mesesAbonar} mes${mesesAbonar>1?'es':''})`,
       monto: precio,
       tipoVehiculo,
       operador: operador || 'Sistema',
@@ -346,10 +360,11 @@ exports.renovarAbono = async (req, res) => {
 
     const clienteActualizado = await Cliente.findById(id).populate('abonos');
     res.status(200).json({
-      message: 'Abono renovado exitosamente. Todos los abonos del cliente han sido activados.',
+      message: 'Abono renovado exitosamente.',
       cliente: clienteActualizado,
       movimiento,
-      movimientoCliente
+      movimientoCliente,
+      mesesAbonar // 👈 eco para trazabilidad
     });
   } catch (error) {
     await session.abortTransaction();
@@ -393,16 +408,13 @@ exports.actualizarClienteBasico = async (req, res) => {
 
     let cliente = await Cliente.findById(id);
     if (!cliente) {
-      // Fallback: puede que _id sea string en la DB local
       const doc = await Cliente.collection.findOne({ _id: String(id) });
       if (doc) cliente = new Cliente(doc);
     }
     if (!cliente) return res.status(404).json({ message: 'Cliente no encontrado' });
 
-    // Aplicamos cambios básicos
     Object.keys(data).forEach(k => { cliente[k] = data[k]; });
 
-    // Aplicamos cochera/exclusiva/piso con coherencia
     if (cRaw !== undefined) {
       cliente.cochera = cRaw;
       if (cliente.cochera !== 'Fija') cliente.exclusiva = false;

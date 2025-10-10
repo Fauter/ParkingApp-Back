@@ -7,7 +7,7 @@ const Vehiculo = require('../models/Vehiculo');
 const Cliente = require('../models/Cliente');
 
 /* =======================================================
-   🔧 Utilidades de precios (catálogo por método)
+   🔧 Utilidades comunes (I/O local y HTTP)
 ======================================================= */
 
 /** Lee JSON si existe, si no devuelve null */
@@ -31,7 +31,7 @@ async function httpGetJsonLocal(pathAndQuery, timeoutMs = 2000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const r = await fetch(url, { signal: ctrl.signal, headers: { 'Accept': 'application/json' } });
+    const r = await fetch(url, { signal: ctrl.signal, headers: { 'Accept': 'application/json', 'cache-control': 'no-store' } });
     if (!r.ok) return null;
     return await r.json();
   } catch {
@@ -41,13 +41,61 @@ async function httpGetJsonLocal(pathAndQuery, timeoutMs = 2000) {
   }
 }
 
-/** Carga catálogo por método, con múltiples fallbacks */
-async function loadCatalogForMetodo(metodoPago = 'Efectivo') {
-  const isCash = String(metodoPago).trim().toLowerCase() === 'efectivo';
-  // 1) HTTP local
+/* =======================================================
+   🧼 Normalización y tiers robustos
+======================================================= */
+
+const toStr = (v) => (v === null || v === undefined ? '' : String(v));
+const stripAccents = (s) => toStr(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+const normKey = (s) => stripAccents(toStr(s).trim().toLowerCase());
+
+const normVehiculoKey = (s) => normKey(s); // "Camioneta" -> "camioneta"
+const normCochera = (s) => {
+  const k = normKey(s);
+  return k === 'fija' ? 'fija' : 'movil'; // todo lo que no sea 'fija' es 'movil'
+};
+const normExclusiva = (exclusiva, cocheraNorm) =>
+  cocheraNorm === 'fija' ? Boolean(exclusiva) : false;
+
+function getTierCandidates(cocheraNorm, exclusivaBool) {
+  if (cocheraNorm === 'fija') {
+    return exclusivaBool ? ['exclusiva', 'fija'] : ['fija'];
+  }
+  return ['móvil', 'movil']; // soporta con y sin tilde
+}
+
+/* =======================================================
+   📦 Catálogo con caché en memoria + doble intento
+======================================================= */
+
+// Estructura esperada desde /api/precios:
+// { "camioneta": { "móvil": 123, "movil": 123, "fija": 456, "exclusiva": 789 }, ... }
+
+let _catalogCache = {
+  at: 0,
+  efectivo: null,
+  otros: null,
+};
+const CACHE_TTL_MS = 60_000; // 60s para evitar race intermitente
+
+function normalizarMapaVehiculos(mapa) {
+  const out = {};
+  for (const k of Object.keys(mapa || {})) {
+    const nk = normVehiculoKey(k);
+    out[nk] = mapa[k] || {};
+  }
+  return out;
+}
+
+async function fetchCatalogoRemoto(metodo) {
+  const isCash = normKey(metodo) === 'efectivo';
   const apiPath = isCash ? '/api/precios' : '/api/precios?metodo=otros';
+
+  // 1) HTTP local (preferido)
   const viaHttp = await httpGetJsonLocal(apiPath, 2000);
-  if (viaHttp && typeof viaHttp === 'object') return viaHttp;
+  if (viaHttp && typeof viaHttp === 'object') {
+    return normalizarMapaVehiculos(viaHttp);
+  }
 
   // 2) Cache en disco (opcional)
   const baseCache = process.env.PRECIOS_CACHE_FILE || null;
@@ -57,7 +105,7 @@ async function loadCatalogForMetodo(metodoPago = 'Efectivo') {
     cachePath = path.join(dir, `${name}_otros${ext || '.json'}`);
   }
   const viaCache = readJsonIfExists(cachePath);
-  if (viaCache) return viaCache;
+  if (viaCache) return normalizarMapaVehiculos(viaCache);
 
   // 3) data local (repo)
   const dataDir = path.join(__dirname, '../data');
@@ -65,84 +113,172 @@ async function loadCatalogForMetodo(metodoPago = 'Efectivo') {
     ? readJsonIfExists(path.join(dataDir, 'precios.json'))
     : (readJsonIfExists(path.join(dataDir, 'precios_otros.json')) ||
        readJsonIfExists(path.join(dataDir, 'precios.json')));
-  if (localData) return localData;
+  if (localData) return normalizarMapaVehiculos(localData);
 
-  // 4) fallback duro -> vacío (NO inventar precios)
+  // 4) vacío
   return {};
 }
 
-/** Carga ambos catálogos (efectivo + otros) */
-async function loadCatalogsBoth() {
-  const [efectivo, otros] = await Promise.all([
-    loadCatalogForMetodo('Efectivo'),
-    loadCatalogForMetodo('Otros')
-  ]);
-  return { efectivo, otros };
-}
+async function getCatalogo(metodo, { forceRefresh = false } = {}) {
+  const key = normKey(metodo) === 'efectivo' ? 'efectivo' : 'otros';
+  const fresh = _catalogCache[key];
+  const expired = Date.now() - _catalogCache.at > CACHE_TTL_MS;
 
-/* === Tier helpers (sin inventar precios) === */
-function getTierName(cochera, exclusiva) {
-  const c = String(cochera || '').toLowerCase(); // 'fija' | 'móvil' | ''
-  if (c === 'fija') return exclusiva ? 'exclusiva' : 'fija';
-  return 'móvil';
-}
+  if (!forceRefresh && fresh && !expired) return fresh;
 
-/** Lee precio por TIER desde un catálogo dado. SIN fallback numérico. */
-function precioTierFromCatalog(catalog, tipoVehiculo, cochera, exclusiva) {
-  const tv = String(tipoVehiculo || '').toLowerCase();
-  const tier = getTierName(cochera, exclusiva); // 'móvil' | 'fija' | 'exclusiva'
-  if (!catalog || !catalog[tv]) {
-    throw new Error(`No hay catálogo para tipo "${tv}"`);
+  try {
+    const data = await fetchCatalogoRemoto(key === 'efectivo' ? 'efectivo' : 'otros');
+    _catalogCache[key] = data;
+    _catalogCache.at = Date.now();
+    return data;
+  } catch (e) {
+    if (fresh) return fresh;
+    return {};
   }
-  // compat móvil con/sin tilde
-  const val =
-    catalog[tv][tier] ??
-    (tier === 'móvil' ? catalog[tv]['movil'] : undefined);
-
-  const num = Number(val);
-  if (!Number.isFinite(num) || num <= 0) {
-    throw new Error(`No hay precio para tipo "${tv}" en tier "${tier}"`);
-  }
-  return num;
-}
-
-/** Precio por método + tier (Efectivo vs Otros) utilizando catálogos precargados */
-function getPrecioByMetodoFromCatalogs(catalogs, tipoVehiculo, metodoPago, cochera, exclusiva) {
-  const isCash = String(metodoPago || '').trim().toLowerCase() === 'efectivo';
-  const pick = isCash ? (catalogs.efectivo || {}) : (catalogs.otros || {});
-  return precioTierFromCatalog(pick, tipoVehiculo, cochera, exclusiva);
 }
 
 /* =======================================================
-   ⏱️ Helpers de fechas / prorrateo
+   💰 Resolución robusta de precio (doble intento + fallback opcional)
 ======================================================= */
 
-function getUltimoDiaMes(hoy = new Date()) {
-  const d = new Date(hoy.getFullYear(), hoy.getMonth() + 1, 0);
+function lookupPrecio(catalogo, vehiculoKey, tierCandidates) {
+  const bucket = (catalogo || {})[vehiculoKey] || null;
+  if (!bucket) return null;
+  for (const t of tierCandidates) {
+    const val = bucket[t];
+    if (typeof val === 'number' && Number.isFinite(val) && val > 0) return val;
+  }
+  return null;
+}
+
+async function resolverPrecioSeguro({
+  tipoVehiculo,
+  metodoPago = 'Efectivo',
+  cochera = 'Móvil',
+  exclusiva = false,
+  precioFront, // opcional
+  tierFront,   // opcional
+}) {
+  const veh = normVehiculoKey(tipoVehiculo);
+  const cochNorm = normCochera(cochera);
+  const excl = normExclusiva(exclusiva, cochNorm);
+  const tierCandidates = getTierCandidates(cochNorm, excl);
+
+  // 1) intento con cache actual
+  let catalogo = await getCatalogo(metodoPago, { forceRefresh: false });
+  let precio = lookupPrecio(catalogo, veh, tierCandidates);
+
+  // 2) refresh y retry
+  if (!(typeof precio === 'number' && Number.isFinite(precio))) {
+    catalogo = await getCatalogo(metodoPago, { forceRefresh: true });
+    precio = lookupPrecio(catalogo, veh, tierCandidates);
+  }
+
+  // 3) fallback opcional al precio del front si el tier calza
+  const allowFrontFallback = String(process.env.ALLOW_FRONT_PRICE_FALLBACK || '').toLowerCase() === 'true';
+  if (!(typeof precio === 'number' && Number.isFinite(precio)) && allowFrontFallback) {
+    const tFront = normKey(tierFront || '');
+    const tierOk =
+      (cochNorm === 'fija' && excl && tFront === 'exclusiva') ||
+      (cochNorm === 'fija' && !excl && tFront === 'fija') ||
+      (cochNorm === 'movil' && (tFront === 'movil' || tFront === 'móvil'));
+
+    if (tierOk && typeof Number(precioFront) === 'number' && Number.isFinite(Number(precioFront))) {
+      precio = Number(precioFront);
+      console.warn(`[ABONOS] FALLBACK al precio del front habilitado. veh='${veh}' tier='${tierCandidates.join('|')}' precio=${precio}`);
+    }
+  }
+
+  if (!(typeof precio === 'number' && Number.isFinite(precio) && precio > 0)) {
+    const metodoStr = normKey(metodoPago) === 'efectivo' ? 'efectivo' : 'otros';
+    const err = new Error(`No hay catálogo para tipo "${veh}" en método "${metodoStr}" con tier (${tierCandidates.join(' / ')}).`);
+    err.code = 'CATALOGO_NO_ENCONTRADO';
+    err.meta = { vehiculo: veh, metodo: metodoStr, tierCandidates };
+    throw err;
+  }
+
+  const tierElegido = tierCandidates.find((t) => {
+    const v = (catalogo?.[veh] || {})[t];
+    return typeof v === 'number' && Number.isFinite(v) && v > 0;
+  }) || tierCandidates[0];
+
+  return {
+    precio,
+    tier: tierElegido,
+    vehiculo: veh,
+    metodo: normKey(metodoPago) === 'efectivo' ? 'efectivo' : 'otros',
+    cochera: cochNorm,
+    exclusiva: excl,
+  };
+}
+
+/* =======================================================
+   ⏱️ Fechas / prorrateo / multi-mes
+======================================================= */
+
+function clampInt(n, min, max) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return min;
+  return Math.max(min, Math.min(max, Math.trunc(v)));
+}
+
+function getUltimoDiaMes(baseDate = new Date(), offsetMonths = 0) {
+  const y = baseDate.getFullYear();
+  const m = baseDate.getMonth() + 1 + offsetMonths;
+  const d = new Date(y, m, 0);
   d.setHours(23, 59, 59, 999);
   return d;
 }
 
 function prorratearMonto(base, hoy = new Date()) {
-  const ultimoDiaMes = getUltimoDiaMes(hoy);
+  const ultimoDiaMes = getUltimoDiaMes(hoy, 0);
   const totalDiasMes = ultimoDiaMes.getDate();
   const diaActual = hoy.getDate();
-  // Día 1 => cobro mes completo
   const diasRestantes = (diaActual === 1) ? totalDiasMes : (totalDiasMes - diaActual + 1);
-  const factor = diasRestantes / totalDiasMes;
-  const proporcional = Math.round(base * factor);
+  const factor = totalDiasMes > 0 ? (diasRestantes / totalDiasMes) : 0;
+  const proporcional = Math.round(Math.max(0, Number(base) || 0) * factor);
   return { proporcional, ultimoDiaMes, totalDiasMes, diasRestantes, factor };
+}
+
+/**
+ * Calcula cobro total para N meses:
+ *  - Mes actual: prorrateo de diffBase (upgrade de este mes)
+ *  - Meses completos siguientes: baseNuevo * (N-1)
+ */
+function calcularCobroMultiMes(baseNuevo, maxBaseVigente, hoy, mesesAbonarRaw) {
+  const meses = clampInt(mesesAbonarRaw, 1, 12);
+  const diffBase = Math.max(0, (Number(baseNuevo) || 0) - (Number(maxBaseVigente) || 0));
+  const { proporcional, ultimoDiaMes, totalDiasMes, diasRestantes, factor } = prorratearMonto(diffBase, hoy);
+
+  const mesesCompletos = Math.max(0, meses - 1);
+  const subtotalMesesCompletos = mesesCompletos * Math.max(0, Number(baseNuevo) || 0);
+  const total = proporcional + subtotalMesesCompletos;
+
+  const venceEl = getUltimoDiaMes(hoy, meses - 1);
+
+  return {
+    meses,
+    mesesCompletos,
+    proporcionalMesActual: proporcional,
+    subtotalMesesCompletos,
+    totalCobrar: total,
+    venceEl,
+    totalDiasMes,
+    diasRestantes,
+    factor,
+    diffBase,
+  };
 }
 
 /* =======================================================
    📈 Máximo “base mensual” ya abonado por el cliente (mes vigente)
 ======================================================= */
 
-async function getClienteMaxBaseMensualVigente(clienteId, hoy = new Date(), sopt, catalogs) {
+async function getClienteMaxBaseMensualVigente(clienteId, hoy = new Date(), sopt) {
   if (!clienteId) return { maxBase: 0 };
 
   const inicioMes = new Date(hoy.getFullYear(), hoy.getMonth(), 1);
-  const finMes = getUltimoDiaMes(hoy);
+  const finMes = getUltimoDiaMes(hoy, 0);
 
   const abonos = await Abono.find({
     cliente: clienteId,
@@ -152,21 +288,21 @@ async function getClienteMaxBaseMensualVigente(clienteId, hoy = new Date(), sopt
 
   if (!abonos || !abonos.length) return { maxBase: 0 };
 
+  // • OJO: Para el "máximo" usamos la misma resolución robusta del catálogo actual
+  //   para evitar inconsistencias si cambiaron claves de catálogo.
   let maxBase = 0;
   for (const a of abonos) {
-    let base = 0;
     try {
-      base = getPrecioByMetodoFromCatalogs(
-        catalogs,
-        a.tipoVehiculo,
-        a.metodoPago || 'Efectivo',
-        a.cochera || 'Móvil',
-        a.cochera === 'Fija' ? Boolean(a.exclusiva) : false
-      );
+      const r = await resolverPrecioSeguro({
+        tipoVehiculo: a.tipoVehiculo,
+        metodoPago: a.metodoPago || 'Efectivo',
+        cochera: a.cochera || 'Móvil',
+        exclusiva: a.cochera === 'Fija' ? Boolean(a.exclusiva) : false
+      });
+      if (r.precio > maxBase) maxBase = r.precio;
     } catch {
-      base = 0; // si un abono viejo no matchea catálogo actual, lo ignoramos para el "máximo"
+      // ignoramos si el abono histórico no matchea el catálogo actual
     }
-    if (base > maxBase) maxBase = base;
   }
   return { maxBase };
 }
@@ -282,7 +418,7 @@ async function ensureClienteBackend(payload, sopt) {
    PREVIEWS
 ========================= */
 
-// GET /api/abonos/preview?clienteId=...&tipoVehiculo=...&metodoPago=...&cochera=Fija|Móvil&exclusiva=true|false (&dniCuitCuil=...)
+// GET /api/abonos/preview?clienteId=...&tipoVehiculo=...&metodoPago=...&cochera=Fija|Móvil&exclusiva=true|false&mesesAbonar=1..12 (&dniCuitCuil=...)
 exports.previewAbono = async (req, res) => {
   try {
     let {
@@ -291,7 +427,8 @@ exports.previewAbono = async (req, res) => {
       dniCuitCuil,
       metodoPago = 'Efectivo',
       cochera = 'Móvil',
-      exclusiva = 'false'
+      exclusiva = 'false',
+      mesesAbonar = '1'
     } = req.query;
 
     if (!tipoVehiculo) {
@@ -299,6 +436,7 @@ exports.previewAbono = async (req, res) => {
     }
 
     const exBool = String(exclusiva) === 'true';
+    const meses = clampInt(mesesAbonar, 1, 12);
 
     // Resolver cliente por id o por dni (opcional)
     let cliente = null;
@@ -308,46 +446,51 @@ exports.previewAbono = async (req, res) => {
       cliente = await Cliente.findOne({ dniCuitCuil: String(dniCuitCuil).trim() }).lean();
     }
 
-    const catalogs = await loadCatalogsBoth();
     const hoy = new Date();
 
-    // base del nuevo abono (según método + tier)
-    let baseNuevo = 0;
+    // 💰 base del nuevo abono (doble intento + normalización + fallback opcional)
+    let baseNuevo, tier;
     try {
-      baseNuevo = getPrecioByMetodoFromCatalogs(catalogs, tipoVehiculo, metodoPago, cochera, cochera === 'Fija' ? exBool : false);
+      const r = await resolverPrecioSeguro({
+        tipoVehiculo,
+        metodoPago,
+        cochera,
+        exclusiva: cochera === 'Fija' ? exBool : false
+      });
+      baseNuevo = r.precio;
+      tier = r.tier;
     } catch (e) {
-      return res.status(400).json({ error: e.message || 'Precio no disponible para el tier elegido' });
+      const status = e.code === 'CATALOGO_NO_ENCONTRADO' ? 409 : 400;
+      return res.status(status).json({ error: e.message });
     }
 
     // máximo base ya abonado este mes (respetando método/tier históricas)
     let baseActual = 0;
     if (cliente && cliente._id) {
-      const r = await getClienteMaxBaseMensualVigente(cliente._id, hoy, null, catalogs);
+      const r = await getClienteMaxBaseMensualVigente(cliente._id, hoy, null);
       baseActual = r.maxBase || 0;
     }
 
-    const diffBase = Math.max(0, baseNuevo - baseActual);
-    const { proporcional, ultimoDiaMes, totalDiasMes, diasRestantes, factor } = prorratearMonto(diffBase, hoy);
+    const multi = calcularCobroMultiMes(baseNuevo, baseActual, hoy, meses);
 
     return res.json({
       ok: true,
       metodoPago,
       cochera,
       exclusiva: cochera === 'Fija' ? exBool : false,
+      tipoVehiculo,
+      mesesAbonar: multi.meses,
       baseActual,
       baseNuevo,
-      diffBase,
-      diasRestantes,
-      totalDiasMes,
-      factor,
-      monto: proporcional,
-      venceEl: ultimoDiaMes,
-      mensaje:
-        diffBase > 0
-          ? `Vas a meter un vehículo más caro (+$${proporcional} hoy por los días restantes).`
-          : (baseActual === 0
-              ? `Alta inicial: prorrateo del tipo ${tipoVehiculo}.`
-              : `No hay diferencia a pagar (tier igual o más barato).`)
+      tier,
+      diffBase: multi.diffBase,
+      diasRestantes: multi.diasRestantes,
+      totalDiasMes: multi.totalDiasMes,
+      factor: multi.factor,
+      proporcionalMesActual: multi.proporcionalMesActual,
+      subtotalMesesCompletos: multi.subtotalMesesCompletos,
+      monto: multi.totalCobrar,
+      venceEl: multi.venceEl
     });
   } catch (e) {
     console.error('previewAbono error:', e);
@@ -355,12 +498,13 @@ exports.previewAbono = async (req, res) => {
   }
 };
 
-// GET /api/abonos/preview-renovacion?clienteId=...&metodoPago=...&cochera=...&exclusiva=...
+// GET /api/abonos/preview-renovacion?clienteId=...&metodoPago=...&cochera=...&exclusiva=...&mesesAbonar=...
 exports.previewRenovacion = async (req, res) => {
   try {
     const { clienteId, metodoPago = 'Efectivo' } = req.query;
-    let { cochera = 'Móvil', exclusiva = 'false' } = req.query;
+    let { cochera = 'Móvil', exclusiva = 'false', mesesAbonar = '1' } = req.query;
     const exBool = String(exclusiva) === 'true';
+    const meses = clampInt(mesesAbonar, 1, 12);
 
     if (!clienteId) return res.status(400).json({ error: 'Falta clienteId' });
 
@@ -374,23 +518,30 @@ exports.previewRenovacion = async (req, res) => {
         .sort({ fechaExpiracion: -1, createdAt: -1 })
         .lean();
       tipo = (ultimo?.tipoVehiculo || '').toLowerCase();
-      // si tampoco hay cochera/exclusiva, tomamos las del último abono
       if (!req.query.cochera && ultimo?.cochera) cochera = ultimo.cochera;
       if (!req.query.exclusiva && typeof ultimo?.exclusiva === 'boolean') exclusiva = String(ultimo.exclusiva);
     }
     if (!tipo) return res.status(400).json({ error: 'No hay tipo asignado para renovar' });
 
-    const catalogs = await loadCatalogsBoth();
     const hoy = new Date();
 
-    let baseNuevo;
+    let baseNuevo, tier;
     try {
-      baseNuevo = getPrecioByMetodoFromCatalogs(catalogs, tipo, metodoPago, cochera, cochera === 'Fija' ? exBool : false);
+      const r = await resolverPrecioSeguro({
+        tipoVehiculo: tipo,
+        metodoPago,
+        cochera,
+        exclusiva: cochera === 'Fija' ? exBool : false
+      });
+      baseNuevo = r.precio;
+      tier = r.tier;
     } catch (e) {
-      return res.status(400).json({ error: e.message || 'Precio no disponible para el tier elegido' });
+      const status = e.code === 'CATALOGO_NO_ENCONTRADO' ? 409 : 400;
+      return res.status(status).json({ error: e.message });
     }
 
-    const { proporcional, ultimoDiaMes, totalDiasMes, diasRestantes, factor } = prorratearMonto(baseNuevo, hoy);
+    // En renovación no consideramos "maxBase" previo del mes.
+    const multi = calcularCobroMultiMes(baseNuevo, 0, hoy, meses);
 
     return res.json({
       ok: true,
@@ -398,13 +549,16 @@ exports.previewRenovacion = async (req, res) => {
       tipoVehiculo: tipo,
       cochera,
       exclusiva: cochera === 'Fija' ? exBool : false,
+      mesesAbonar: multi.meses,
       baseNuevo,
-      diasRestantes,
-      totalDiasMes,
-      factor,
-      monto: proporcional,
-      venceEl: ultimoDiaMes,
-      mensaje: `Renovación de ${tipo}: $${proporcional} por los días restantes del mes.`
+      tier,
+      diasRestantes: multi.diasRestantes,
+      totalDiasMes: multi.totalDiasMes,
+      factor: multi.factor,
+      proporcionalMesActual: multi.proporcionalMesActual,
+      subtotalMesesCompletos: multi.subtotalMesesCompletos,
+      monto: multi.totalCobrar,
+      venceEl: multi.venceEl
     });
   } catch (e) {
     console.error('previewRenovacion error:', e);
@@ -413,7 +567,7 @@ exports.previewRenovacion = async (req, res) => {
 };
 
 /* =========================
-   RENOVAR ABONO
+   RENOVAR ABONO (NUNCA crear movimientos acá)
 ========================= */
 
 exports.renovarAbono = async (req, res) => {
@@ -431,7 +585,8 @@ exports.renovarAbono = async (req, res) => {
       patente,
       cochera = 'Móvil',
       piso = '',
-      exclusiva = false
+      exclusiva = false,
+      mesesAbonar = 1
     } = req.body;
     if (!clienteId) throw new Error('Falta clienteId');
 
@@ -445,26 +600,28 @@ exports.renovarAbono = async (req, res) => {
         .sort({ fechaExpiracion: -1, createdAt: -1 })
         .lean();
       tipo = (ultimo?.tipoVehiculo || '').toLowerCase();
-      // si body no trae cochera/exclusiva, heredamos del último
       if (!req.body.cochera && ultimo?.cochera) req.body.cochera = ultimo.cochera;
       if (!('exclusiva' in req.body) && typeof ultimo?.exclusiva === 'boolean') req.body.exclusiva = ultimo.exclusiva;
     }
     if (!tipo) throw new Error('El cliente no tiene tipo asociado para renovar');
 
-    const catalogs = await loadCatalogsBoth();
     const hoy = new Date();
 
     let baseNuevo;
     try {
-      baseNuevo = getPrecioByMetodoFromCatalogs(
-        catalogs, tipo, metodoPago, cochera, cochera === 'Fija' ? Boolean(exclusiva) : false
-      );
+      const r = await resolverPrecioSeguro({
+        tipoVehiculo: tipo,
+        metodoPago,
+        cochera,
+        exclusiva: cochera === 'Fija' ? Boolean(exclusiva) : false
+      });
+      baseNuevo = r.precio;
     } catch (e) {
       throw new Error(e.message || 'Precio no disponible para el tier elegido');
     }
 
-    const { proporcional, ultimoDiaMes, totalDiasMes } = prorratearMonto(baseNuevo, hoy);
-    const monto = proporcional;
+    const multi = calcularCobroMultiMes(baseNuevo, 0, hoy, mesesAbonar);
+    const monto = multi.totalCobrar;
 
     const abono = new Abono({
       nombreApellido: cliente.nombreApellido || '',
@@ -481,8 +638,8 @@ exports.renovarAbono = async (req, res) => {
       metodoPago,
       factura,
       tipoVehiculo: tipo,
-      tipoAbono: { nombre: 'Mensual', dias: totalDiasMes },
-      fechaExpiracion: ultimoDiaMes,
+      tipoAbono: { nombre: 'Mensual', dias: multi.totalDiasMes },
+      fechaExpiracion: multi.venceEl,
       cliente: cliente._id,
       activo: true,
       cochera: ['Fija','Móvil'].includes(String(cochera)) ? cochera : '',
@@ -491,48 +648,14 @@ exports.renovarAbono = async (req, res) => {
     });
     await abono.save(sopt);
 
-    // Reactivar cliente
+    // Reactivar cliente y extender fin
     cliente.abonado = true;
-    cliente.finAbono = ultimoDiaMes;
+    cliente.finAbono = multi.venceEl;
     if (!cliente.precioAbono) cliente.precioAbono = tipo;
     if (!cliente.abonos.some(id => String(id) === String(abono._id))) {
       cliente.abonos.push(abono._id);
     }
     await cliente.save(sopt);
-
-    // Movimiento
-    if (monto > 0) {
-      const Movimiento = require('../models/Movimiento');
-      const MovimientoCliente = require('../models/MovimientoCliente');
-      const operadorNombre = req.user?.nombre || operador || 'Sistema';
-
-      const mov = new Movimiento({
-        cliente: cliente._id,
-        patente: (patente || '').toUpperCase(),
-        operador: operadorNombre,
-        tipoVehiculo: tipo,
-        metodoPago,
-        factura,
-        monto,
-        descripcion: `Renovación abono ${tipo}`,
-        tipoTarifa: 'abono'
-      });
-      await mov.save(sopt);
-
-      const movCli = new (require('../models/MovimientoCliente'))({
-        cliente: cliente._id,
-        descripcion: `Renovación abono ${tipo}`,
-        monto,
-        tipoVehiculo: tipo,
-        operador: operadorNombre,
-        patente: (patente || '').toUpperCase(),
-        fecha: new Date()
-      });
-      await movCli.save(sopt);
-
-      cliente.movimientos.push(movCli._id);
-      await cliente.save(sopt);
-    }
 
     if (session) { await session.commitTransaction(); session.endSession(); }
 
@@ -546,7 +669,12 @@ exports.renovarAbono = async (req, res) => {
       message: `Renovación registrada por $${monto}.`,
       cobrado: monto,
       abono,
-      cliente: clientePop
+      cliente: clientePop,
+      multi: {
+        mesesAbonar: multi.meses,
+        proporcionalMesActual: multi.proporcionalMesActual,
+        subtotalMesesCompletos: multi.subtotalMesesCompletos
+      }
     });
   } catch (error) {
     console.error('renovarAbono error:', error);
@@ -556,7 +684,7 @@ exports.renovarAbono = async (req, res) => {
 };
 
 /* =========================
-   REGISTRAR / AGREGAR ABONO
+   REGISTRAR / AGREGAR ABONO (NUNCA crear movimientos acá)
 ========================= */
 
 exports.registrarAbono = async (req, res) => {
@@ -567,7 +695,7 @@ exports.registrarAbono = async (req, res) => {
   if (session) session.startTransaction();
   const sopt = session ? { session } : {};
 
-  const created = { cliente: null, vehiculo: null, abono: null, mov: null, movCli: null };
+  const created = { cliente: null, vehiculo: null, abono: null };
 
   try {
     const {
@@ -594,10 +722,11 @@ exports.registrarAbono = async (req, res) => {
       operador,
       cochera = 'Móvil',
       piso = '',
-      exclusiva = false
+      exclusiva = false,
+      mesesAbonar = 1
     } = req.body;
 
-    // Validaciones mínimas de datos base (cliente se resuelve/crea abajo)
+    // Validaciones mínimas
     if (!String(nombreApellido || '').trim()) throw new Error('Falta nombreApellido');
     if (!String(email || '').trim()) throw new Error('Falta email');
     if (!String(patente || '').trim()) throw new Error('Falta patente');
@@ -605,9 +734,8 @@ exports.registrarAbono = async (req, res) => {
     if (!String(dniCuitCuil || '').trim()) throw new Error('Falta dniCuitCuil');
 
     const pat = String(patente).trim().toUpperCase();
-    const operadorNombre = req.user?.nombre || operador || 'Sistema';
 
-    // 🧠 Cliente: buscar por id/dni o crear
+    // 🧠 Cliente: buscar/crear
     let cliente = await ensureClienteBackend(
       {
         cliente: clienteIdBody || clienteIdAlt,
@@ -627,7 +755,7 @@ exports.registrarAbono = async (req, res) => {
     if (!cliente) throw new Error('No se pudo obtener/crear cliente');
     if (!session) created.cliente = cliente;
 
-    // Fotos (YA VIENEN MAPEADAS A RUTA WEB FINAL POR mapUploadedPaths)
+    // Fotos (YA VIENEN MAPEADAS A RUTA WEB FINAL)
     const fotoSeguro       = buildFotoPath(req, 'fotoSeguro');
     const fotoDNI          = buildFotoPath(req, 'fotoDNI');
     const fotoCedulaVerde  = buildFotoPath(req, 'fotoCedulaVerde');
@@ -656,26 +784,29 @@ exports.registrarAbono = async (req, res) => {
       console.log('🔗 Vehículo actualizado/vinculado:', vehiculo._id);
     }
 
-    // === Cálculo diferencia usando catálogos por método + TIER ===
-    const catalogs = await loadCatalogsBoth();
-    const hoy = new Date();
-
-    // base del nuevo abono (según método seleccionado y tier)
+    // === 💰 Precio robusto por método + tier (doble intento + fallback opcional) ===
     let baseNuevo;
     try {
-      baseNuevo = getPrecioByMetodoFromCatalogs(
-        catalogs, tipoVehiculo, metodoPago, cochera, cochera === 'Fija' ? Boolean(exclusiva) : false
-      );
+      const r = await resolverPrecioSeguro({
+        tipoVehiculo,
+        metodoPago,
+        cochera,
+        exclusiva: cochera === 'Fija' ? Boolean(exclusiva) : false,
+        precioFront: req.body?.precio ? Number(req.body.precio) : undefined,
+        tierFront: req.body?.tierAbono || undefined,
+      });
+      baseNuevo = r.precio;
     } catch (e) {
-      throw new Error(e.message || 'Precio no disponible para el tier elegido');
+      const status = e.code === 'CATALOGO_NO_ENCONTRADO' ? 409 : 400;
+      throw Object.assign(new Error(e.message), { httpStatus: status });
     }
 
-    // máximo base ya abonado este mes por el cliente (respetando método/tier previos)
-    const { maxBase } = await getClienteMaxBaseMensualVigente(cliente._id, hoy, sopt, catalogs);
+    // máximo base ya abonado este mes por el cliente (para la diferencia del mes actual)
+    const { maxBase } = await getClienteMaxBaseMensualVigente(cliente._id, new Date(), sopt);
 
-    const diffBase = Math.max(0, baseNuevo - maxBase);
-    const { proporcional, ultimoDiaMes, totalDiasMes } = prorratearMonto(diffBase, hoy);
-    const montoACobrar = proporcional;
+    // multi-mes
+    const multi = calcularCobroMultiMes(baseNuevo, maxBase, new Date(), mesesAbonar);
+    const montoACobrar = multi.totalCobrar;
 
     // Crear Abono
     const AbonoModelo = new Abono({
@@ -698,8 +829,8 @@ exports.registrarAbono = async (req, res) => {
       metodoPago,
       factura,
       tipoVehiculo,
-      tipoAbono: { nombre: 'Mensual', dias: totalDiasMes },
-      fechaExpiracion: ultimoDiaMes,
+      tipoAbono: { nombre: 'Mensual', dias: multi.totalDiasMes },
+      fechaExpiracion: multi.venceEl,
       fotoSeguro,
       fotoDNI,
       fotoCedulaVerde,
@@ -718,9 +849,9 @@ exports.registrarAbono = async (req, res) => {
     await vehiculo.save(sopt);
 
     cliente.abonado = true;
-    cliente.finAbono = ultimoDiaMes;
+    cliente.finAbono = multi.venceEl;
 
-    // Actualizar "tipo" del cliente si corresponde (nos quedamos con el más caro del mes)
+    // Actualizar "tipo" del cliente si corresponde (nos quedamos con el más caro del mes actual)
     if (baseNuevo >= maxBase) {
       cliente.precioAbono = (tipoVehiculo || '').toLowerCase();
     }
@@ -734,49 +865,7 @@ exports.registrarAbono = async (req, res) => {
     await cliente.save(sopt);
     console.log('🔁 Cliente vinculado a abono/vehículo');
 
-    // Movimientos (si hay diferencia)
-    if (montoACobrar > 0) {
-      const Movimiento = require('../models/Movimiento');
-      const MovimientoCliente = require('../models/MovimientoCliente');
-
-      const descripcion =
-        maxBase === 0
-          ? 'Alta abono'
-          : 'Diferencia por cambio a tier más caro';
-
-      const mov = new Movimiento({
-        cliente: cliente._id,
-        patente: pat,
-        operador: operadorNombre,
-        tipoVehiculo,
-        metodoPago,
-        factura,
-        monto: montoACobrar,
-        descripcion,
-        tipoTarifa: 'abono'
-      });
-      await mov.save(sopt);
-      if (!session) created.mov = mov;
-      console.log('💸 Movimiento creado:', mov._id);
-
-      const movCli = new MovimientoCliente({
-        cliente: cliente._id,
-        descripcion,
-        monto: montoACobrar,
-        tipoVehiculo,
-        operador: operadorNombre,
-        patente: pat,
-        fecha: new Date()
-      });
-      await movCli.save(sopt);
-      if (!session) created.movCli = movCli;
-
-      cliente.movimientos.push(movCli._id);
-      await cliente.save(sopt);
-      console.log('📒 MovimientoCliente creado y vinculado:', movCli._id);
-    } else {
-      console.log('ℹ️ Sin diferencia a cobrar: no se crean movs.');
-    }
+    // ❌ NUNCA crear Movimiento aquí (lo hace movimientoControllers desde el front).
 
     if (session) {
       await session.commitTransaction();
@@ -792,30 +881,31 @@ exports.registrarAbono = async (req, res) => {
     return res.status(201).json({
       message:
         montoACobrar > 0
-          ? `Abono registrado. Se cobró $${montoACobrar} de diferencia.`
-          : 'Abono registrado sin cargos adicionales.',
+          ? `Abono registrado. Se cobró $${montoACobrar}.`
+          : 'Abono registrado sin cargos.',
       cobrado: montoACobrar,
       abono: AbonoModelo,
       vehiculo,
-      cliente: clientePopulado
+      cliente: clientePopulado,
+      multi: {
+        mesesAbonar: multi.meses,
+        proporcionalMesActual: multi.proporcionalMesActual,
+        subtotalMesesCompletos: multi.subtotalMesesCompletos,
+        diffBase: multi.diffBase
+      }
     });
 
   } catch (error) {
     console.error('🔥 Error en registrarAbono:', error);
 
-    // Rollback
     if (session) {
       try { await session.abortTransaction(); } catch {}
       session.endSession();
       console.log('↩️ Transacción abort');
     } else {
+      // Rollback compensatorio
       try {
-        const Movimiento = require('../models/Movimiento');
-        const MovimientoCliente = require('../models/MovimientoCliente');
-
-        if (created.movCli) await MovimientoCliente.deleteOne({ _id: created.movCli._id });
-        if (created.mov)    await Movimiento.deleteOne({ _id: created.mov._id });
-        if (created.abono)  await Abono.deleteOne({ _id: created.abono._id });
+        if (created.abono)   await Abono.deleteOne({ _id: created.abono._id });
         if (created.vehiculo) await Vehiculo.deleteOne({ _id: created.vehiculo._id });
         if (created.cliente) await Cliente.deleteOne({ _id: created.cliente._id });
         console.log('🧹 Rollback compensatorio ejecutado');
@@ -824,7 +914,8 @@ exports.registrarAbono = async (req, res) => {
       }
     }
 
-    return res.status(400).json({ message: 'Error al registrar abono', error: error.message });
+    const httpStatus = error.httpStatus || 400;
+    return res.status(httpStatus).json({ message: 'Error al registrar abono', error: error.message });
   }
 };
 
@@ -839,7 +930,6 @@ exports.agregarAbono = async (req, res) => {
    LISTADOS / BÚSQUEDAS
 ========================= */
 
-// GET /api/abonos?cochera=Fija|Móvil&exclusiva=true|false&search=...&limit=&skip=&activo=
 exports.getAbonos = async (req, res) => {
   try {
     const {
@@ -1012,7 +1102,8 @@ exports.actualizarAbono = async (req, res) => {
       'color','anio','companiaSeguro','precio','metodoPago','factura','tipoVehiculo',
       'activo',
       'cochera','piso','exclusiva',
-      'fotoSeguro','fotoDNI','fotoCedulaVerde'
+      'fotoSeguro','fotoDNI','fotoCedulaVerde',
+      // Nota: mesesAbonar no se persiste; la fechaExpiracion ya quedó extendida
     ];
 
     for (const k of allowed) {
@@ -1035,11 +1126,6 @@ exports.actualizarAbono = async (req, res) => {
       const c = String(updates.cochera || '');
       updates.cochera = ['Fija','Móvil',''].includes(c) ? c : '';
     }
-
-    // Fotos: ya vienen mapeadas a path web en req.body por el middleware mapUploadedPaths
-    // Si no se subió nada nuevo, no viene en body y no se toca.
-    // (El código anterior por req.files se reemplaza por este enfoque)
-    // -> Nada extra que hacer aquí.
 
     const updated = await Abono.findByIdAndUpdate(id, { $set: updates }, { new: true });
     if (!updated) return res.status(404).json({ message: 'Abono no encontrado' });

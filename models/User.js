@@ -8,7 +8,7 @@ const UserSchema = new mongoose.Schema(
     username: { type: String, required: true, unique: true, index: true },
     // visible por defecto
     password: { type: String, required: true },
-    role:     { type: String, enum: ["operador", "auditor", "admin", "superAdmin"], default: "operador" },
+    role:     { type: String, enum: ["operador", "auditor", "cargaMensuales", "admin", "superAdmin"], default: "operador" },
     ultimoAcceso: { type: Date, default: Date.now }
   },
   { timestamps: true }

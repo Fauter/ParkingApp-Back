@@ -160,11 +160,11 @@ router.get('/by-patente/:patente',   getAbonosPorPatente);
 // Detalle por id
 router.get('/:id', getAbonoPorId);
 
-// Altas
+// Altas (NO crean movimientos — el movimiento lo hace el front contra movimientosController)
 router.post('/registrar-abono', uploadFields, mapUploadedPaths, registrarAbono);
 router.post('/agregar-abono',   uploadFields, mapUploadedPaths, agregarAbono);
 
-// Renovación
+// Renovación (NO crea movimientos)
 router.post('/renovar', renovarAbono);
 
 // Updates (con upload opcional)

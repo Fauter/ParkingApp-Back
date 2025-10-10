@@ -1,4 +1,6 @@
 // routes/movimientoRoutes.js
+'use strict';
+
 const express = require('express');
 const router = express.Router();
 const {
@@ -7,13 +9,13 @@ const {
   eliminarTodosLosMovimientos
 } = require('../controllers/movimientoControllers');
 
-// POST crea SIEMPRE timestamps de mongoose; ignoramos timestamps del body
+// POST crea con idempotencia dura (índice único + bucket 2s)
 router.post('/registrar', registrarMovimiento);
 
 // GET ordenado por creación real (createdAt || fecha) DESC
 router.get('/', obtenerMovimientos);
 
-// Danger zone: borrar todos (sólo para mantenimiento)
+// Danger zone: borrar todos (sólo mantenimiento)
 router.delete('/', eliminarTodosLosMovimientos);
 
 module.exports = router;

@@ -222,7 +222,7 @@ async function fetchPreciosDocs() {
 // =======================
 // WATERMARK / SYNC STATE
 // =======================
-// 🔁 NUEVO: usamos `canon` (no `collection`) y migramos en caliente
+// 🔁 usamos `canon` (no `collection`) + migración en caliente
 const SyncStateSchema = new mongoose.Schema({
   canon: { type: String, unique: true, required: true },
   lastUpdatedAt: { type: Date },
@@ -262,7 +262,7 @@ function bytesFromAny(x) {
         if (keys.length === 12) return Uint8Array.from(keys.map(k => Number(x.buffer[k])));
       }
       const directKeys = Object.keys(x).filter(k => /^\d+$/.test(k)).sort((a,b)=>Number(a)-Number(b));
-      if (directKeys.length === 12) return Uint8Array.from(directKeys.map(k => Number(x[k])));
+        if (directKeys.length === 12) return Uint8Array.from(directKeys.map(k => Number(x[k])));
       if (x._bsontype === 'ObjectId' && x.id) return bytesFromAny(x.id);
       if (x.id) return bytesFromAny(x.id);
     }
@@ -405,8 +405,8 @@ async function resolveLocalCollectionName(db, canonName) {
   }
   return canonName;
 }
+
 // === Índice único para precios (tipo, metodo) ===
-// Lo intentamos apenas la conexión esté "open". Si ya está abierta, lo hacemos ya.
 (async () => {
   try {
     const ensure = async () => {
@@ -424,6 +424,7 @@ async function resolveLocalCollectionName(db, canonName) {
     }
   } catch (_) {}
 })();
+
 function buildNaturalKeyFilter(colName, src) {
   const keys = NATURAL_KEYS[colName?.toLowerCase()] || [];
   const filter = {};
@@ -465,7 +466,7 @@ function normalizeIds(inputDoc, colName) {
 function getCollectionNameFromItem(item) {
   if (!item) return null;
   if (item.collection) return item.collection;
-    if (item.route) {
+  if (item.route) {
     const raw = String(item.route || '');
     const routePath = raw.split('?')[0].split('#')[0];   // ✅ limpia query/fragment
     const parts = routePath.split('/').filter(Boolean);
@@ -563,11 +564,8 @@ async function ensureCompositeRegistrarAbonoSynced(remoteDb, item) {
     abono = await Abono.findOne({ patente: body.patente }).sort({ createdAt: -1 }).lean();
   }
 
-  let mov = null;
-  if (cliente && body.patente) {
-    mov = await Movimiento.findOne({ cliente: cliente._id, patente: body.patente }).sort({ createdAt: -1 }).lean();
-  }
-
+  // ⛔️ Importante: NO empujamos movimientos desde el compuesto;
+  // el movimiento se sube por su propio Outbox (evita duplicados).
   if (!MovimientoCliente) { try { MovimientoCliente = require('../models/MovimientoCliente'); } catch (_) {} }
   let movCli = null;
   if (MovimientoCliente && cliente) {
@@ -578,7 +576,7 @@ async function ensureCompositeRegistrarAbonoSynced(remoteDb, item) {
   pushed += await upsertRemoteDoc(remoteDb, 'clientes', cliente);
   pushed += await upsertRemoteDoc(remoteDb, 'vehiculos', vehiculo);
   pushed += await upsertRemoteDoc(remoteDb, 'abonos', abono);
-  pushed += await upsertRemoteDoc(remoteDb, 'movimientos', mov);
+  // NO: pushed += await upsertRemoteDoc(remoteDb, 'movimientos', mov);
   pushed += await upsertRemoteDoc(remoteDb, 'movimientoclientes', movCli);
 
   if (!pushed) throw new Error('composite_registrar_abono: no se encontraron docs locales para sincronizar');
@@ -741,10 +739,11 @@ async function processOutboxItem(remoteDb, item) {
 // =======================
 // PULL REMOTO → LOCAL
 // =======================
-function buildDedupKey(collName, doc) {
-  const keys = NATURAL_KEYS[collName?.toLowerCase()] || [];
-  if (keys.length) return keys.map(k => String(doc[k])).join('||');
-  return String(doc._id);
+
+// ❗️Para mirror no usamos la clave natural para dedup (evita perdas y deleteLocal falsos)
+function makeSeenKeyIncremental(doc) {
+  // En incremental: con _id basta para dedup entre aliases; NK se usa solo al resolver conflictos locales.
+  return String(doc && doc._id);
 }
 
 async function upsertLocalDocWithConflictResolution(localCollection, collName, remoteDoc, stats, options = {}) {
@@ -830,6 +829,7 @@ async function upsertLocalDocWithConflictResolution(localCollection, collName, r
     const code = err && (err.code || err?.errorResponse?.code);
     if (code !== 11000) throw err;
 
+    // 🔁 Aquí sí usamos claves naturales solo para resolver duplicados locales
     const keys = NATURAL_KEYS[collName?.toLowerCase()] || [];
     let anyDelete = false;
     for (const k of keys) {
@@ -890,13 +890,12 @@ async function detectTemporalField(remoteDb, collName) {
   return field;
 }
 
-// 🔁 NUEVAS funciones con migración en caliente desde el campo legado `collection`
+// 🔁 NUEVAS funciones con migración en caliente desde `collection` -> `canon`
 async function getSyncState(collName) {
   const canon = canonicalizeName(collName);
   let st = await SyncState.findOne({ canon });
 
   if (!st) {
-    // migración: si existe con "collection", lo renombro
     const legacy = await SyncState.findOne({ collection: canon }).lean();
     if (legacy) {
       await SyncState.updateOne(
@@ -928,7 +927,6 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
     incrementalBatch = Number(process.env.SYNC_PULL_BATCH) || 5000,
   } = opts;
 
-  const local = mongoose.connection;
   const resultCounts = {};
   let collections = requestedCollections;
 
@@ -1015,7 +1013,7 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
     try {
       const remoteNames = getRemoteNames(canonName);
       const union = [];
-      const seen = new Set();
+      const seenIds = new Set(); // solo por _id para evitar duplicados idénticos entre alias
 
       const isMirrorThisCollection = !!(mirrorAll || new Set(mirrorCollections || []).has(canonName));
       const st = await getSyncState(canonName);
@@ -1050,10 +1048,18 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
               batch.push(d);
             }
             for (const d of batch) {
-              const key = buildDedupKey(canonName, d) + '##' + String(d._id);
-              if (seen.has(key)) continue;
-              seen.add(key);
-              union.push(d);
+              const idStr = String(d._id);
+              if (isMirrorThisCollection) {
+                // En MIRROR dejamos entrar todo; solo filtramos duplicados idénticos por _id
+                if (seenIds.has(idStr)) continue;
+                seenIds.add(idStr);
+                union.push(d);
+              } else {
+                // En incremental, con _id basta para evitar duplicados entre alias
+                if (seenIds.has(idStr)) continue;
+                seenIds.add(idStr);
+                union.push(d);
+              }
               lastDoc = d;
             }
           }
