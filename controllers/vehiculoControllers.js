@@ -575,6 +575,40 @@ exports.getVehiculoByTicketAdmin = async (req, res) => {
   }
 };
 
+exports.setAbonadoFlagByPatente = async (req, res) => {
+  try {
+    const { patente } = req.params;
+    const { abonado, detachFromCliente } = req.body || {};
+
+    if (typeof abonado !== 'boolean') {
+      return res.status(400).json({ msg: 'Campo "abonado" requerido (boolean).' });
+    }
+
+    const vehiculo = await Vehiculo.findOne({ patente: String(patente).toUpperCase() });
+    if (!vehiculo) return res.status(404).json({ msg: 'Vehículo no encontrado' });
+
+    vehiculo.abonado = abonado;
+    if (abonado === false) {
+      // Limpio referencia al abono si existiera
+      vehiculo.abono = undefined;
+    }
+    await vehiculo.save();
+
+    if (detachFromCliente) {
+      // Remueve este vehículo del array vehiculos en todos los clientes que lo tengan
+      await Cliente.updateMany(
+        { vehiculos: vehiculo._id },
+        { $pull: { vehiculos: vehiculo._id } }
+      );
+    }
+
+    res.json({ msg: 'Vehículo actualizado', vehiculo });
+  } catch (err) {
+    console.error('Error en setAbonadoFlagByPatente:', err);
+    res.status(500).json({ msg: 'Error del servidor' });
+  }
+};
+
 // Eliminar todos los vehículos
 exports.eliminarTodosLosVehiculos = async (_req, res) => {
   try {

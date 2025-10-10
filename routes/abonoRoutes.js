@@ -18,6 +18,7 @@ const {
   getAbonosPorCliente,
   getAbonosPorPatente,
   getCatalogoCocherasYPisos,
+  updateVehiculoDeAbono, // 👈 NUEVO
 } = require('../controllers/abonoControllers');
 
 const router = express.Router();
@@ -170,6 +171,9 @@ router.post('/renovar', renovarAbono);
 // Updates (con upload opcional)
 router.patch('/:id', uploadFields, mapUploadedPaths, actualizarAbono);
 router.patch('/:id/exclusiva', setExclusiva);
+
+// NUEVO: actualizar / desvincular vehículo del abono
+router.patch('/:id/vehiculo', updateVehiculoDeAbono);
 
 // Borrado masivo
 router.delete('/', eliminarAbonos);

@@ -15,7 +15,8 @@ const {
   asignarAbonoAVehiculo,
   registrarEntrada,
   registrarSalida,
-  eliminarTodosLosVehiculos
+  eliminarTodosLosVehiculos,
+  setAbonadoFlagByPatente 
 } = require('../controllers/vehiculoControllers');
 
 const router = express.Router();
@@ -95,6 +96,9 @@ router.put('/:patente/registrarSalida', registrarSalida);
 
 // Abonos
 router.put('/asignar-abono/:patente', asignarAbonoAVehiculo);
+
+// ⬇⬇⬇ NUEVA RUTA para (des)abonar por patente y opcionalmente sacar del cliente
+router.patch('/:patente/abonado', setAbonadoFlagByPatente);
 
 // Danger zone
 router.delete('/', eliminarTodosLosVehiculos);

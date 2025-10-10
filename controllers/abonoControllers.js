@@ -288,8 +288,6 @@ async function getClienteMaxBaseMensualVigente(clienteId, hoy = new Date(), sopt
 
   if (!abonos || !abonos.length) return { maxBase: 0 };
 
-  // • OJO: Para el "máximo" usamos la misma resolución robusta del catálogo actual
-  //   para evitar inconsistencias si cambiaron claves de catálogo.
   let maxBase = 0;
   for (const a of abonos) {
     try {
@@ -1095,6 +1093,10 @@ exports.actualizarAbono = async (req, res) => {
       return res.status(400).json({ message: 'ID inválido' });
     }
 
+    // tomamos snapshot antes para saber si hay que propagar cambios
+    const before = await Abono.findById(id).lean();
+    if (!before) return res.status(404).json({ message: 'Abono no encontrado' });
+
     const updates = {};
     const allowed = [
       'nombreApellido','domicilio','localidad','telefonoParticular','telefonoEmergencia',
@@ -1103,7 +1105,7 @@ exports.actualizarAbono = async (req, res) => {
       'activo',
       'cochera','piso','exclusiva',
       'fotoSeguro','fotoDNI','fotoCedulaVerde',
-      // Nota: mesesAbonar no se persiste; la fechaExpiracion ya quedó extendida
+      // 'vehiculo' NO se expone aquí; hay endpoint dedicado
     ];
 
     for (const k of allowed) {
@@ -1130,6 +1132,33 @@ exports.actualizarAbono = async (req, res) => {
     const updated = await Abono.findByIdAndUpdate(id, { $set: updates }, { new: true });
     if (!updated) return res.status(404).json({ message: 'Abono no encontrado' });
 
+    // Propagación: si se desactiva, quitar marca de abonado del vehículo vinculado
+    if (('activo' in updates) && updates.activo === false && before.vehiculo) {
+      try {
+        const veh = await Vehiculo.findById(before.vehiculo);
+        if (veh) {
+          // Verificamos si el vehículo sigue teniendo algún abono activo
+          const stillActive = await Abono.exists({
+            vehiculo: veh._id,
+            activo: true
+          });
+          if (!stillActive) {
+            veh.abonado = false;
+            veh.abono = null;
+            await veh.save();
+          } else {
+            // si hay otro abono activo, solo limpiamos vínculo con ESTE abono si coincide
+            if (String(veh.abono || '') === String(id)) {
+              veh.abono = null;
+              await veh.save();
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[actualizarAbono] no se pudo propagar estado a vehiculo:', e.message);
+      }
+    }
+
     res.json({ ok: true, abono: updated });
   } catch (e) {
     console.error('actualizarAbono error:', e);
@@ -1152,6 +1181,81 @@ exports.setExclusiva = async (req, res) => {
   } catch (e) {
     console.error('setExclusiva error:', e);
     res.status(500).json({ message: 'Error al actualizar exclusiva' });
+  }
+};
+
+/* =========================
+   NUEVO: desvincular/actualizar vehículo del abono
+   PATCH /api/abonos/:id/vehiculo
+   Body: { vehiculoId: "<ObjectId>" | null }
+   - Si vehiculoId === null => quita el vínculo. También marca el vehículo previo como no abonado si no tiene otro abono activo.
+========================= */
+exports.updateVehiculoDeAbono = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(String(id))) {
+      return res.status(400).json({ message: 'ID inválido' });
+    }
+
+    const { vehiculoId } = req.body;
+    const abono = await Abono.findById(id);
+    if (!abono) return res.status(404).json({ message: 'Abono no encontrado' });
+
+    const prevVehId = abono.vehiculo ? String(abono.vehiculo) : null;
+
+    // Validación de nuevo vehiculo (si viene)
+    let nextVehId = null;
+    if (vehiculoId) {
+      if (!mongoose.Types.ObjectId.isValid(String(vehiculoId))) {
+        return res.status(400).json({ message: 'vehiculoId inválido' });
+      }
+      const exists = await Vehiculo.exists({ _id: vehiculoId });
+      if (!exists) return res.status(404).json({ message: 'Vehículo no encontrado' });
+      nextVehId = String(vehiculoId);
+    }
+
+    // Actualizo vínculo en Abono
+    abono.vehiculo = nextVehId ? nextVehId : null;
+    await abono.save();
+
+    // Si había vínculo previo y se está removiendo o cambiando, limpiar el Vehiculo previo
+    if (prevVehId && (!nextVehId || nextVehId !== prevVehId)) {
+      try {
+        const vehPrev = await Vehiculo.findById(prevVehId);
+        if (vehPrev) {
+          // Si no tiene otro abono activo, bajar bandera
+          const otherActive = await Abono.exists({ vehiculo: vehPrev._id, activo: true });
+          if (!otherActive) {
+            vehPrev.abonado = false;
+          }
+          if (String(vehPrev.abono || '') === String(id)) {
+            vehPrev.abono = null;
+          }
+          await vehPrev.save();
+        }
+      } catch (e) {
+        console.warn('[updateVehiculoDeAbono] limpiar vehiculo previo:', e.message);
+      }
+    }
+
+    // Si setearon un nuevo vehículo, subimos su bandera y lo vinculamos
+    if (nextVehId) {
+      try {
+        const vehNext = await Vehiculo.findById(nextVehId);
+        if (vehNext) {
+          vehNext.abonado = true;
+          vehNext.abono = abono._id;
+          await vehNext.save();
+        }
+      } catch (e) {
+        console.warn('[updateVehiculoDeAbono] setear vehiculo nuevo:', e.message);
+      }
+    }
+
+    return res.json({ ok: true, abono });
+  } catch (e) {
+    console.error('updateVehiculoDeAbono error:', e);
+    res.status(500).json({ message: 'Error al actualizar vínculo de vehículo del abono' });
   }
 };
 
