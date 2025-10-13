@@ -1,3 +1,4 @@
+/* eslint-disable no-console */
 // controllers/abonoControllers.js
 const fs = require('fs');
 const path = require('path');
@@ -5,6 +6,7 @@ const mongoose = require('mongoose');
 const Abono = require('../models/Abono');
 const Vehiculo = require('../models/Vehiculo');
 const Cliente = require('../models/Cliente');
+const Outbox = require('../models/Outbox'); // para encolar manualmente PATCH abonos
 
 /* =======================================================
    🔧 Utilidades comunes (I/O local y HTTP)
@@ -278,12 +280,15 @@ async function getClienteMaxBaseMensualVigente(clienteId, hoy = new Date(), sopt
   if (!clienteId) return { maxBase: 0 };
 
   const inicioMes = new Date(hoy.getFullYear(), hoy.getMonth(), 1);
-  const finMes = getUltimoDiaMes(hoy, 0);
+  const finMesLocal = getUltimoDiaMes(hoy, 0);
+
+  // ⚠️ Importante: agregamos +12h para absorber diferencias de huso/UTC
+  const finMesTolerante = new Date(finMesLocal.getTime() + 12 * 60 * 60 * 1000);
 
   const abonos = await Abono.find({
     cliente: clienteId,
     activo: true,
-    fechaExpiracion: { $gte: inicioMes, $lte: finMes }
+    fechaExpiracion: { $gte: inicioMes, $lte: finMesTolerante }
   }, { tipoVehiculo: 1, metodoPago: 1, cochera: 1, exclusiva: 1 }, sopt).lean();
 
   if (!abonos || !abonos.length) return { maxBase: 0 };
@@ -315,7 +320,7 @@ function buildFotoPath(req, field) {
 }
 
 /* =======================================================
-   ⚙️ Soporte transacciones y búsqueda flexible de Cliente
+   ⚙️ Soporte transacciones / búsqueda cliente / ObjectId safe
 ======================================================= */
 
 async function supportsTransactions() {
@@ -366,27 +371,49 @@ async function findClienteFlexible(id, sopt) {
   return null;
 }
 
+// === ObjectId safe (acepta string, Buffer, objeto {buffer:{...}}, ObjectId) ===
+const { Types: { ObjectId } } = mongoose;
+function toObjectIdSafe(v) {
+  if (!v) return undefined;
+  if (v instanceof ObjectId) return v;
+  if (typeof v === 'string') {
+    const s = v.trim();
+    return /^[0-9a-fA-F]{24}$/.test(s) ? new ObjectId(s) : undefined;
+  }
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(v) && (v.length === 12 || v.length === 24)) {
+    return new ObjectId(v);
+  }
+  if (typeof v === 'object' && v.buffer && typeof v.buffer === 'object') {
+    try {
+      const arr = Object.keys(v.buffer).map(k => v.buffer[k]);
+      const buf = Buffer.from(arr);
+      if (buf.length === 12 || buf.length === 24) return new ObjectId(buf);
+    } catch (_) {}
+  }
+  return undefined;
+}
+
 /* =======================================================
    👤 Alta/obtención de cliente en backend (id o DNI)
+   (la dejo disponible y también inlinée en registrarAbono)
 ======================================================= */
-
 async function ensureClienteBackend(payload, sopt) {
   const clienteId = payload.cliente || payload.clienteId;
   const dni = String(payload.dniCuitCuil || '').trim();
 
-  // 1) Si vino un ID, lo intentamos
+  // 1) ID explícito
   if (clienteId) {
     const byId = await findClienteFlexible(clienteId, sopt);
     if (byId) return byId;
   }
 
-  // 2) Si hay DNI, buscamos por DNI
+  // 2) Buscar por DNI
   if (dni) {
     const byDni = await Cliente.findOne({ dniCuitCuil: dni }, null, sopt);
     if (byDni) return byDni;
   }
 
-  // 3) Crear cliente con los datos provistos
+  // 3) Crear con los datos provistos
   if (!dni) throw new Error('Falta dniCuitCuil para crear cliente');
   if (!String(payload.nombreApellido || '').trim()) throw new Error('Falta nombreApellido para crear cliente');
   if (!String(payload.email || '').trim()) throw new Error('Falta email para crear cliente');
@@ -416,7 +443,6 @@ async function ensureClienteBackend(payload, sopt) {
    PREVIEWS
 ========================= */
 
-// GET /api/abonos/preview?clienteId=...&tipoVehiculo=...&metodoPago=...&cochera=Fija|Móvil&exclusiva=true|false&mesesAbonar=1..12 (&dniCuitCuil=...)
 exports.previewAbono = async (req, res) => {
   try {
     let {
@@ -446,7 +472,7 @@ exports.previewAbono = async (req, res) => {
 
     const hoy = new Date();
 
-    // 💰 base del nuevo abono (doble intento + normalización + fallback opcional)
+    // 💰 base del nuevo abono
     let baseNuevo, tier;
     try {
       const r = await resolverPrecioSeguro({
@@ -462,7 +488,7 @@ exports.previewAbono = async (req, res) => {
       return res.status(status).json({ error: e.message });
     }
 
-    // máximo base ya abonado este mes (respetando método/tier históricas)
+    // máximo base ya abonado este mes
     let baseActual = 0;
     if (cliente && cliente._id) {
       const r = await getClienteMaxBaseMensualVigente(cliente._id, hoy, null);
@@ -496,7 +522,7 @@ exports.previewAbono = async (req, res) => {
   }
 };
 
-// GET /api/abonos/preview-renovacion?clienteId=...&metodoPago=...&cochera=...&exclusiva=...&mesesAbonar=...
+// GET /api/abonos/preview-renovacion
 exports.previewRenovacion = async (req, res) => {
   try {
     const { clienteId, metodoPago = 'Efectivo' } = req.query;
@@ -538,7 +564,6 @@ exports.previewRenovacion = async (req, res) => {
       return res.status(status).json({ error: e.message });
     }
 
-    // En renovación no consideramos "maxBase" previo del mes.
     const multi = calcularCobroMultiMes(baseNuevo, 0, hoy, meses);
 
     return res.json({
@@ -733,23 +758,37 @@ exports.registrarAbono = async (req, res) => {
 
     const pat = String(patente).trim().toUpperCase();
 
-    // 🧠 Cliente: buscar/crear
-    let cliente = await ensureClienteBackend(
-      {
-        cliente: clienteIdBody || clienteIdAlt,
-        nombreApellido,
-        dniCuitCuil,
-        domicilio,
-        localidad,
-        telefonoParticular,
-        telefonoEmergencia,
-        domicilioTrabajo,
-        telefonoTrabajo,
-        email,
-        tipoVehiculo
-      },
-      sopt
-    );
+    // 🧠 Cliente: buscar/crear (inline robusto para evitar ReferenceError)
+    let cliente = null;
+    const anyClienteId = clienteIdBody || clienteIdAlt;
+    if (anyClienteId) {
+      cliente = await findClienteFlexible(anyClienteId, sopt);
+    }
+    if (!cliente && dniCuitCuil) {
+      cliente = await Cliente.findOne({ dniCuitCuil: String(dniCuitCuil).trim() }, null, sopt);
+    }
+    if (!cliente) {
+      // crear
+      const nuevo = new Cliente({
+        nombreApellido: String(nombreApellido).trim(),
+        dniCuitCuil: String(dniCuitCuil).trim(),
+        domicilio: domicilio || '',
+        localidad: localidad || '',
+        telefonoParticular: telefonoParticular || '',
+        telefonoEmergencia: telefonoEmergencia || '',
+        domicilioTrabajo: domicilioTrabajo || '',
+        telefonoTrabajo: telefonoTrabajo || '',
+        email: String(email).trim(),
+        abonado: false,
+        finAbono: null,
+        precioAbono: String(tipoVehiculo || '').toLowerCase(),
+        abonos: [],
+        vehiculos: [],
+        movimientos: []
+      });
+      await nuevo.save(sopt);
+      cliente = nuevo;
+    }
     if (!cliente) throw new Error('No se pudo obtener/crear cliente');
     if (!session) created.cliente = cliente;
 
@@ -799,7 +838,7 @@ exports.registrarAbono = async (req, res) => {
       throw Object.assign(new Error(e.message), { httpStatus: status });
     }
 
-    // máximo base ya abonado este mes por el cliente (para la diferencia del mes actual)
+    // máximo base ya abonado este mes por el cliente
     const { maxBase } = await getClienteMaxBaseMensualVigente(cliente._id, new Date(), sopt);
 
     // multi-mes
@@ -849,7 +888,7 @@ exports.registrarAbono = async (req, res) => {
     cliente.abonado = true;
     cliente.finAbono = multi.venceEl;
 
-    // Actualizar "tipo" del cliente si corresponde (nos quedamos con el más caro del mes actual)
+    // Actualizar "tipo" del cliente si corresponde
     if (baseNuevo >= maxBase) {
       cliente.precioAbono = (tipoVehiculo || '').toLowerCase();
     }
@@ -903,9 +942,9 @@ exports.registrarAbono = async (req, res) => {
     } else {
       // Rollback compensatorio
       try {
-        if (created.abono)   await Abono.deleteOne({ _id: created.abono._id });
+        if (created.abono)    await Abono.deleteOne({ _id: created.abono._id });
         if (created.vehiculo) await Vehiculo.deleteOne({ _id: created.vehiculo._id });
-        if (created.cliente) await Cliente.deleteOne({ _id: created.cliente._id });
+        if (created.cliente)  await Cliente.deleteOne({ _id: created.cliente._id });
         console.log('🧹 Rollback compensatorio ejecutado');
       } catch (e) {
         console.warn('⚠️ Fallo en rollback compensatorio:', e?.message || e);
@@ -976,10 +1015,16 @@ exports.getAbonos = async (req, res) => {
       Abono.countDocuments(q)
     ]);
 
+    // espejo + ok:true
+    const normalized = items.map((it) => {
+      const clone = { ...it };
+      return { ...clone, abono: { ...clone }, ok: true };
+    });
+
     if (String(paginated) === 'true') {
-      return res.status(200).json({ total, limit: lim, skip: sk, items });
+      return res.status(200).json({ total, limit: lim, skip: sk, items: normalized });
     }
-    return res.status(200).json(items);
+    return res.status(200).json(normalized);
   } catch (error) {
     console.error('Error al obtener abonos:', error);
     res.status(500).json({ message: 'Error al obtener abonos' });
@@ -994,7 +1039,13 @@ exports.getAbonosPorCliente = async (req, res) => {
       return res.status(400).json({ message: 'clienteId inválido' });
     }
     const items = await Abono.find({ cliente: clienteId }).sort({ createdAt: -1 }).lean();
-    res.status(200).json({ total: items.length, items });
+
+    const normalized = items.map((it) => {
+      const clone = { ...it };
+      return { ...clone, abono: { ...clone }, ok: true };
+    });
+
+    res.status(200).json({ total: normalized.length, items: normalized });
   } catch (error) {
     console.error('getAbonosPorCliente error:', error);
     res.status(500).json({ message: 'Error al obtener abonos por cliente' });
@@ -1009,7 +1060,13 @@ exports.getAbonosPorPatente = async (req, res) => {
     if (!pat) return res.status(400).json({ message: 'Patente requerida' });
 
     const items = await Abono.find({ patente: pat }).sort({ createdAt: -1 }).lean();
-    res.status(200).json({ total: items.length, items });
+
+    const normalized = items.map((it) => {
+      const clone = { ...it };
+      return { ...clone, abono: { ...clone }, ok: true };
+    });
+
+    res.status(200).json({ total: normalized.length, items: normalized });
   } catch (error) {
     console.error('getAbonosPorPatente error:', error);
     res.status(500).json({ message: 'Error al obtener abonos por patente' });
@@ -1078,12 +1135,32 @@ exports.getAbonoPorId = async (req, res) => {
     const { id } = req.params;
     const abono = await Abono.findById(id);
     if (!abono) return res.status(404).json({ message: 'Abono no encontrado' });
-    res.status(200).json(abono);
+    const o = abono.toObject();
+    return res.status(200).json({ ...o, abono: o, ok: true });
   } catch (error) {
     console.error('Error al obtener abono por ID:', error);
     res.status(500).json({ message: 'Error al obtener abono por ID' });
   }
 };
+
+// 🔸 helper: encola un Outbox
+async function enqueueOutboxPatchAbono(abonoDoc) {
+  try {
+    if (!abonoDoc?._id) return;
+    if (process.env.SYNC_DISABLE_PUSH === '1') return;
+
+    await Outbox.create({
+      method: 'PATCH',
+      route: `/api/abonos/${abonoDoc._id}`,
+      params: { id: String(abonoDoc._id) },
+      document: abonoDoc,
+      status: 'pending',
+      createdAt: new Date(),
+    });
+  } catch (e) {
+    console.warn('[actualizarAbono] no pude encolar Outbox PATCH abonos:', e.message || e);
+  }
+}
 
 // PATCH /api/abonos/:id
 exports.actualizarAbono = async (req, res) => {
@@ -1093,65 +1170,71 @@ exports.actualizarAbono = async (req, res) => {
       return res.status(400).json({ message: 'ID inválido' });
     }
 
-    // tomamos snapshot antes para saber si hay que propagar cambios
-    const before = await Abono.findById(id).lean();
+    // ⛔️ NO usar .lean() acá (necesitamos casteo Mongoose por docs viejos)
+    const before = await Abono.findById(id);
     if (!before) return res.status(404).json({ message: 'Abono no encontrado' });
+
+    // Normalizo/limpio abono.vehiculo si vino raro (Buffer serializado, string, etc.)
+    const vehIdSafePre = toObjectIdSafe(before.vehiculo);
+    if (before.vehiculo && !vehIdSafePre) {
+      before.vehiculo = undefined;
+      try { await before.save(); } catch (_) {}
+    } else if (vehIdSafePre && String(vehIdSafePre) !== String(before.vehiculo || '')) {
+      before.vehiculo = vehIdSafePre;
+      try { await before.save(); } catch (_) {}
+    }
 
     const updates = {};
     const allowed = [
       'nombreApellido','domicilio','localidad','telefonoParticular','telefonoEmergencia',
       'domicilioTrabajo','telefonoTrabajo','email','dniCuitCuil','patente','marca','modelo',
       'color','anio','companiaSeguro','precio','metodoPago','factura','tipoVehiculo',
-      'activo',
-      'cochera','piso','exclusiva',
-      'fotoSeguro','fotoDNI','fotoCedulaVerde',
-      // 'vehiculo' NO se expone aquí; hay endpoint dedicado
+      'activo','cochera','piso','exclusiva','fotoSeguro','fotoDNI','fotoCedulaVerde'
+      // 'vehiculo' NO se expone aquí
     ];
 
     for (const k of allowed) {
-      if (k in req.body) {
-        updates[k] = req.body[k];
-      }
+      if (k in req.body) updates[k] = req.body[k];
     }
 
-    // Normalizaciones
-    if ('patente' in updates && updates.patente) {
-      updates.patente = String(updates.patente).toUpperCase();
-    }
-    if ('anio' in updates && updates.anio != null) {
-      updates.anio = Number(updates.anio);
-    }
-    if ('exclusiva' in updates) {
-      updates.exclusiva = String(updates.exclusiva) === 'true' || updates.exclusiva === true;
-    }
+    // Normalizaciones de campos
+    const beforePatUP = String(before.patente || '').toUpperCase();
+    if ('patente' in updates && updates.patente) updates.patente = String(updates.patente).toUpperCase();
+    if ('anio' in updates && updates.anio != null) updates.anio = Number(updates.anio);
+    if ('exclusiva' in updates) updates.exclusiva = String(updates.exclusiva) === 'true' || updates.exclusiva === true;
     if ('cochera' in updates) {
       const c = String(updates.cochera || '');
       updates.cochera = ['Fija','Móvil',''].includes(c) ? c : '';
     }
 
+    const newPatUP = ('patente' in updates && updates.patente) ? String(updates.patente).toUpperCase() : beforePatUP;
+    const willChangePatente = newPatUP !== beforePatUP;
+
+    // 🔍 Pre-chequeo de colisión si cambia la patente (para cortar temprano)
+    if (willChangePatente) {
+      const dup = await Vehiculo.findOne({ patente: newPatUP });
+      if (dup && (!before.vehiculo || String(dup._id) !== String(before.vehiculo))) {
+        return res.status(409).json({ message: 'Patente ya existe en otro vehículo', code: 'PATENTE_DUPLICADA' });
+      }
+    }
+
+    // ⬆️ Actualizo Abono primero
     const updated = await Abono.findByIdAndUpdate(id, { $set: updates }, { new: true });
     if (!updated) return res.status(404).json({ message: 'Abono no encontrado' });
 
-    // Propagación: si se desactiva, quitar marca de abonado del vehículo vinculado
+    // 🔁 Propagación si se desactiva: limpiar bandera en vehículo vinculado (si corresponde)
     if (('activo' in updates) && updates.activo === false && before.vehiculo) {
       try {
         const veh = await Vehiculo.findById(before.vehiculo);
         if (veh) {
-          // Verificamos si el vehículo sigue teniendo algún abono activo
-          const stillActive = await Abono.exists({
-            vehiculo: veh._id,
-            activo: true
-          });
+          const stillActive = await Abono.exists({ vehiculo: veh._id, activo: true });
           if (!stillActive) {
             veh.abonado = false;
             veh.abono = null;
             await veh.save();
-          } else {
-            // si hay otro abono activo, solo limpiamos vínculo con ESTE abono si coincide
-            if (String(veh.abono || '') === String(id)) {
-              veh.abono = null;
-              await veh.save();
-            }
+          } else if (String(veh.abono || '') === String(id)) {
+            veh.abono = null;
+            await veh.save();
           }
         }
       } catch (e) {
@@ -1159,7 +1242,106 @@ exports.actualizarAbono = async (req, res) => {
       }
     }
 
-    res.json({ ok: true, abono: updated });
+    // ⭐ Renombrado/Link robusto si cambió la patente
+    if (willChangePatente) {
+      try {
+        const abonoId = updated._id;
+        const vehIdFromBefore = toObjectIdSafe(before.vehiculo);
+        let veh = null;
+
+        // 1) Intento por ID ya vinculado
+        if (vehIdFromBefore) {
+          veh = await Vehiculo.findById(vehIdFromBefore);
+        }
+
+        // 2) Si no hay vínculo previo, busco por patente ANTERIOR
+        if (!veh && beforePatUP) {
+          veh = await Vehiculo.findOne({ patente: beforePatUP });
+        }
+
+        // 3) Si encontré vehículo → renombro y reparo vínculos
+        if (veh) {
+          // Seguridad extra: evito colisión
+          const colision = await Vehiculo.findOne({ patente: newPatUP });
+          if (colision && String(colision._id) !== String(veh._id)) {
+            // deshago patente en Abono a valor anterior
+            try { await Abono.findByIdAndUpdate(id, { $set: { patente: beforePatUP } }); } catch {}
+            return res.status(409).json({ message: 'Patente ya existe en otro vehículo', code: 'PATENTE_DUPLICADA' });
+          }
+
+          veh.patente = newPatUP;
+          veh.abonado = true;
+          try { veh.abono = abonoId; } catch (_) {}
+          // opcional: refresco datos básicos desde Abono
+          if (updated.tipoVehiculo) veh.tipoVehiculo = updated.tipoVehiculo;
+          if ('marca' in updated)  veh.marca  = updated.marca ?? veh.marca;
+          if ('modelo' in updated) veh.modelo = updated.modelo ?? veh.modelo;
+          if ('color' in updated)  veh.color  = updated.color ?? veh.color;
+          if ('anio' in updated && Number.isFinite(Number(updated.anio))) veh.anio = Number(updated.anio);
+
+          await veh.save();
+
+          // Aseguro puntero en Abono → vehiculo
+          const vehIdFinal = toObjectIdSafe(veh._id) || veh._id;
+          if (!updated.vehiculo || String(updated.vehiculo) !== String(vehIdFinal)) {
+            updated.vehiculo = vehIdFinal;
+            try { await updated.save(); } catch (e) { console.warn('[actualizarAbono] no pude setear abono.vehiculo:', e?.message); }
+          }
+
+          // Aseguro que el cliente tenga el vehículo en el array
+          if (updated.cliente && vehIdFinal) {
+            try {
+              await Cliente.updateOne(
+                { _id: updated.cliente },
+                { $addToSet: { vehiculos: vehIdFinal } }
+              );
+            } catch (e) {
+              console.warn('[actualizarAbono] no pude addToSet vehiculo en cliente:', e?.message);
+            }
+          }
+        } else {
+          // 4) Si no existe vehículo previo: creo uno SOLO si no existe la patente nueva
+          const existNew = await Vehiculo.findOne({ patente: newPatUP });
+          if (!existNew) {
+            const v = new Vehiculo({
+              patente: newPatUP,
+              tipoVehiculo: updated.tipoVehiculo || 'Auto',
+              abonado: true,
+              abono: abonoId,
+              marca: updated.marca || '',
+              modelo: updated.modelo || '',
+              color: updated.color || '',
+              anio: updated.anio || null,
+              cliente: updated.cliente || undefined
+            });
+            await v.save();
+
+            // vinculo en Abono y Cliente
+            const vId = toObjectIdSafe(v._id) || v._id;
+            updated.vehiculo = vId;
+            try { await updated.save(); } catch {}
+            if (updated.cliente && vId) {
+              try {
+                await Cliente.updateOne({ _id: updated.cliente }, { $addToSet: { vehiculos: vId } });
+              } catch (e) { console.warn('[actualizarAbono] addToSet cliente.vehiculos (creación):', e?.message); }
+            }
+          }
+        }
+      } catch (e) {
+        // Falla “controlada”: vuelvo la patente del Abono a la anterior para no dejar roto
+        console.warn('[actualizarAbono] fallo propagación/rename vehiculo:', e?.message || e);
+        try { await Abono.findByIdAndUpdate(id, { $set: { patente: beforePatUP } }, { new: true }); } catch {}
+        return res.status(400).json({ message: 'No se pudo actualizar la patente del vehículo vinculado' });
+      }
+    }
+
+    // Encolar PATCH del Abono para sync
+    try {
+      await enqueueOutboxPatchAbono(updated.toObject());
+    } catch (_) {}
+
+    const out = updated.toObject();
+    return res.json({ ok: true, abono: out, ...out });
   } catch (e) {
     console.error('actualizarAbono error:', e);
     res.status(500).json({ message: 'Error al actualizar abono' });
@@ -1177,7 +1359,13 @@ exports.setExclusiva = async (req, res) => {
     const bool = String(exclusiva) === 'true' || exclusiva === true;
     const updated = await Abono.findByIdAndUpdate(id, { $set: { exclusiva: bool } }, { new: true });
     if (!updated) return res.status(404).json({ message: 'Abono no encontrado' });
-    res.json({ ok: true, exclusiva: updated.exclusiva, abono: updated });
+
+    try {
+      await enqueueOutboxPatchAbono(updated.toObject());
+    } catch (_) {}
+
+    const out = updated.toObject();
+    res.json({ ok: true, exclusiva: updated.exclusiva, abono: out, ...out });
   } catch (e) {
     console.error('setExclusiva error:', e);
     res.status(500).json({ message: 'Error al actualizar exclusiva' });
@@ -1186,9 +1374,6 @@ exports.setExclusiva = async (req, res) => {
 
 /* =========================
    NUEVO: desvincular/actualizar vehículo del abono
-   PATCH /api/abonos/:id/vehiculo
-   Body: { vehiculoId: "<ObjectId>" | null }
-   - Si vehiculoId === null => quita el vínculo. También marca el vehículo previo como no abonado si no tiene otro abono activo.
 ========================= */
 exports.updateVehiculoDeAbono = async (req, res) => {
   try {
@@ -1223,7 +1408,6 @@ exports.updateVehiculoDeAbono = async (req, res) => {
       try {
         const vehPrev = await Vehiculo.findById(prevVehId);
         if (vehPrev) {
-          // Si no tiene otro abono activo, bajar bandera
           const otherActive = await Abono.exists({ vehiculo: vehPrev._id, activo: true });
           if (!otherActive) {
             vehPrev.abonado = false;
@@ -1252,7 +1436,12 @@ exports.updateVehiculoDeAbono = async (req, res) => {
       }
     }
 
-    return res.json({ ok: true, abono });
+    try {
+      await enqueueOutboxPatchAbono(abono.toObject());
+    } catch (_) {}
+
+    const out = abono.toObject();
+    return res.json({ ok: true, abono: out, ...out });
   } catch (e) {
     console.error('updateVehiculoDeAbono error:', e);
     res.status(500).json({ message: 'Error al actualizar vínculo de vehículo del abono' });

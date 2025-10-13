@@ -17,6 +17,33 @@ const { startPeriodicSync } = require('./services/syncService');
 const app = express();
 app.disable('x-powered-by');
 
+/* =========================================
+   ⏱️ Prefijo de fecha y hora para TODOS los logs
+   Formato: [dd/MM HH:mm:ss] Mensaje...
+   (sin año, compacto y al inicio)
+========================================= */
+(function patchConsoleTimestamps() {
+  const orig = {
+    log: console.log,
+    info: console.info,
+    warn: console.warn,
+    error: console.error,
+    debug: console.debug
+  };
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const stamp = () => {
+    const d = new Date();
+    return `[${pad2(d.getDate())}/${pad2(d.getMonth() + 1)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}]`;
+  };
+  const wrap = (fn) => (...args) => fn(stamp(), ...args);
+
+  console.log  = wrap(orig.log);
+  console.info = wrap(orig.info);
+  console.warn = wrap(orig.warn);
+  console.error= wrap(orig.error);
+  console.debug= wrap(orig.debug);
+})();
+
 // ---------- Resolver de API remota ----------
 function resolveRemoteApiBase() {
   const explicit = (process.env.REMOTE_API_BASE || '').trim();

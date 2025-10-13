@@ -1,6 +1,24 @@
 // models/Abono.js
 const mongoose = require('mongoose');
 const { Schema } = mongoose;
+const { Types: { ObjectId } } = mongoose;
+
+function toObjectIdSafe(v) {
+  if (!v) return v;
+  if (v instanceof ObjectId) return v;
+  if (typeof v === 'string' && /^[0-9a-fA-F]{24}$/.test(v)) return new ObjectId(v);
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(v) && (v.length === 12 || v.length === 24)) {
+    return new ObjectId(v);
+  }
+  if (typeof v === 'object' && v.buffer && typeof v.buffer === 'object') {
+    try {
+      const arr = Object.keys(v.buffer).map(k => v.buffer[k]);
+      const buf = Buffer.from(arr);
+      if (buf.length === 12 || buf.length === 24) return new ObjectId(buf);
+    } catch (_) {}
+  }
+  return v; // dejar como vino, pero idealmente nunca debería ocurrir
+}
 
 const abonoSchema = new Schema({
   nombreApellido: String,
@@ -56,8 +74,16 @@ const abonoSchema = new Schema({
   },
 
   // >>>> IMPRESCINDIBLE PARA VINCULAR <<<<
-  cliente: { type: Schema.Types.ObjectId, ref: 'Cliente' },
-  vehiculo: { type: Schema.Types.ObjectId, ref: 'Vehiculo' },
+  cliente: { 
+    type: Schema.Types.ObjectId, 
+    ref: 'Cliente',
+    set: toObjectIdSafe
+  },
+  vehiculo: { 
+    type: Schema.Types.ObjectId, 
+    ref: 'Vehiculo',
+    set: toObjectIdSafe
+  },
 }, { strict: true, timestamps: true });
 
 /**

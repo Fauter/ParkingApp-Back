@@ -168,7 +168,9 @@ router.post('/agregar-abono',   uploadFields, mapUploadedPaths, agregarAbono);
 // Renovación (NO crea movimientos)
 router.post('/renovar', renovarAbono);
 
-// Updates (con upload opcional)
+// Updates (con upload opcional).
+// ⚠️ Nota: aunque uses multipart, ahora el controlador encola Outbox manualmente,
+// así que el sync va a empujar igual.
 router.patch('/:id', uploadFields, mapUploadedPaths, actualizarAbono);
 router.patch('/:id/exclusiva', setExclusiva);
 
