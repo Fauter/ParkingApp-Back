@@ -393,9 +393,17 @@ function toObjectIdSafe(v) {
   return undefined;
 }
 
+/** Devuelve string de ObjectId o null, evitando objetos “buffer” en la salida */
+function toObjectIdString(v) {
+  const oid =
+    toObjectIdSafe(v) ||
+    toObjectIdSafe(v && v._id) ||
+    (v && v.buffer ? toObjectIdSafe(v) : undefined);
+  return oid ? String(oid) : null;
+}
+
 /* =======================================================
    👤 Alta/obtención de cliente en backend (id o DNI)
-   (la dejo disponible y también inlinée en registrarAbono)
 ======================================================= */
 async function ensureClienteBackend(payload, sopt) {
   const clienteId = payload.cliente || payload.clienteId;
@@ -916,6 +924,7 @@ exports.registrarAbono = async (req, res) => {
       .populate('movimientos');
 
     return res.status(201).json({
+      ok: true,
       message:
         montoACobrar > 0
           ? `Abono registrado. Se cobró $${montoACobrar}.`
@@ -962,6 +971,71 @@ exports.agregarAbono = async (req, res) => {
   }
   return exports.registrarAbono(req, res);
 };
+
+/* =======================================================
+   === 🔴 NORMALIZADOR DE SALIDA (ordenado y sin duplicados) ===
+======================================================= */
+
+function normalizeAbonoOutput(a) {
+  // aseguramos ids planos
+  const clienteId = toObjectIdString(a.cliente);
+  const vehiculoId = toObjectIdString(a.vehiculo);
+
+  // orden lógico (inserción) para serialización “linda”
+  const out = {};
+
+  // 1) Identificación y estado
+  out._id = String(a._id);
+  if (typeof a.activo === 'boolean') out.activo = a.activo;
+
+  // 2) Persona / contacto
+  out.nombreApellido = a.nombreApellido || '';
+  out.dniCuitCuil = a.dniCuitCuil || '';
+  out.email = a.email || '';
+  out.telefonoParticular = a.telefonoParticular || '';
+  out.telefonoTrabajo = a.telefonoTrabajo || '';
+  out.telefonoEmergencia = a.telefonoEmergencia || '';
+  out.domicilio = a.domicilio || '';
+  out.domicilioTrabajo = a.domicilioTrabajo || '';
+  out.localidad = a.localidad || '';
+
+  // 3) Vehículo
+  out.patente = (a.patente || '').toUpperCase();
+  out.tipoVehiculo = a.tipoVehiculo || '';
+  out.marca = a.marca || '';
+  out.modelo = a.modelo || '';
+  out.color = a.color || '';
+  if (a.anio !== undefined && a.anio !== null) out.anio = Number(a.anio);
+
+  // 4) Contrato / abono
+  out.tipoAbono = a.tipoAbono || null; // { nombre, dias }
+  if (a.precio !== undefined) out.precio = Number(a.precio) || 0;
+  out.metodoPago = a.metodoPago || '';
+  out.factura = a.factura || '';
+  out.cochera = a.cochera || '';
+  out.piso = a.piso || '';
+  if (typeof a.exclusiva === 'boolean') out.exclusiva = a.exclusiva;
+
+  // 5) Fechas
+  if (a.fechaCreacion) out.fechaCreacion = a.fechaCreacion;
+  if (a.createdAt) out.createdAt = a.createdAt;
+  if (a.updatedAt) out.updatedAt = a.updatedAt;
+  if (a.fechaExpiracion) out.fechaExpiracion = a.fechaExpiracion;
+
+  // 6) Media / adjuntos
+  out.fotoSeguro = a.fotoSeguro || '';
+  out.fotoDNI = a.fotoDNI || '';
+  out.fotoCedulaVerde = a.fotoCedulaVerde || '';
+
+  // 7) Referencias planas
+  out.cliente = clienteId;
+  out.vehiculo = vehiculoId;
+
+  // 8) Técnicos
+  if (a.__v !== undefined) out.__v = a.__v;
+
+  return out;
+}
 
 /* =========================
    LISTADOS / BÚSQUEDAS
@@ -1015,11 +1089,8 @@ exports.getAbonos = async (req, res) => {
       Abono.countDocuments(q)
     ]);
 
-    // espejo + ok:true
-    const normalized = items.map((it) => {
-      const clone = { ...it };
-      return { ...clone, abono: { ...clone }, ok: true };
-    });
+    // 🔹 Normalización sin duplicados ni buffers
+    const normalized = items.map(normalizeAbonoOutput);
 
     if (String(paginated) === 'true') {
       return res.status(200).json({ total, limit: lim, skip: sk, items: normalized });
@@ -1039,12 +1110,7 @@ exports.getAbonosPorCliente = async (req, res) => {
       return res.status(400).json({ message: 'clienteId inválido' });
     }
     const items = await Abono.find({ cliente: clienteId }).sort({ createdAt: -1 }).lean();
-
-    const normalized = items.map((it) => {
-      const clone = { ...it };
-      return { ...clone, abono: { ...clone }, ok: true };
-    });
-
+    const normalized = items.map(normalizeAbonoOutput);
     res.status(200).json({ total: normalized.length, items: normalized });
   } catch (error) {
     console.error('getAbonosPorCliente error:', error);
@@ -1060,12 +1126,7 @@ exports.getAbonosPorPatente = async (req, res) => {
     if (!pat) return res.status(400).json({ message: 'Patente requerida' });
 
     const items = await Abono.find({ patente: pat }).sort({ createdAt: -1 }).lean();
-
-    const normalized = items.map((it) => {
-      const clone = { ...it };
-      return { ...clone, abono: { ...clone }, ok: true };
-    });
-
+    const normalized = items.map(normalizeAbonoOutput);
     res.status(200).json({ total: normalized.length, items: normalized });
   } catch (error) {
     console.error('getAbonosPorPatente error:', error);
@@ -1133,10 +1194,9 @@ exports.getCatalogoCocherasYPisos = async (_req, res) => {
 exports.getAbonoPorId = async (req, res) => {
   try {
     const { id } = req.params;
-    const abono = await Abono.findById(id);
+    const abono = await Abono.findById(id).lean();
     if (!abono) return res.status(404).json({ message: 'Abono no encontrado' });
-    const o = abono.toObject();
-    return res.status(200).json({ ...o, abono: o, ok: true });
+    return res.status(200).json(normalizeAbonoOutput(abono));
   } catch (error) {
     console.error('Error al obtener abono por ID:', error);
     res.status(500).json({ message: 'Error al obtener abono por ID' });
@@ -1412,8 +1472,8 @@ exports.actualizarAbono = async (req, res) => {
       await enqueueOutboxPatchAbono(updated.toObject());
     } catch (_) {}
 
-    const out = updated.toObject();
-    return res.json({ ok: true, abono: out, ...out });
+    // 🔹 Respuesta normalizada (sin duplicados)
+    return res.json({ ok: true, abono: normalizeAbonoOutput(updated.toObject()) });
   } catch (e) {
     console.error('actualizarAbono error:', e);
     res.status(500).json({ message: 'Error al actualizar abono' });
@@ -1436,8 +1496,7 @@ exports.setExclusiva = async (req, res) => {
       await enqueueOutboxPatchAbono(updated.toObject());
     } catch (_) {}
 
-    const out = updated.toObject();
-    res.json({ ok: true, exclusiva: updated.exclusiva, abono: out, ...out });
+    return res.json({ ok: true, abono: normalizeAbonoOutput(updated.toObject()) });
   } catch (e) {
     console.error('setExclusiva error:', e);
     res.status(500).json({ message: 'Error al actualizar exclusiva' });
@@ -1512,8 +1571,7 @@ exports.updateVehiculoDeAbono = async (req, res) => {
       await enqueueOutboxPatchAbono(abono.toObject());
     } catch (_) {}
 
-    const out = abono.toObject();
-    return res.json({ ok: true, abono: out, ...out });
+    return res.json({ ok: true, abono: normalizeAbonoOutput(abono.toObject()) });
   } catch (e) {
     console.error('updateVehiculoDeAbono error:', e);
     res.status(500).json({ message: 'Error al actualizar vínculo de vehículo del abono' });

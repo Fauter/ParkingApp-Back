@@ -1,4 +1,3 @@
-// controllers/clienteControllers.js
 const mongoose = require("mongoose");
 const Cliente = require("../models/Cliente");
 const Vehiculo = require("../models/Vehiculo");
@@ -13,7 +12,6 @@ const {
 function toObjectIdSafe(v) {
   if (!v) return undefined;
   if (v instanceof ObjectId) return v;
-
   if (typeof v === "string") {
     const s = v.trim();
     return /^[0-9a-fA-F]{24}$/.test(s) ? new ObjectId(s) : undefined;
@@ -45,10 +43,9 @@ function normCochera(raw) {
   const v = String(raw || "").trim().toLowerCase();
   if (v === "fija") return "Fija";
   if (v === "movil" || v === "móvil") return "Móvil";
-  return ""; // vacío si no vino/indefinida
+  return "";
 }
 function normExclusiva(raw, cochera) {
-  // Solo permitimos exclusiva=true si la cochera es Fija
   return cochera === "Fija" && Boolean(raw);
 }
 function normPiso(raw) {
@@ -99,23 +96,11 @@ exports.crearClienteSiNoExiste = async (req, res) => {
   const datos = req.body;
   const { nombreApellido, dniCuitCuil } = datos;
 
-  if (
-    !nombreApellido ||
-    typeof nombreApellido !== "string" ||
-    nombreApellido.trim() === ""
-  ) {
-    return res
-      .status(400)
-      .json({ message: 'El campo "nombreApellido" es obligatorio.' });
+  if (!nombreApellido || typeof nombreApellido !== "string" || nombreApellido.trim() === "") {
+    return res.status(400).json({ message: 'El campo "nombreApellido" es obligatorio.' });
   }
-  if (
-    !dniCuitCuil ||
-    typeof dniCuitCuil !== "string" ||
-    dniCuitCuil.trim() === ""
-  ) {
-    return res
-      .status(400)
-      .json({ message: 'El campo "dniCuitCuil" es obligatorio.' });
+  if (!dniCuitCuil || typeof dniCuitCuil !== "string" || dniCuitCuil.trim() === "") {
+    return res.status(400).json({ message: 'El campo "dniCuitCuil" es obligatorio.' });
   }
 
   try {
@@ -123,12 +108,10 @@ exports.crearClienteSiNoExiste = async (req, res) => {
     const email = String(datos.email || "").trim().toLowerCase();
     const nombre = String(nombreApellido || "").trim();
 
-    // Normalización de los nuevos campos
     const cochera = normCochera(datos.cochera);
     const exclusiva = normExclusiva(datos.exclusiva, cochera);
     const piso = normPiso(datos.piso);
 
-    // 🔎 buscar por DNI o email; si nada, fallback a nombre
     let cliente = await Cliente.findOne({
       $or: [{ dniCuitCuil: dni }, ...(email ? [{ email }] : []), { nombreApellido: nombre }],
     });
@@ -145,7 +128,6 @@ exports.crearClienteSiNoExiste = async (req, res) => {
         telefonoTrabajo: String(datos.telefonoTrabajo || ""),
         email,
         precioAbono: String(datos.precioAbono || ""),
-        // NUEVO: guardamos estado de cochera del cliente
         cochera,
         exclusiva,
         piso,
@@ -154,7 +136,6 @@ exports.crearClienteSiNoExiste = async (req, res) => {
       return res.status(201).json(cliente);
     }
 
-    // si existe, actualizar datos básicos (ahora también cochera/exclusiva/piso)
     const campos = [
       "dniCuitCuil",
       "domicilio",
@@ -167,19 +148,13 @@ exports.crearClienteSiNoExiste = async (req, res) => {
       "nombreApellido",
     ];
     campos.forEach((k) => {
-      if (
-        datos[k] !== undefined &&
-        datos[k] !== null &&
-        String(datos[k]).trim() !== ""
-      ) {
+      if (datos[k] !== undefined && datos[k] !== null && String(datos[k]).trim() !== "") {
         cliente[k] = String(datos[k]).trim();
       }
     });
 
-    // Actualizamos cochera/exclusiva/piso si vinieron
     if (datos.cochera !== undefined) {
       cliente.cochera = cochera;
-      // Si cochera cambió a no-Fija, forzamos exclusiva=false
       if (cliente.cochera !== "Fija") cliente.exclusiva = false;
     }
     if (datos.exclusiva !== undefined) {
@@ -192,24 +167,79 @@ exports.crearClienteSiNoExiste = async (req, res) => {
     await cliente.save();
     return res.status(200).json(cliente);
   } catch (err) {
-    res
-      .status(500)
-      .json({ message: "Error al crear/actualizar cliente", error: err.message });
+    res.status(500).json({ message: "Error al crear/actualizar cliente", error: err.message });
   }
 };
 
+// ✅ GET /api/clientes LIMPIO
 exports.obtenerClientes = async (_req, res) => {
   try {
     const clientes = await Cliente.find()
       .populate("vehiculos", "_id patente")
-      .populate("movimientos")
-      .populate("abonos");
-    const out = clientes.map(deriveEstadoAbono);
+      .populate({
+        path: "abonos",
+        select: "_id patente tipoVehiculo precio activo fechaExpiracion cochera exclusiva piso",
+      });
+
+    // Ordenar los campos en la salida
+    const out = clientes.map((c) => {
+      const doc = deriveEstadoAbono(c);
+      const {
+        _id,
+        nombreApellido,
+        dniCuitCuil,
+        email,
+        domicilio,
+        localidad,
+        telefonoParticular,
+        telefonoEmergencia,
+        domicilioTrabajo,
+        telefonoTrabajo,
+        abonado,
+        finAbono,
+        precioAbono,
+        cochera,
+        exclusiva,
+        piso,
+        balance,
+        vehiculos,
+        abonos,
+        movimientos,
+        createdAt,
+        updatedAt,
+        __v,
+      } = doc;
+
+      return {
+        _id,
+        nombreApellido,
+        dniCuitCuil,
+        email,
+        domicilio,
+        localidad,
+        telefonoParticular,
+        telefonoEmergencia,
+        domicilioTrabajo,
+        telefonoTrabajo,
+        abonado,
+        finAbono,
+        precioAbono,
+        cochera,
+        exclusiva,
+        piso,
+        balance,
+        vehiculos,
+        abonos,
+        movimientos,
+        createdAt,
+        updatedAt,
+        __v,
+      };
+    });
+
     res.status(200).json(out);
   } catch (err) {
-    res
-      .status(500)
-      .json({ message: "Error al obtener clientes", error: err.message });
+    res.status(500).json({ message: "Error al obtener clientes", error: err.message });
   }
 };
 
@@ -218,13 +248,11 @@ exports.obtenerClientePorNombre = async (req, res) => {
   try {
     const cliente = await Cliente.findOne({ nombreApellido })
       .populate("vehiculos", "_id patente")
-      .populate("abonos"); // 👈 necesario para derivar por fecha si finAbono es null
+      .populate("abonos");
     if (!cliente) return res.status(404).json({ message: "Cliente no encontrado" });
     res.json(deriveEstadoAbono(cliente));
   } catch (err) {
-    res
-      .status(500)
-      .json({ message: "Error al buscar cliente", error: err.message });
+    res.status(500).json({ message: "Error al buscar cliente", error: err.message });
   }
 };
 
@@ -238,22 +266,14 @@ exports.obtenerClientePorId = async (req, res) => {
     if (!cliente) return res.status(404).json({ message: "Cliente no encontrado" });
     res.json(deriveEstadoAbono(cliente));
   } catch (err) {
-    res
-      .status(500)
-      .json({ message: "Error al buscar cliente por ID", error: err.message });
+    res.status(500).json({ message: "Error al buscar cliente por ID", error: err.message });
   }
 };
 
 exports.marcarClienteComoAbonado = async (req, res) => {
   const { nombreApellido } = req.body;
-  if (
-    !nombreApellido ||
-    typeof nombreApellido !== "string" ||
-    nombreApellido.trim() === ""
-  ) {
-    return res
-      .status(400)
-      .json({ message: 'El campo "nombreApellido" es obligatorio.' });
+  if (!nombreApellido || typeof nombreApellido !== "string" || nombreApellido.trim() === "") {
+    return res.status(400).json({ message: 'El campo "nombreApellido" es obligatorio.' });
   }
   try {
     const cliente = await Cliente.findOneAndUpdate(
@@ -262,13 +282,9 @@ exports.marcarClienteComoAbonado = async (req, res) => {
       { new: true }
     );
     if (!cliente) return res.status(404).json({ message: "Cliente no encontrado." });
-    res
-      .status(200)
-      .json({ message: "Cliente marcado como abonado.", cliente });
+    res.status(200).json({ message: "Cliente marcado como abonado.", cliente });
   } catch (err) {
-    res
-      .status(500)
-      .json({ message: "Error al actualizar cliente", error: err.message });
+    res.status(500).json({ message: "Error al actualizar cliente", error: err.message });
   }
 };
 
@@ -281,17 +297,11 @@ exports.actualizarPrecioAbono = async (req, res) => {
     if (tipoVehiculo) {
       cliente.precioAbono = tipoVehiculo;
       await cliente.save();
-      return res.json({
-        message: "Precio de abono actualizado correctamente",
-        cliente,
-      });
+      return res.json({ message: "Precio de abono actualizado correctamente", cliente });
     }
     res.json(cliente);
   } catch (err) {
-    res.status(500).json({
-      message: "Error al actualizar precio de abono",
-      error: err.message,
-    });
+    res.status(500).json({ message: "Error al actualizar precio de abono", error: err.message });
   }
 };
 
@@ -328,9 +338,7 @@ exports.desabonarCliente = async (req, res) => {
       cliente: await Cliente.findById(id).populate("vehiculos abonos movimientos"),
     });
   } catch (err) {
-    res
-      .status(500)
-      .json({ message: "Error al desabonar cliente", error: err.message });
+    res.status(500).json({ message: "Error al desabonar cliente", error: err.message });
   }
 };
 
@@ -339,18 +347,12 @@ exports.renovarAbono = async (req, res) => {
   session.startTransaction();
   try {
     const { id } = req.params;
-    const { precio, metodoPago, factura, operador, patente, tipoVehiculo } =
-      req.body;
-
-    // NUEVO: mesesAbonar para extender fecha
+    const { precio, metodoPago, factura, operador, patente, tipoVehiculo } = req.body;
     const mesesAbonar = clampInt(req.body?.mesesAbonar ?? 1, 1, 12);
 
-    // === Permitir actualizar cochera/exclusiva/piso si vienen en la renovación ===
     const cocheraBody = normCochera(req.body.cochera);
-    const exclusivaBody =
-      req.body.exclusiva !== undefined ? Boolean(req.body.exclusiva) : undefined;
-    const pisoBody =
-      req.body.piso !== undefined ? normPiso(req.body.piso) : undefined;
+    const exclusivaBody = req.body.exclusiva !== undefined ? Boolean(req.body.exclusiva) : undefined;
+    const pisoBody = req.body.piso !== undefined ? normPiso(req.body.piso) : undefined;
 
     if (!precio || isNaN(precio)) {
       await session.abortTransaction();
@@ -358,9 +360,7 @@ exports.renovarAbono = async (req, res) => {
     }
     if (
       !metodoPago ||
-      !["Efectivo", "Transferencia", "Débito", "Crédito", "QR"].includes(
-        metodoPago
-      )
+      !["Efectivo", "Transferencia", "Débito", "Crédito", "QR"].includes(metodoPago)
     ) {
       await session.abortTransaction();
       return res.status(400).json({ message: "Método de pago inválido" });
@@ -377,7 +377,6 @@ exports.renovarAbono = async (req, res) => {
     }
 
     const hoy = new Date();
-    // ⬇️ Extiende hasta el último día del mes N-ésimo
     const ultimoDiaMesExtendido = getUltimoDiaMes(hoy, mesesAbonar - 1);
 
     if (cliente.abonos?.length) {
@@ -403,13 +402,11 @@ exports.renovarAbono = async (req, res) => {
     cliente.precioAbono = tipoVehiculo;
     cliente.updatedAt = new Date();
 
-    // coherencia cochera/exclusiva/piso
     if (cocheraBody !== "") {
       cliente.cochera = cocheraBody;
       if (cliente.cochera !== "Fija") cliente.exclusiva = false;
-      if (exclusivaBody !== undefined) {
+      if (exclusivaBody !== undefined)
         cliente.exclusiva = normExclusiva(exclusivaBody, cliente.cochera);
-      }
     } else if (exclusivaBody !== undefined) {
       cliente.exclusiva = normExclusiva(exclusivaBody, cliente.cochera);
     }
@@ -421,7 +418,9 @@ exports.renovarAbono = async (req, res) => {
 
     const movimiento = new Movimiento({
       cliente: id,
-      descripcion: `Renovación abono ${tipoVehiculo} (${mesesAbonar} mes${mesesAbonar > 1 ? "es" : ""})`,
+      descripcion: `Renovación abono ${tipoVehiculo} (${mesesAbonar} mes${
+        mesesAbonar > 1 ? "es" : ""
+      })`,
       monto: precio,
       tipoVehiculo,
       operador: operador || "Sistema",
@@ -434,7 +433,9 @@ exports.renovarAbono = async (req, res) => {
 
     const movimientoCliente = new MovimientoCliente({
       cliente: id,
-      descripcion: `Renovación abono ${tipoVehiculo} (${mesesAbonar} mes${mesesAbonar > 1 ? "es" : ""})`,
+      descripcion: `Renovación abono ${tipoVehiculo} (${mesesAbonar} mes${
+        mesesAbonar > 1 ? "es" : ""
+      })`,
       monto: precio,
       tipoVehiculo,
       operador: operador || "Sistema",
@@ -455,16 +456,13 @@ exports.renovarAbono = async (req, res) => {
       cliente: clienteActualizado,
       movimiento,
       movimientoCliente,
-      mesesAbonar, // eco para trazabilidad
+      mesesAbonar,
     });
   } catch (error) {
     await session.abortTransaction();
     session.endSession();
     console.error("Error al renovar abono:", error);
-    res.status(500).json({
-      message: "Error al renovar abono",
-      error: error.message,
-    });
+    res.status(500).json({ message: "Error al renovar abono", error: error.message });
   }
 };
 
@@ -473,18 +471,13 @@ exports.eliminarTodosLosClientes = async (_req, res) => {
     await Cliente.deleteMany({});
     res.status(200).json({ message: "Todos los clientes fueron eliminados." });
   } catch (err) {
-    res
-      .status(500)
-      .json({ message: "Error al eliminar clientes", error: err.message });
+    res.status(500).json({ message: "Error al eliminar clientes", error: err.message });
   }
 };
 
-// NUEVO: update básico (sin tocar abonos/vehículos) con fallback a _id string
 exports.actualizarClienteBasico = async (req, res) => {
   try {
     const { id } = req.params;
-
-    // permitimos actualizar datos básicos + cochera/exclusiva/piso
     const campos = [
       "nombreApellido",
       "dniCuitCuil",
@@ -496,15 +489,12 @@ exports.actualizarClienteBasico = async (req, res) => {
       "telefonoTrabajo",
       "email",
     ];
-
     const data = {};
     campos.forEach((k) => {
       if (k in req.body) data[k] = req.body[k];
     });
 
-    // Normalizamos cochera/exclusiva/piso si vinieron
-    const cRaw =
-      req.body.cochera !== undefined ? normCochera(req.body.cochera) : undefined;
+    const cRaw = req.body.cochera !== undefined ? normCochera(req.body.cochera) : undefined;
     const pRaw = req.body.piso !== undefined ? normPiso(req.body.piso) : undefined;
     const eRawPresent = req.body.exclusiva !== undefined;
 
@@ -533,8 +523,6 @@ exports.actualizarClienteBasico = async (req, res) => {
     await cliente.save();
     return res.json({ message: "Cliente actualizado", cliente });
   } catch (err) {
-    res
-      .status(500)
-      .json({ message: "Error al actualizar cliente", error: err.message });
+    res.status(500).json({ message: "Error al actualizar cliente", error: err.message });
   }
 };

@@ -20,10 +20,7 @@ const Counter = require("../models/Counter");
 const UPLOADS_DIR = path.join(__dirname, "../uploads");
 const FOTOS_DIR = path.join(UPLOADS_DIR, "fotos");
 const FOTOS_ENTRADAS_DIR = path.join(FOTOS_DIR, "entradas");
-const RUTA_FOTO_TEMPORAL = path.join(
-  __dirname,
-  "../camara/sacarfoto/captura.jpg"
-);
+const RUTA_FOTO_TEMPORAL = path.join(__dirname, "../camara/sacarfoto/captura.jpg");
 
 [UPLOADS_DIR, FOTOS_DIR, FOTOS_ENTRADAS_DIR].forEach((dir) => {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -55,13 +52,22 @@ async function resolveClienteIdForAbono(abonoDoc) {
   if (id) return id;
 
   // 2) Heurísticas por datos del abono
-  const dni   = String(abonoDoc?.dniCuitCuil || '').trim();
-  const email = String(abonoDoc?.email || '').trim().toLowerCase();
-  const name  = String(abonoDoc?.nombreApellido || '').trim();
+  const dni = String(abonoDoc?.dniCuitCuil || "").trim();
+  const email = String(abonoDoc?.email || "").trim().toLowerCase();
+  const name = String(abonoDoc?.nombreApellido || "").trim();
 
-  if (dni)   { const c = await Cliente.findOne({ dniCuitCuil: dni }).select('_id').lean();   if (c) return c._id; }
-  if (email) { const c = await Cliente.findOne({ email }).select('_id').lean();               if (c) return c._id; }
-  if (name)  { const c = await Cliente.findOne({ nombreApellido: name }).select('_id').lean();if (c) return c._id; }
+  if (dni) {
+    const c = await Cliente.findOne({ dniCuitCuil: dni }).select("_id").lean();
+    if (c) return c._id;
+  }
+  if (email) {
+    const c = await Cliente.findOne({ email }).select("_id").lean();
+    if (c) return c._id;
+  }
+  if (name) {
+    const c = await Cliente.findOne({ nombreApellido: name }).select("_id").lean();
+    if (c) return c._id;
+  }
 
   return null;
 }
@@ -80,10 +86,7 @@ async function actualizarEstadoTurnoVehiculo(patente) {
   const pat = String(patente || "").toUpperCase();
   const turnos = await Turno.find({ patente: pat });
   const tieneTurnoActivo = turnos.some(
-    (turno) =>
-      turno.expirado === false &&
-      new Date(turno.fin) > ahora &&
-      turno.usado === false
+    (turno) => turno.expirado === false && new Date(turno.fin) > ahora && turno.usado === false
   );
   return tieneTurnoActivo;
 }
@@ -137,10 +140,7 @@ function getOperadorNombre(req) {
 async function calcularCostoExcedente(tipoVehiculo, desde, hasta) {
   try {
     const payload = { tipoVehiculo, desde, hasta };
-    const { data } = await axios.post(
-      "http://localhost:5000/api/calcular-tarifa",
-      payload
-    );
+    const { data } = await axios.post("http://localhost:5000/api/calcular-tarifa", payload);
     const valor = data?.precio ?? data?.monto ?? data?.total ?? 0;
     if (Number.isFinite(Number(valor))) return Number(valor);
   } catch (e) {
@@ -214,10 +214,6 @@ function oidOrNull(x) {
 
 /* =========================================================================
    🔒 ANTI-DUPLICADOS / CAST ROBUSTO
-   - Nunca crear un vehículo nuevo por cambiar patente (si colisiona -> 409)
-   - Sync desde Abono: buscar por abonoId, renombrar, actualizar.
-   - Blindar abono.vehiculo como ObjectId real.
-   - Castear SIEMPRE abono.cliente para $addToSet en Cliente.
    ========================================================================= */
 
 // ✅ Sync seguro desde Abono SIN duplicar + fija abono.vehiculo como ObjectId real
@@ -278,14 +274,11 @@ async function ensureVehiculoFromAbono(abonoDoc) {
     try {
       await abonoDoc.save();
     } catch (e) {
-      console.warn(
-        "[ensureVehiculoFromAbono] No pude guardar abono.vehiculo:",
-        e?.message
-      );
+      console.warn("[ensureVehiculoFromAbono] No pude guardar abono.vehiculo:", e?.message);
     }
   }
 
-  // 7) Vínculo en Cliente con casteo FUERTE y sin romper si no hay ID
+  // 7) Vínculo en Cliente
   const cliId = await resolveClienteIdForAbono(abonoDoc);
   if (cliId && vehId) {
     try {
@@ -294,7 +287,7 @@ async function ensureVehiculoFromAbono(abonoDoc) {
       console.warn("[ensureVehiculoFromAbono] addToSet cliente.vehiculos:", e?.message);
     }
 
-    // 👉 Encolar Outbox para que suba al remoto (merge por addToSet)
+    // 👉 Outbox
     try {
       const Outbox = require("../models/Outbox");
       await Outbox.create({
@@ -309,10 +302,115 @@ async function ensureVehiculoFromAbono(abonoDoc) {
       console.warn("[ensureVehiculoFromAbono] no pude encolar Outbox clientes:", e?.message);
     }
   } else {
-    console.warn("[ensureVehiculoFromAbono] skip addToSet: no pude resolver cliId para el abono", String(abonoDoc?._id || '¿?'));
+    console.warn(
+      "[ensureVehiculoFromAbono] skip addToSet: no pude resolver cliId para el abono",
+      String(abonoDoc?._id || "¿?")
+    );
   }
-  
+
   return vehiculo;
+}
+
+/* =========================================================================
+   🔧 LIMPIEZA Y ORDEN DE RESPUESTA
+   ========================================================================= */
+
+// Quita cualquier propiedad 'buffer' anidada y normaliza _id a string donde corresponda
+function deepClean(value) {
+  if (Array.isArray(value)) {
+    return value.map((v) => deepClean(v));
+  }
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (k === "buffer") continue; // basura
+      if (k === "_id") {
+        try {
+          out._id = String(v);
+          continue;
+        } catch {
+          // fallthrough
+        }
+      }
+      out[k] = deepClean(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+// Abono “lite”: sin buffers; mantengo campos útiles si vienen “embeddeados”
+function formatAbono(ab) {
+  if (!ab || typeof ab !== "object") return ab ?? null;
+  const x = deepClean(ab);
+  const out = {};
+  if (x._id) out._id = x._id;
+  if (x.tipoTarifa !== undefined) out.tipoTarifa = x.tipoTarifa;
+  if (x.activo !== undefined) out.activo = x.activo;
+  if (x.cochera !== undefined) out.cochera = x.cochera;
+  if (x.piso !== undefined) out.piso = x.piso;
+  if (x.exclusiva !== undefined) out.exclusiva = x.exclusiva;
+  if (x.fechaCreacion) out.fechaCreacion = x.fechaCreacion;
+  if (x.patente) out.patente = x.patente;
+  if (x.tipoVehiculo) out.tipoVehiculo = x.tipoVehiculo;
+  if (x.precio !== undefined) out.precio = x.precio;
+  return out;
+}
+
+// Cliente “lite”: sin buffers, mantengo lo relevante si vino “embeddeado”
+function formatCliente(cli) {
+  if (!cli || typeof cli !== "object") return cli ?? null;
+  const x = deepClean(cli);
+  const out = {};
+  // Identidad si estuviera
+  if (x._id) out._id = x._id;
+  if (x.nombreApellido) out.nombreApellido = x.nombreApellido;
+  if (x.dniCuitCuil) out.dniCuitCuil = x.dniCuitCuil;
+  if (x.email) out.email = x.email;
+
+  // Estado que usás en front
+  if (x.abonado !== undefined) out.abonado = x.abonado;
+  if (x.finAbono) out.finAbono = x.finAbono;
+  if (x.precioAbono !== undefined) out.precioAbono = x.precioAbono;
+  if (x.cochera !== undefined) out.cochera = x.cochera;
+  if (x.exclusiva !== undefined) out.exclusiva = x.exclusiva;
+  if (x.piso !== undefined) out.piso = x.piso;
+  if (x.balance !== undefined) out.balance = x.balance;
+
+  // Referencias si vinieran
+  if (Array.isArray(x.vehiculos)) out.vehiculos = x.vehiculos.map((v) => deepClean(v));
+  if (Array.isArray(x.abonos)) out.abonos = x.abonos.map((v) => deepClean(v));
+  if (Array.isArray(x.movimientos)) out.movimientos = x.movimientos.map((v) => deepClean(v));
+
+  return out;
+}
+
+// Orden y limpieza final de un vehículo (objeto plain)
+function formatVehiculo(v) {
+  const x = deepClean(v || {});
+  const ordered = {
+    _id: x._id,
+    patente: x.patente,
+    tipoVehiculo: x.tipoVehiculo,
+    abonado: x.abonado,
+    turno: x.turno,
+    abono: formatAbono(x.abono),
+    cliente: formatCliente(x.cliente),
+    marca: x.marca,
+    modelo: x.modelo,
+    color: x.color,
+    anio: x.anio,
+    operador: x.operador,
+    estadiaActual: x.estadiaActual ? deepClean(x.estadiaActual) : undefined,
+    historialEstadias: Array.isArray(x.historialEstadias) ? deepClean(x.historialEstadias) : [],
+    createdAt: x.createdAt,
+    updatedAt: x.updatedAt,
+    __v: x.__v,
+  };
+
+  // Quitar claves undefined para no ensuciar
+  Object.keys(ordered).forEach((k) => ordered[k] === undefined && delete ordered[k]);
+  return ordered;
 }
 
 /* =========================================================================
@@ -340,9 +438,7 @@ exports.createVehiculo = async (req, res) => {
     }
 
     const operadorNombre =
-      (typeof operador === "string" && operador.trim()) ||
-      getOperadorNombre(req) ||
-      "Operador Desconocido";
+      (typeof operador === "string" && operador.trim()) || getOperadorNombre(req) || "Operador Desconocido";
 
     const rutaFotoGuardada = await guardarFotoVehiculo(patente, fotoUrl);
 
@@ -359,8 +455,7 @@ exports.createVehiculo = async (req, res) => {
 
       if (abonado) {
         const precios = obtenerPrecios();
-        const precioAbono =
-          precios[tipoVehiculo.toLowerCase()]?.estadia || 0;
+        const precioAbono = precios[tipoVehiculo.toLowerCase()]?.estadia || 0;
 
         vehiculo.abonoExpira = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
 
@@ -390,15 +485,11 @@ exports.createVehiculo = async (req, res) => {
       };
 
       await vehiculo.save();
-      return res
-        .status(201)
-        .json({ msg: "Vehículo creado y entrada registrada", vehiculo });
+      return res.status(201).json({ msg: "Vehículo creado y entrada registrada", vehiculo: formatVehiculo(vehiculo.toObject()) });
     }
 
     if (vehiculo.estadiaActual?.entrada) {
-      return res
-        .status(400)
-        .json({ msg: "Este vehículo ya tiene una estadía en curso" });
+      return res.status(400).json({ msg: "Este vehículo ya tiene una estadía en curso" });
     }
 
     const ticketNum = ticket || (await obtenerProximoTicket());
@@ -414,9 +505,7 @@ exports.createVehiculo = async (req, res) => {
     };
 
     await vehiculo.save();
-    return res
-      .status(200)
-      .json({ msg: "Entrada registrada para vehículo existente", vehiculo });
+    return res.status(200).json({ msg: "Entrada registrada para vehículo existente", vehiculo: formatVehiculo(vehiculo.toObject()) });
   } catch (err) {
     console.error("💥 Error en createVehiculo:", err);
     res.status(500).json({ msg: "Error del servidor" });
@@ -444,8 +533,7 @@ exports.createVehiculoSinEntrada = async (req, res) => {
 
       if (abonado) {
         const precios = obtenerPrecios();
-        const precioAbono =
-          precios[tipoVehiculo.toLowerCase()]?.estadia || 0;
+        const precioAbono = precios[tipoVehiculo.toLowerCase()]?.estadia || 0;
 
         vehiculo.abonoExpira = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
 
@@ -463,29 +551,28 @@ exports.createVehiculoSinEntrada = async (req, res) => {
       }
 
       await vehiculo.save();
-      return res
-        .status(201)
-        .json({ msg: "Vehículo creado sin entrada registrada", vehiculo });
+      return res.status(201).json({ msg: "Vehículo creado sin entrada registrada", vehiculo: formatVehiculo(vehiculo.toObject()) });
     }
 
-    return res.status(200).json({ msg: "Vehículo ya existe", vehiculo });
+    return res.status(200).json({ msg: "Vehículo ya existe", vehiculo: formatVehiculo(vehiculo.toObject()) });
   } catch (err) {
     console.error("💥 Error en createVehiculoSinEntrada:", err);
     res.status(500).json({ msg: "Error del servidor" });
   }
 };
 
-// Obtener todos los vehículos
+// Obtener todos los vehículos (🧹 limpio y ordenado)
 exports.getVehiculos = async (_req, res) => {
   try {
-    const vehiculos = await Vehiculo.find();
-    res.json(vehiculos);
+    const vehiculos = await Vehiculo.find().lean();
+    const out = vehiculos.map((v) => formatVehiculo(v));
+    res.json(out);
   } catch (err) {
     res.status(500).json({ msg: "Error del servidor" });
   }
 };
 
-// Obtener por patente
+// Obtener por patente (🧹 limpio y ordenado)
 exports.getVehiculoByPatente = async (req, res) => {
   try {
     const patente = upperOrEmpty(req.params.patente);
@@ -502,13 +589,13 @@ exports.getVehiculoByPatente = async (req, res) => {
       await vehiculo.save();
     }
 
-    res.json(vehiculo);
+    res.json(formatVehiculo(vehiculo.toObject()));
   } catch (err) {
     res.status(500).json({ msg: "Error del servidor" });
   }
 };
 
-// Obtener por ID
+// Obtener por ID (🧹 limpio y ordenado)
 exports.getVehiculoById = async (req, res) => {
   try {
     const { id } = req.params;
@@ -523,7 +610,7 @@ exports.getVehiculoById = async (req, res) => {
       return res.status(404).json({ msg: "Vehículo no encontrado." });
     }
 
-    res.json(vehiculo);
+    res.json(formatVehiculo(vehiculo.toObject()));
   } catch (err) {
     console.error("Error en getVehiculoById:", err);
     res.status(500).json({ msg: "Error del servidor" });
@@ -535,9 +622,7 @@ exports.getTiposVehiculo = (_req, res) => {
   try {
     const precios = obtenerPrecios();
     const tipos = Object.keys(precios || {}).map((nombre) => ({ nombre }));
-    const out = tipos.length
-      ? tipos
-      : [{ nombre: "auto" }, { nombre: "camioneta" }, { nombre: "moto" }];
+    const out = tipos.length ? tipos : [{ nombre: "auto" }, { nombre: "camioneta" }, { nombre: "moto" }];
     res.json(out);
   } catch (err) {
     console.error("💥 Error al obtener tipos de vehículo:", err);
@@ -559,18 +644,14 @@ exports.registrarEntrada = async (req, res) => {
     }
 
     if (vehiculo.estadiaActual?.entrada) {
-      return res
-        .status(400)
-        .json({ msg: "Este vehículo ya tiene una estadía en curso" });
+      return res.status(400).json({ msg: "Este vehículo ya tiene una estadía en curso" });
     }
 
     const ticketNum = ticket || (await obtenerProximoTicket());
     const fechaEntrada = entrada ? new Date(entrada) : new Date();
 
     const operadorNombre =
-      (typeof operador === "string" && operador.trim()) ||
-      getOperadorNombre(req) ||
-      "Operador Desconocido";
+      (typeof operador === "string" && operador.trim()) || getOperadorNombre(req) || "Operador Desconocido";
 
     vehiculo.estadiaActual = {
       entrada: fechaEntrada,
@@ -583,9 +664,7 @@ exports.registrarEntrada = async (req, res) => {
 
     await vehiculo.save();
 
-    res
-      .status(200)
-      .json({ msg: "Entrada registrada para vehículo", vehiculo });
+    res.status(200).json({ msg: "Entrada registrada para vehículo", vehiculo: formatVehiculo(vehiculo.toObject()) });
   } catch (err) {
     console.error("Error en registrarEntrada:", err);
     res.status(500).json({ msg: "Error del servidor" });
@@ -610,11 +689,7 @@ exports.registrarSalida = async (req, res) => {
 
     const vehiculo = await Vehiculo.findOne({ patente }).session(session);
     if (!vehiculo) throw new Error("Vehículo no encontrado");
-    if (
-      !vehiculo.estadiaActual ||
-      !vehiculo.estadiaActual.entrada ||
-      vehiculo.estadiaActual.salida
-    ) {
+    if (!vehiculo.estadiaActual || !vehiculo.estadiaActual.entrada || vehiculo.estadiaActual.salida) {
       throw new Error("No hay estadía activa para este vehículo");
     }
 
@@ -643,23 +718,14 @@ exports.registrarSalida = async (req, res) => {
         : 0;
 
     if (turnoElegible) {
-      const inicioCubierto = new Date(
-        Math.max(
-          entrada.getTime(),
-          new Date(turnoElegible.inicio).getTime()
-        )
-      );
-      const finCubierto = new Date(
-        Math.min(salida.getTime(), new Date(turnoElegible.fin).getTime())
-      );
+      const inicioCubierto = new Date(Math.max(entrada.getTime(), new Date(turnoElegible.inicio).getTime()));
+      const finCubierto = new Date(Math.min(salida.getTime(), new Date(turnoElegible.fin).getTime()));
 
       const cubreTodo = inicioCubierto <= entrada && finCubierto >= salida;
       if (cubreTodo) {
         costoFinal = 0;
       } else if (salida > turnoElegible.fin) {
-        const desdeExcedente = new Date(
-          Math.max(turnoElegible.fin.getTime(), entrada.getTime())
-        );
+        const desdeExcedente = new Date(Math.max(turnoElegible.fin.getTime(), entrada.getTime()));
         const hastaExcedente = salida;
         const costoExcedente = await calcularCostoExcedente(
           vehiculo.tipoVehiculo || "auto",
@@ -685,14 +751,11 @@ exports.registrarSalida = async (req, res) => {
     );
 
     const operadorNombre =
-      (typeof operadorBody === "string" && operadorBody.trim()) ||
-      getOperadorNombre(req) ||
-      "Operador Desconocido";
+      (typeof operadorBody === "string" && operadorBody.trim()) || getOperadorNombre(req) || "Operador Desconocido";
 
     const metodoPago = mpBody || estadiaSnapshot.metodoPago || "Efectivo";
     const factura = facturaBody || "Final";
-    const tipoTarifa =
-      tipoTarifaBody || estadiaSnapshot.tipoTarifa || "estadia";
+    const tipoTarifa = tipoTarifaBody || estadiaSnapshot.tipoTarifa || "estadia";
     const descripcion = descripcionBody || `Salida ${patente} — ${tipoTarifa}`;
 
     const movimientoDoc = {
@@ -716,30 +779,20 @@ exports.registrarSalida = async (req, res) => {
       fin: { $gt: ahora },
     }).session(session);
     if (!sigueConTurnoActivo) {
-      await Vehiculo.updateOne(
-        { _id: vehiculo._id },
-        { $set: { turno: false, updatedAt: new Date() } },
-        { session }
-      );
+      await Vehiculo.updateOne({ _id: vehiculo._id }, { $set: { turno: false, updatedAt: new Date() } }, { session });
     }
 
     await session.commitTransaction();
 
-    const vehiculoActualizado = await Vehiculo.findOne({
-      _id: vehiculo._id,
-    }).lean();
+    const vehiculoActualizado = await Vehiculo.findOne({ _id: vehiculo._id }).lean();
     return res.json({
       msg: "Salida registrada",
       estadia: estadiaSnapshot,
       movimiento: movimientoDoc,
       turnoUsado: turnoElegible
-        ? {
-            _id: turnoElegible._id,
-            inicio: turnoElegible.inicio,
-            fin: turnoElegible.fin,
-          }
+        ? { _id: turnoElegible._id, inicio: turnoElegible.inicio, fin: turnoElegible.fin }
         : null,
-      vehiculo: vehiculoActualizado,
+      vehiculo: formatVehiculo(vehiculoActualizado),
     });
   } catch (err) {
     await session.abortTransaction();
@@ -757,8 +810,7 @@ exports.asignarAbonoAVehiculo = async (req, res) => {
 
   try {
     const vehiculo = await Vehiculo.findOne({ patente });
-    if (!vehiculo)
-      return res.status(404).json({ message: "Vehículo no encontrado." });
+    if (!vehiculo) return res.status(404).json({ message: "Vehículo no encontrado." });
 
     const abono = await Abono.findById(getIdAny(abonoId));
     if (!abono) return res.status(404).json({ message: "Abono no encontrado" });
@@ -777,16 +829,11 @@ exports.asignarAbonoAVehiculo = async (req, res) => {
       try {
         await abono.save();
       } catch (e) {
-        console.warn(
-          "[asignarAbonoAVehiculo] No pude guardar abono.vehiculo:",
-          e?.message
-        );
+        console.warn("[asignarAbonoAVehiculo] No pude guardar abono.vehiculo:", e?.message);
       }
     }
 
-    return res
-      .status(200)
-      .json({ message: "Vehículo actualizado con éxito", vehiculo });
+    return res.status(200).json({ message: "Vehículo actualizado con éxito", vehiculo: formatVehiculo(vehiculo.toObject()) });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error al actualizar el vehículo" });
@@ -803,16 +850,12 @@ exports.getVehiculoByTicket = async (req, res) => {
       return res.status(400).json({ msg: "Número de ticket inválido" });
     }
 
-    const vehiculo = await Vehiculo.findOne({
-      "estadiaActual.ticket": ticketNum,
-    });
+    const vehiculo = await Vehiculo.findOne({ "estadiaActual.ticket": ticketNum });
     if (!vehiculo) {
-      return res
-        .status(404)
-        .json({ msg: "Vehículo no encontrado para este ticket" });
+      return res.status(404).json({ msg: "Vehículo no encontrado para este ticket" });
     }
 
-    res.json(vehiculo);
+    res.json(formatVehiculo(vehiculo.toObject()));
   } catch (err) {
     console.error("Error en getVehiculoByTicket:", err);
     res.status(500).json({ msg: "Error del servidor" });
@@ -831,10 +874,7 @@ exports.getVehiculoByTicketAdmin = async (req, res) => {
 
     // 1️⃣ Buscar en estadía actual o historial
     let vehiculo = await Vehiculo.findOne({
-      $or: [
-        { "estadiaActual.ticket": ticketNum },
-        { "historialEstadias.ticket": ticketNum }
-      ]
+      $or: [{ "estadiaActual.ticket": ticketNum }, { "historialEstadias.ticket": ticketNum }],
     }).select("-__v");
 
     if (!vehiculo) {
@@ -847,14 +887,12 @@ exports.getVehiculoByTicketAdmin = async (req, res) => {
     if (vehiculo.estadiaActual && vehiculo.estadiaActual.ticket === ticketNum) {
       estadia = { ...vehiculo.estadiaActual };
     } else if (Array.isArray(vehiculo.historialEstadias)) {
-      estadia = vehiculo.historialEstadias.find(e => e.ticket === ticketNum) || null;
+      estadia = vehiculo.historialEstadias.find((e) => e.ticket === ticketNum) || null;
     }
 
     // 3️⃣ Si no hay salida en la estadía, intentar completarla
     if (estadia && !estadia.salida) {
-      const mov = await Movimiento.findOne({ ticket: ticketNum })
-        .sort({ createdAt: -1 })
-        .lean();
+      const mov = await Movimiento.findOne({ ticket: ticketNum }).sort({ createdAt: -1 }).lean();
 
       if (mov) {
         estadia.salida = mov.fecha || mov.createdAt || mov.updatedAt || new Date();
@@ -870,14 +908,13 @@ exports.getVehiculoByTicketAdmin = async (req, res) => {
         entrada: null,
         salida: null,
         ticket: ticketNum,
-        operadorNombre: "Desconocido"
+        operadorNombre: "Desconocido",
       };
     }
 
     // 5️⃣ Formato y salida final
     estadia.ticketFormateado = String(estadia.ticket).padStart(10, "0");
-    return res.json({ vehiculo, estadia });
-
+    return res.json({ vehiculo: formatVehiculo(vehiculo.toObject()), estadia });
   } catch (err) {
     console.error("💥 Error en getVehiculoByTicketAdmin:", err);
     return res.status(500).json({ msg: "Error del servidor" });
@@ -890,14 +927,11 @@ exports.setAbonadoFlagByPatente = async (req, res) => {
     const { abonado, detachFromCliente } = req.body || {};
 
     if (typeof abonado !== "boolean") {
-      return res
-        .status(400)
-        .json({ msg: 'Campo "abonado" requerido (boolean).' });
+      return res.status(400).json({ msg: 'Campo "abonado" requerido (boolean).' });
     }
 
     const vehiculo = await Vehiculo.findOne({ patente });
-    if (!vehiculo)
-      return res.status(404).json({ msg: "Vehículo no encontrado" });
+    if (!vehiculo) return res.status(404).json({ msg: "Vehículo no encontrado" });
 
     vehiculo.abonado = abonado;
     if (abonado === false) {
@@ -908,14 +942,11 @@ exports.setAbonadoFlagByPatente = async (req, res) => {
     // 🔧 NUEVO: desvincular correctamente del/los cliente/s + Outbox para remoto
     if (detachFromCliente) {
       try {
-        const owners = await Cliente.find({ vehiculos: vehiculo._id }).select('_id').lean();
-        const ownerIds = owners.map(o => o._id);
+        const owners = await Cliente.find({ vehiculos: vehiculo._id }).select("_id").lean();
+        const ownerIds = owners.map((o) => o._id);
 
         if (ownerIds.length) {
-          await Cliente.updateMany(
-            { _id: { $in: ownerIds } },
-            { $pull: { vehiculos: vehiculo._id } }
-          );
+          await Cliente.updateMany({ _id: { $in: ownerIds } }, { $pull: { vehiculos: vehiculo._id } });
 
           // Encolar Outbox por cada cliente para hacer __merge:'pull' en REMOTO
           try {
@@ -939,7 +970,7 @@ exports.setAbonadoFlagByPatente = async (req, res) => {
       }
     }
 
-    res.json({ msg: "Vehículo actualizado", vehiculo });
+    res.json({ msg: "Vehículo actualizado", vehiculo: formatVehiculo(vehiculo.toObject()) });
   } catch (err) {
     console.error("Error en setAbonadoFlagByPatente:", err);
     res.status(500).json({ msg: "Error del servidor" });
@@ -965,10 +996,6 @@ exports.eliminarTodosLosVehiculos = async (_req, res) => {
 
 /**
  * PATCH /api/vehiculos/:patente
- * - Actualiza campos del vehículo por patente actual.
- * - Si se envía `patente` en el body **y es distinta**, renombra la patente
- *   (previo chequeo de colisión). Si ya existe otro vehículo con esa patente -> 409.
- * - ❌ NO crea vehículos si no existe: devuelve 404 (política anti-duplicado).
  */
 exports.updateVehiculoByPatente = async (req, res) => {
   try {
@@ -988,18 +1015,14 @@ exports.updateVehiculoByPatente = async (req, res) => {
 
     let vehiculo = await Vehiculo.findOne({ patente: patenteActual });
     if (!vehiculo) {
-      return res
-        .status(404)
-        .json({ msg: "Vehículo no encontrado por patente actual." });
+      return res.status(404).json({ msg: "Vehículo no encontrado por patente actual." });
     }
 
     // Renombrar patente con chequeo de colisión
     if (nuevaPatente && nuevaPatente !== vehiculo.patente) {
       const colision = await Vehiculo.findOne({ patente: nuevaPatente });
       if (colision && String(colision._id) !== String(vehiculo._id)) {
-        return res
-          .status(409)
-          .json({ msg: `Ya existe un vehículo con patente ${nuevaPatente}` });
+        return res.status(409).json({ msg: `Ya existe un vehículo con patente ${nuevaPatente}` });
       }
       vehiculo.patente = nuevaPatente;
     }
@@ -1017,7 +1040,7 @@ exports.updateVehiculoByPatente = async (req, res) => {
     }
 
     await vehiculo.save();
-    res.json({ msg: "Vehículo actualizado", vehiculo });
+    res.json({ msg: "Vehículo actualizado", vehiculo: formatVehiculo(vehiculo.toObject()) });
   } catch (err) {
     console.error("💥 Error en updateVehiculoByPatente:", err);
     res.status(500).json({ msg: "Error del servidor" });
@@ -1046,24 +1069,18 @@ exports.syncVehiculoFromAbono = async (req, res) => {
 
       if (cliId && vehId) {
         try {
-          await Cliente.updateOne(
-            { _id: cliId },
-            { $addToSet: { vehiculos: vehId } }
-          );
+          await Cliente.updateOne({ _id: cliId }, { $addToSet: { vehiculos: vehId } });
         } catch (e) {
-          console.warn(
-            "[syncVehiculoFromAbono] addToSet cliente.vehiculos:",
-            e?.message
-          );
+          console.warn("[syncVehiculoFromAbono] addToSet cliente.vehiculos:", e?.message);
         }
       } else {
-        console.warn(
-          "[syncVehiculoFromAbono] skip addToSet (no cliId o vehId casteables)",
-          { cliId: String(cliId || ''), vehId: String(vehId || '') }
-        );
+        console.warn("[syncVehiculoFromAbono] skip addToSet (no cliId o vehId casteables)", {
+          cliId: String(cliId || ""),
+          vehId: String(vehId || ""),
+        });
       }
 
-      return res.json({ msg: "Vehículo sincronizado desde Abono", vehiculo });
+      return res.json({ msg: "Vehículo sincronizado desde Abono", vehiculo: formatVehiculo(vehiculo.toObject()) });
     } catch (e) {
       if (e?.statusCode === 409) {
         return res.status(409).json({ msg: e.message });
