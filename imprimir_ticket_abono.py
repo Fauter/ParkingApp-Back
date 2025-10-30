@@ -1,26 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Ticket ABONO: SIN código de barras. Muestra Pago Proporcional y pie especial.
-- Si la impresora es "Microsoft Print to PDF" (o contiene "print to pdf"):
-  NO imprime: guarda PREVIEW en PNG y PDF con el mismo layout y lo abre.
-
-Entrada:
-  argv[1]: puede ser un identificador de operación (no se imprime).
-  argv[2] (JSON opcional) o variables de entorno:
-    - proporcional  (o PROPORCIONAL)  -> string (formateado) para "Pago en este acto: $..."
-    - valorMensual  (o VALOR_MENSUAL) -> string (formateado) para "Valor Mensual: $..."
-    - baseMensual                      -> número de respaldo
-    - proporcionalRaw                  -> número de respaldo
-    - diasRestantes (o DIAS)           -> entero con los días usados para el prorrateo
-    - nombreApellido                   -> "A nombre de: ..."
-    - metodoPago                       -> "Método de Pago: ..."
-    - tipoVehiculo                     -> "Tipo de Vehículo: ..."
-    - marca                            -> "Marca: ..."
-    - modelo                           -> "Modelo: ..."
-    - patente   (o PATENTE)            -> "Patente: ..."
-    - cochera                          -> "Fija" | "Móvil"
-    - piso                             -> si es Fija, se mostrará acá
-    - exclusiva                        -> bool (no se pide mostrar, pero puede afectar valor mensual en el front)
+Ticket ABONO (sin código de barras) – versión estética FINAL:
+- Sin "Ticket: NNNNNN".
+- "Cochera": si el front manda "Móvil" -> imprime "Cochera: Móvil"; si no, el número (piso).
+- Cuerpo en 3 secciones con respiro y separadores finos entre secciones.
+- SIN línea separadora bajo el header (sólo espacio).
+- Bloque "Gracias..." compacto en PDF y un poco más amplio en ticketera (para no superponer),
+  pero con mayor margen superior y menor separación entre líneas.
+- "Aceptación..." y "Jurisdicción..." un poco más chicas.
+- Dos líneas de 'XXXXX' pegadas al borde de abajo (sin espacio en blanco grande).
+- NUEVO: valores debajo de la etiqueta, con sangría breve (no a la misma altura).
 """
 
 import os, sys, json
@@ -47,16 +36,15 @@ except Exception as e:
     PIL_OK = False
     PIL_VERSION = "N/A"
 
-COMPANY_NAME  = "Eleven Park S.A."
-LOCATION_TEXT = "Aguero 256"  # Debajo de la razón social en el encabezado
+COMPANY_NAME  = "Estacionamiento Agüero"
+LOCATION_TEXT = "Agüero 265"
 
 # ------------------------- Constantes de layout -------------------------
-GAP = 6                         # gap vertical base
-PAD_AFTER_FECHA = 10            # padding extra debajo de "Fecha de Alta"
-PAD_AFTER_PATENTE = 20          # padding extra debajo de "Patente" (si la usamos con bloque aparte)
-LEGAL_GAP = 10                  # separación entre líneas legales
-BOTTOM_LEGAL_TOP_GAP = 8        # separación ANTES de la última línea
-MARGIN_BOTTOM_PIXELS = 3        # margen real inferior deseado (3 px)
+GAP = 6                           # gap vertical base
+PAD_AFTER_FECHA = 8               # respiro extra luego de "Fecha Alta"
+SECTION_GAP = 6                   # respiro antes/después de cada sección
+MARGIN_BOTTOM_PDF = 0             # margen inferior PDF (querés las XXXXX al borde)
+MARGIN_BOTTOM_TICKET = 2          # margen inferior mínimo para ticketera
 
 # ------------------------- Utils -------------------------
 
@@ -67,7 +55,6 @@ def _today_str():
     return datetime.now().strftime("%Y-%m-%d")
 
 def _today_ddmmyyyy():
-    # Formato requerido: 03/10/2025
     return datetime.now().strftime("%d/%m/%Y")
 
 def _ensure_dir(p):
@@ -83,15 +70,10 @@ def _debug_env():
     print("=======================")
 
 def _fmt_money_str(s_or_num):
-    """
-    Recibe un string ya formateado (ej: '123.456') o un número.
-    Devuelve string sin símbolo, listo para anteponer '$'.
-    """
     if s_or_num is None:
         return ""
     if isinstance(s_or_num, (int, float)):
         try:
-            # Formato es-AR sin decimales
             import locale
             try:
                 locale.setlocale(locale.LC_ALL, "es_AR.UTF-8")
@@ -104,13 +86,10 @@ def _fmt_money_str(s_or_num):
     return str(s_or_num)
 
 def _calc_dias_restantes_fallback():
+    from calendar import monthrange
     hoy = datetime.now()
-    if hoy.month == 12:
-        ultimo = datetime(hoy.year, 12, 31)
-    else:
-        from calendar import monthrange
-        last_day = monthrange(hoy.year, hoy.month)[1]
-        ultimo = datetime(hoy.year, hoy.month, last_day)
+    last_day = monthrange(hoy.year, hoy.month)[1]
+    ultimo = datetime(hoy.year, hoy.month, last_day)
     return (ultimo - hoy).days + 1
 
 def _cap_first(s):
@@ -219,20 +198,31 @@ def _text_wh(draw, text, font):
     bbox = draw.textbbox((0, 0), text, font=font)
     return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
-def _draw_center(draw, text, y, font, canvas_w, fill=0):
+def _draw_text(draw, xy, text, font, fill=0, heavy=False):
+    x, y = xy
+    try:
+        draw.text((x, y), text, fill=fill, font=font,
+                  stroke_width=(1 if heavy else 0), stroke_fill=fill)
+    except TypeError:
+        if heavy:
+            draw.text((x, y), text, fill=fill, font=font)
+            draw.text((x+1, y), text, fill=fill, font=font)
+        else:
+            draw.text((x, y), text, fill=fill, font=font)
+
+def _draw_center(draw, text, y, font, canvas_w, fill=0, heavy=False):
     w, h = _text_wh(draw, text, font)
     x = max(0, (canvas_w - w) // 2)
-    draw.text((x, y), text, fill=fill, font=font)
+    _draw_text(draw, (x, y), text, font, fill=fill, heavy=heavy)
     return y + h
 
-def _draw_left(draw, text, y, font, x_left, fill=0):
+def _draw_left(draw, text, y, font, x_left, fill=0, heavy=False):
     _, h = _text_wh(draw, text, font)
-    draw.text((x_left, y), text, fill=fill, font=font)
+    _draw_text(draw, (x_left, y), text, font, fill=fill, heavy=heavy)
     return y + h
 
 def _draw_box_with_x(draw, center_x, y, size, padding=6, stroke=2, color=0, fill=None):
-    half = size // 2
-    left = max(0, center_x - half); right = left + size
+    left = max(0, center_x - size // 2); right = left + size
     top = y; bottom = y + size
     if fill is not None:
         draw.rectangle([left, top, right, bottom], fill=fill, outline=color, width=stroke)
@@ -244,145 +234,223 @@ def _draw_box_with_x(draw, center_x, y, size, padding=6, stroke=2, color=0, fill
     draw.line([il, ib, ir, it], fill=color, width=stroke)
     return bottom
 
-def render_ticket_canvas(lines):
+def _split_label_value(line: str):
     """
-    Devuelve un PIL.Image 'L' (grises) del ticket de ABONO (sin barcode).
-    Encabezado: [X] centrado, COMPANY_NAME centrado, LOCATION_TEXT centrado, línea separadora.
-    Alineación: desde "A nombre de:" hasta "Patente:" en dos columnas (etiqueta/valor).
+    Recorta la primera ocurrencia de ":" para separar etiqueta/valor.
+    Devuelve (label, value). Si no hay ":", label=line, value="".
+    """
+    line = (line or "").rstrip()
+    if not line:
+        return "", ""
+    if ":" in line:
+        label, value = line.split(":", 1)
+        return (label.strip() + ":", value.strip())
+    return line.strip(), ""
+
+def render_ticket_canvas(lines, *, not_pdf: bool = False):
+    """
+    Render del ticket ABONO (sin barcode).
+    - Etiquetas arriba y valores debajo con sangría pequeña.
+    - Encabezado: [X], razón social y dirección.
+    - Cuerpo: 3 secciones con separadores finos (NO hay línea bajo el header).
+    - Bloques legales + dos líneas de XXXXX al final.
     """
     if not PIL_OK:
         raise RuntimeError("Pillow (PIL) no disponible")
 
-    # Layout 58mm a 203dpi (~384 px de ancho)
+    # 58mm a 203dpi ≈ 384 px
     canvas_w = 384
-    margin_top   = 10
-    margin_side  = 10
-    margin_bottom = MARGIN_BOTTOM_PIXELS
+
+    # Estilos según destino
+    scale = 1.5 if not_pdf else 1.0
+    heavy = True if not_pdf else False
+    margin_top   = 1 if not_pdf else 10
+    margin_side  = 1 if not_pdf else 10
+    margin_bottom = MARGIN_BOTTOM_TICKET if not_pdf else MARGIN_BOTTOM_PDF
 
     gap      = GAP
+    usable_w = canvas_w - 2 * margin_side
 
-    font_title_size  = 29
-    font_body_size   = 22
-    font_footer_size = 18
+    # Fuentes
+    font_title_size   = int(round(29 * scale))                  # Estacionamiento Agüero
+    font_loc_size     = int(round(int(round(22 * scale)) * 1.5))# Agüero 265 +50%
+    font_body_size    = int(round(22 * scale))
+    font_footer_size  = int(round(18 * scale))
+
     font_title   = _load_font(font_title_size)
+    font_loc     = _load_font(font_loc_size)
     font_body    = _load_font(font_body_size)
     font_small   = _load_font(max(10, int(round(font_footer_size * 0.70))))
-    font_bottom  = _load_font(max(8,  int(round(font_footer_size * 0.55))))
+    # Legales finales "un poquito más chicos"
+    font_legal_final = _load_font(int(round(font_footer_size * 0.9)))
 
-    header = lines[0] if lines else COMPANY_NAME
-    body   = [t for t in (lines[1:] if len(lines) > 1 else [])]
-    if body:
-        body[0] = LOCATION_TEXT
-    else:
-        body = [LOCATION_TEXT]
+    # Sangría y espaciado para el valor debajo de la etiqueta
+    VALUE_INDENT = int(round(14 * scale))    # sangría izquierda del valor
+    VALUE_GAP    = int(round(2 * scale))     # separación etiqueta -> valor
+
+    header_company = COMPANY_NAME
+    header_location = LOCATION_TEXT
 
     dummy = Image.new("L", (1, 1), 255)
     d     = ImageDraw.Draw(dummy)
 
-    _, h_header = _text_wh(d, header, font_title)
-    _, h_loc    = _text_wh(d, LOCATION_TEXT, font_body)
+    # Texto separadores XXXXX
+    xw, _ = _text_wh(d, "X", font_small)
+    if xw <= 0: xw = 6
+    count = max(1, int(usable_w / xw))
+    sep_text = "X" * count
+    _, h_sep = _text_wh(d, sep_text, font_small)
 
-    legal_texts  = [
+    # Bloques legales superiores
+    gracias_texts = [
         "Gracias por confiar en nosotros, recuerde que la",
         "mensualidad se paga del 1 al 10 de cada mes",
     ]
-    bottom_legal = "Aceptación Contrato (Adm.) – Jurisdicción: Tribunales CABA"
 
-    # --- Preparar cuerpo: detectar la primera (Fecha de Alta) y el bloque alineado ---
-    other_body = body[1:] if len(body) > 1 else []
-    fecha_line = None
-    aligned_pairs = []  # (label_with_colon, value)
-    for t in other_body:
-        if fecha_line is None and t.startswith("Fecha de Alta:"):
-            fecha_line = t
-            continue
-        # split etiqueta:valor (solo primera aparición de ':')
-        if ":" in t:
-            label, value = t.split(":", 1)
-            label = (label or "").strip() + ":"
-            value = (value or "").lstrip()
-            aligned_pairs.append((label, value))
-        else:
-            # fallback raro: tratarlo como texto plano
-            aligned_pairs.append((t, ""))
+    # Espaciado dentro del bloque de "Gracias":
+    # - MÁS margen superior (para despegar de "Patente")
+    # - MENOS separación entre líneas
+    THANKS_MARGIN_TOP = max(10, int(round(14 * scale)))   # ↑ más espacio antes del bloque
+    THANKS_LINE_GAP   = max(2, int(round(4 * scale)))     # ↓ menos espacio entre líneas
+    # NUEVO: margen inferior del bloque "Gracias" = margin_top (y mantener gap aparte)
+    THANKS_MARGIN_BOTTOM = margin_top
 
-    # Calcular alto estimado para canvas (como antes)
-    est_text_h = 0
-    if fecha_line:
-        _, hf = _text_wh(d, fecha_line, font_body)
-        est_text_h += hf + gap + PAD_AFTER_FECHA
-    # Para el bloque alineado: cada par ocupa una línea con font_body
-    for _ in aligned_pairs:
-        _, h = _text_wh(d, "X", font_body)
-        est_text_h += h + gap
+    # ==== Cálculo del alto total ====
+    # Header
+    _, h_header = _text_wh(d, header_company, font_title)
+    _, h_loc    = _text_wh(d, header_location, font_loc)
 
-    # Legales
-    h_legal_total = 0
-    for t in legal_texts:
+    # Util para calcular altura de una lista de líneas (etiqueta y valor debajo)
+    def height_lines(idx_from, idx_to):
+        h_sum = 0
+        for i in range(idx_from, idx_to + 1):
+            t = lines[i]
+            label, value = _split_label_value(t)
+            # etiqueta
+            _, h_lbl = _text_wh(d, label or " ", font_body)
+            h_sum += h_lbl
+            # pequeño gap etiqueta->valor
+            h_sum += VALUE_GAP
+            # valor (puede ser vacío)
+            _, h_val = _text_wh(d, (value or "-"), font_body)
+            h_sum += h_val
+            # gap entre campos
+            h_sum += gap
+            # extra si es "Fecha Alta:"
+            if (label or "").lower().startswith("fecha alta"):
+                h_sum += PAD_AFTER_FECHA
+        return h_sum
+
+    # Secciones: 0..2  | 3..6 | 7..10  (11 es vacío)
+    h_sec1 = height_lines(0, 2)
+    h_sec2 = height_lines(3, 6)
+    h_sec3 = height_lines(7, 10)
+
+    # Gracias (2 líneas, con menos gap entre sí)
+    h_gracias_total = 0
+    for t in gracias_texts:
         _, h = _text_wh(d, t, font_small)
-        h_legal_total += LEGAL_GAP + h
-    _, h_bottom = _text_wh(d, bottom_legal, font_bottom)
+        h_gracias_total += h + THANKS_LINE_GAP
+    # quitar el último gap extra
+    h_gracias_total -= THANKS_LINE_GAP
+    if h_gracias_total < 0: h_gracias_total = 0
 
-    # Alto total con la última línea anclada al fondo
-    canvas_h = (margin_top +
-                26 + 8 +           # caja con cruz
-                h_header + gap +
-                h_loc + gap +
-                (2 + gap) +
-                gap +
-                est_text_h +
-                h_legal_total +
-                BOTTOM_LEGAL_TOP_GAP +
-                h_bottom +
-                margin_bottom)
+    # Legales finales
+    _, h_legal1 = _text_wh(d, "Aceptación Contrato (Adm.)", font_legal_final)
+    _, h_legal2 = _text_wh(d, "Jurisdicción: Tribunales CABA", font_legal_final)
+
+    # Altura total (SIN línea bajo header)
+    canvas_h = (
+        margin_top +
+        26 + 8 +                         # caja con X
+        h_header + gap +
+        h_loc + gap +                    # sólo espacio bajo header
+        (SECTION_GAP + h_sec1 + SECTION_GAP + 1) +  # sec1 + línea fina
+        (SECTION_GAP + h_sec2 + SECTION_GAP + 1) +  # sec2 + línea fina
+        (SECTION_GAP + h_sec3) +                     # sec3 (sin línea abajo)
+        THANKS_MARGIN_TOP +               # margen superior antes de Gracias
+        h_gracias_total +
+        THANKS_MARGIN_BOTTOM +            # NUEVO: margen inferior del bloque Gracias
+        gap +                             # mantener gap antes de legales finales
+        h_legal1 + max(8, gap) + h_legal2 +
+        GAP +                             # respiro antes de XXXXX
+        (h_sep + (GAP // 2)) * 2 +        # dos tiras XXXXX
+        margin_bottom
+    )
 
     canvas   = Image.new("L", (canvas_w, canvas_h), 255)
     draw     = ImageDraw.Draw(canvas)
 
     y = margin_top
     center_x = canvas_w // 2
+
+    # Caja con X
     y = _draw_box_with_x(draw, center_x, y, 26, padding=6, stroke=2, color=0, fill=None)
     y += 8
 
-    y = _draw_center(draw, header, y, font_title, canvas_w); y += gap
-    y = _draw_center(draw, LOCATION_TEXT, y, font_body, canvas_w); y += gap
+    # Header
+    y = _draw_center(draw, header_company, y, font_title, canvas_w, heavy=heavy); y += gap
+    y = _draw_center(draw, header_location, y, font_loc, canvas_w, heavy=heavy); y += gap
+    # (NO dibujamos línea aquí)
 
-    line_y_start = y
-    draw.line([(margin_side, line_y_start), (canvas_w - margin_side, line_y_start)], fill=0, width=1)
-    y += 2 + gap
+    # Helper para dibujar etiqueta arriba y valor debajo con sangría
+    def draw_label_value(line_text, y_local):
+        label, value = _split_label_value(line_text)
+        # Etiqueta
+        y_local = _draw_left(draw, label, y_local, font_body, margin_side, heavy=heavy)
+        # Gap pequeño entre etiqueta y valor
+        y_local += VALUE_GAP
+        # Valor (con sangría)
+        y_local = _draw_left(draw, (value or "-"), y_local, font_body, margin_side + VALUE_INDENT, heavy=heavy)
+        # Respiro entre campos
+        y_local += gap
+        # Extra si es "Fecha Alta:"
+        if (label or "").lower().startswith("fecha alta"):
+            y_local += PAD_AFTER_FECHA
+        return y_local
+
+    # ========= Sección 1 =========
+    y += SECTION_GAP
+    for i in range(0, 3):
+        y = draw_label_value(lines[i], y)
+    y += SECTION_GAP
+    draw.line([(margin_side, y), (canvas_w - margin_side, y)], fill=0, width=1)
+    y += 1
+
+    # ========= Sección 2 =========
+    y += SECTION_GAP
+    for i in range(3, 7):
+        y = draw_label_value(lines[i], y)
+    y += SECTION_GAP
+    draw.line([(margin_side, y), (canvas_w - margin_side, y)], fill=0, width=1)
+    y += 1
+
+    # ========= Sección 3 =========
+    y += SECTION_GAP
+    for i in range(7, 11):
+        y = draw_label_value(lines[i], y)
+    y += SECTION_GAP
+
+    # ====== Gracias ======
+    y += THANKS_MARGIN_TOP
+    for idx, t in enumerate(gracias_texts):
+        y = _draw_center(draw, t, y, font_small, canvas_w, heavy=heavy)
+        if idx < len(gracias_texts) - 1:
+            y += THANKS_LINE_GAP
+    # NUEVO: margen inferior del bloque "Gracias" + mantener gap antes de legales
+    y += THANKS_MARGIN_BOTTOM
     y += gap
 
-    # 1) Fecha (sin alinear)
-    if fecha_line:
-        y = _draw_left(draw, fecha_line, y, font_body, margin_side)
-        y += PAD_AFTER_FECHA
+    # ====== Legales finales (más chicos) ======
+    y = _draw_center(draw, "Aceptación Contrato (Adm.)", y, font_legal_final, canvas_w, heavy=heavy)
+    y += max(8, gap)
+    y = _draw_center(draw, "Jurisdicción: Tribunales CABA", y, font_legal_final, canvas_w, heavy=heavy)
 
-    # 2) Bloque alineado etiqueta/valor
-    if aligned_pairs:
-        # ancho máximo de etiqueta (incluyendo ":")
-        max_label_w = 0
-        for label, _ in aligned_pairs:
-            w, _ = _text_wh(draw, label, font_body)
-            if w > max_label_w:
-                max_label_w = w
-        value_x = margin_side + max_label_w + 12  # 12px de separación visual
-
-        for label, value in aligned_pairs:
-            # etiqueta
-            draw.text((margin_side, y), label, fill=0, font=font_body)
-            # valor
-            draw.text((value_x, y), value, fill=0, font=font_body)
-            _, hline = _text_wh(draw, label, font_body)
-            y += hline + gap
-
-    # Legales (dos renglones pequeños centrados)
-    for t in legal_texts:
-        y += LEGAL_GAP
-        _ = _draw_center(draw, t, y, font_small, canvas_w)
-
-    # Posición FINAL de la última línea (anclada al fondo con margin_bottom exacto)
-    y_bottom_legal = canvas_h - margin_bottom - h_bottom
-    _ = _draw_center(draw, bottom_legal, y_bottom_legal, font_bottom, canvas_w)
+    # ====== Dos separadores 'XXXXX' pegados al borde ======
+    y += GAP
+    y = _draw_center(draw, sep_text, y, font_small, canvas_w, heavy=True)
+    y += GAP // 2
+    _ = _draw_center(draw, sep_text, y, font_small, canvas_w, heavy=True)
 
     return canvas
 
@@ -507,37 +575,23 @@ def _parse_optional_meta():
         "cochera": cochera,
         "piso": piso,
         "exclusiva": exclusiva,
-        "diasRestantes": diasRestantes
+        "diasRestantes": diasRestantes,
     }
 
 def _cochera_asignada_str(cochera, piso):
     """
-    Regla pedida:
+    Regla:
       - Si eligió Cochera Móvil -> "Móvil"
-      - Si eligió Fija           -> mostrar el "piso" (número de cochera)
+      - Si eligió Fija          -> mostrar el "piso" (número de cochera)
     """
     v = (cochera or "").strip().lower()
-    if v == "móvil" or v == "movil":
+    if v in ("móvil", "movil"):
         return "Móvil"
     if v == "fija":
         return (piso or "").strip() or "-"
     return (cochera or "").strip() or "-"
 
 def build_ticket_lines(meta):
-    """
-    Orden EXACTO del cuerpo (después del header y la barra):
-      Fecha Alta:
-      A nombre de:
-      Cochera Asignada:
-      Valor Mensual:
-      Pago en este acto:
-      Por días:
-      Método de Pago:
-      Tipo de Vehículo:
-      Marca:
-      Modelo:
-      Patente:
-    """
     fecha_alta = _today_ddmmyyyy()
 
     nom = meta.get("nombreApellido", "")
@@ -557,16 +611,14 @@ def build_ticket_lines(meta):
     patente= meta.get("patente", "")
 
     lines = [
-        COMPANY_NAME,
-        LOCATION_TEXT,
-        f"Fecha de Alta: {fecha_alta}",
-        f"A nombre de: {nom or '-'}",
-        f"Cochera Asignada: {cochera_asignada}",
+        f"Fecha Alta: {fecha_alta}",
+        f"Cliente: {nom or '-'}",
+        f"Cochera: {cochera_asignada}",
         f"Valor Mensual: ${valor_mensual}",
-        f"Pago en este acto: ${proporcional}",
+        f"Recibimos: ${proporcional}",
         f"Por días: {dias_str or '-'}",
-        f"Método de Pago: {metodo or '-'}",
-        f"Tipo de Vehículo: {tipo_cap or '-'}",
+        f"Pago: {metodo or '-'}",
+        f"Vehículo: {tipo_cap or '-'}",
         f"Marca: {marca or '-'}",
         f"Modelo: {modelo or '-'}",
         f"Patente: {patente or '-'}",
@@ -594,10 +646,8 @@ def _save_preview(canvas_img):
 def main():
     _debug_env()
 
-    _ = str(sys.argv[1]).strip() if len(sys.argv) >= 2 else ""  # id/placeholder no usado
-    printer_name = get_resolved_printer_name()
-
     meta = _parse_optional_meta()
+    printer_name = get_resolved_printer_name()
     lines = build_ticket_lines(meta)
 
     # PREVIEW (PDF)
@@ -606,24 +656,26 @@ def main():
             print("ERROR: Para PREVIEW se requiere Pillow instalado.")
             raise SystemExit(1)
         try:
-            canvas = render_ticket_canvas(lines)
+            canvas = render_ticket_canvas(lines, not_pdf=False)
             _save_preview(canvas)
             return
         except Exception as e:
             print(f"ERROR: Falló PREVIEW: {e}")
             raise SystemExit(1)
 
-    # IMPRESIÓN REAL
+    # IMPRESIÓN REAL (NO PDF)
     try:
         if not PIL_OK:
             raise RuntimeError("Pillow no disponible")
-        canvas = render_ticket_canvas(lines)
+        canvas = render_ticket_canvas(lines, not_pdf=True)
         _print_bitmap_via_gdi(printer_name, canvas.convert("RGB"))
         return
     except Exception as e:
         print(f"WARNING: Render estético falló, uso GDI texto. Motivo: {e}")
 
-    _print_text_gdi(printer_name, lines, font_name="Consolas", font_height=18, left=10, top=10, line_spacing=4)
+    # Fallback GDI texto (sin header especial ni separadores bonitos)
+    _print_text_gdi(printer_name, [COMPANY_NAME, LOCATION_TEXT, ""] + lines,
+                    font_name="Consolas", font_height=18, left=10, top=10, line_spacing=4)
 
 if __name__ == "__main__":
     try:

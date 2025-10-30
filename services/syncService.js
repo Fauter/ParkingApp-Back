@@ -227,7 +227,7 @@ const SyncStateSchema = new mongoose.Schema({
   canon: { type: String, unique: true, required: true },
   lastUpdatedAt: { type: Date },
   lastObjectId: { type: String },
-  meta: { type: mongoose.Schema.Types.Mixed },
+  meta: { type: mongoose.Schema.Types.Mixed }, // puede guardar { lastPair: { ts: Date, oid: string } }
 }, { collection: 'sync_state', timestamps: true });
 
 const SyncState = mongoose.models.SyncState || mongoose.model('SyncState', SyncStateSchema);
@@ -262,7 +262,7 @@ function bytesFromAny(x) {
         if (keys.length === 12) return Uint8Array.from(keys.map(k => Number(x.buffer[k])));
       }
       const directKeys = Object.keys(x).filter(k => /^\d+$/.test(k)).sort((a,b)=>Number(a)-Number(b));
-        if (directKeys.length === 12) return Uint8Array.from(directKeys.map(k => Number(x[k])));
+      if (directKeys.length === 12) return Uint8Array.from(directKeys.map(k => Number(x[k])));
       if (x._bsontype === 'ObjectId' && x.id) return bytesFromAny(x.id);
       if (x.id) return bytesFromAny(x.id);
     }
@@ -345,7 +345,7 @@ async function connectRemote(atlasUri, dbName) {
 const REF_BY_COLL = {
   vehiculos: ['cliente', 'abono'],
   abonos: ['cliente', 'vehiculo'],
-  movimientos: ['cliente', 'vehiculo', 'abono'],
+  movimientos: ['cliente', 'vehiculo', 'abono', 'operador'], // ✅ incluir operador
   movimientoclientes: ['cliente', 'vehiculo', 'abono'],
   cierresdecajas: ['operador'],
 };
@@ -406,7 +406,6 @@ async function resolveLocalCollectionName(db, canonName) {
   return canonName;
 }
 
-// === Índice único para precios (tipo, metodo) ===
 (async () => {
   try {
     const ensure = async () => {
@@ -435,17 +434,27 @@ function buildNaturalKeyFilter(colName, src) {
   }
   return Object.keys(filter).length ? filter : null;
 }
+
+// ⬇️ robustecido: también normaliza 'operador' y subdoc 'movimiento'
 function coerceRefIds(doc, colName) {
   if (!doc || typeof doc !== 'object') return doc;
-  const fields = REF_BY_COLL[colName?.toLowerCase()] || [];
+  const fields = new Set([...(REF_BY_COLL[colName?.toLowerCase()] || []), 'operador']);
   for (const f of fields) {
     if (doc[f] !== undefined) {
       if (Array.isArray(doc[f])) doc[f] = doc[f].map(safeObjectId);
       else doc[f] = safeObjectId(doc[f]);
     }
   }
+  if (doc.movimiento && typeof doc.movimiento === 'object') {
+    if (doc.movimiento._id !== undefined) doc.movimiento._id = safeObjectId(doc.movimiento._id);
+    if (doc.movimiento.operador !== undefined) doc.movimiento.operador = safeObjectId(doc.movimiento.operador);
+    if (doc.movimiento.cliente !== undefined) doc.movimiento.cliente = safeObjectId(doc.movimiento.cliente);
+    if (doc.movimiento.vehiculo !== undefined) doc.movimiento.vehiculo = safeObjectId(doc.movimiento.vehiculo);
+    if (doc.movimiento.abono !== undefined) doc.movimiento.abono = safeObjectId(doc.movimiento.abono);
+  }
   return doc;
 }
+
 function normalizeIds(inputDoc, colName) {
   const clone = deepClone(inputDoc || {});
   if (clone._id != null) clone._id = safeObjectId(clone._id);
@@ -457,6 +466,15 @@ function normalizeIds(inputDoc, colName) {
       else clone[k] = safeObjectId(clone[k]);
     }
   }
+  // Normalización anidada para dedup.movimiento
+  if (clone.movimiento && typeof clone.movimiento === 'object') {
+    clone.movimiento = deepClone(clone.movimiento);
+    if (clone.movimiento._id !== undefined) clone.movimiento._id = safeObjectId(clone.movimiento._id);
+    for (const k of ['cliente','vehiculo','abono','operador','user']) {
+      if (clone.movimiento[k] !== undefined) clone.movimiento[k] = safeObjectId(clone.movimiento[k]);
+    }
+  }
+
   const maybeIdArrays = ['abonos','vehiculos','movimientos'];
   for (const k of maybeIdArrays) {
     if (Array.isArray(clone[k])) clone[k] = clone[k].map(safeObjectId);
@@ -742,8 +760,17 @@ async function processOutboxItem(remoteDb, item) {
 
 // ❗️Para mirror no usamos la clave natural para dedup (evita perdas y deleteLocal falsos)
 function makeSeenKeyIncremental(doc) {
-  // En incremental: con _id basta para dedup entre aliases; NK se usa solo al resolver conflictos locales.
   return String(doc && doc._id);
+}
+
+// 🔧 helper: compara Date, devolviendo -1/0/1
+function cmpDate(a, b) {
+  const ta = a instanceof Date ? a.getTime() : null;
+  const tb = b instanceof Date ? b.getTime() : null;
+  if (ta === null && tb === null) return 0;
+  if (ta === null) return -1;
+  if (tb === null) return 1;
+  return ta < tb ? -1 : ta > tb ? 1 : 0;
 }
 
 async function upsertLocalDocWithConflictResolution(localCollection, collName, remoteDoc, stats, options = {}) {
@@ -824,6 +851,16 @@ async function upsertLocalDocWithConflictResolution(localCollection, collName, r
         : (isMovs ? { $setOnInsert: { fecha: new Date() } } : { $set: {} }),
       { upsert: true }
     );
+
+    // 🧹 Compactación local segura: si entra un doc dedup que referencia a un movimiento base, borramos ese base local.
+    if (isMovs && cleaned.dedup === true && cleaned.movimiento && cleaned.movimiento._id) {
+      const baseId = safeObjectId(cleaned.movimiento._id);
+      if (baseId && String(baseId) !== String(_id)) {
+        const delRes = await localCollection.deleteOne({ _id: baseId });
+        if (delRes?.deletedCount && stats) stats.deletedLocal = (stats.deletedLocal || 0) + delRes.deletedCount;
+      }
+    }
+
     return true;
   } catch (err) {
     const code = err && (err.code || err?.errorResponse?.code);
@@ -905,7 +942,8 @@ async function getSyncState(collName) {
       st = await SyncState.findOne({ canon });
     }
   }
-  if (!st) st = await SyncState.create({ canon });
+  if (!st) st = await SyncState.create({ canon, meta: {} });
+  if (!st.meta) { st.meta = {}; await st.save().catch(()=>{}); }
   return st;
 }
 async function saveSyncState(collName, patch) {
@@ -1019,23 +1057,34 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
       const st = await getSyncState(canonName);
       const temporalField = await detectTemporalField(remoteDb, remoteNames[0]);
 
+      // Checkpoint previo (para tie-break en frontera)
+      const lastTs = st.lastUpdatedAt instanceof Date ? st.lastUpdatedAt : null;
+      const lastId = is24Hex(st.lastObjectId || '') ? st.lastObjectId : null;
+
       for (const name of remoteNames) {
         try {
           const rc = remoteDb.collection(name);
           let filter = {};
-          const sort = {};
+          let sort = {};
 
           if (isMirrorThisCollection) {
-            sort._id = 1; // FULL SCAN
+            sort = { _id: 1 }; // FULL SCAN
           } else {
             if (temporalField) {
-              if (st.lastUpdatedAt) filter[temporalField] = { $gt: st.lastUpdatedAt };
-              sort[temporalField] = 1;
-            } else if (st.lastObjectId) {
-              filter._id = { $gt: safeObjectId(st.lastObjectId) };
-              sort._id = 1;
+              // ✅ Incremental robusto: ts > lastTs  OR  (ts == lastTs AND _id > lastId)
+              if (lastTs || lastId) {
+                const orConds = [{ [temporalField]: { $gt: lastTs || new Date(0) } }];
+                if (lastTs && lastId) {
+                  orConds.push({ [temporalField]: lastTs, _id: { $gt: safeObjectId(lastId) } });
+                }
+                filter = { $or: orConds };
+              }
+              sort = { [temporalField]: 1, _id: 1 };
+            } else if (lastId) {
+              filter = { _id: { $gt: safeObjectId(lastId) } };
+              sort = { _id: 1 };
             } else {
-              sort._id = 1;
+              sort = { _id: 1 };
             }
           }
 
@@ -1049,28 +1098,33 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
             }
             for (const d of batch) {
               const idStr = String(d._id);
-              if (isMirrorThisCollection) {
-                // En MIRROR dejamos entrar todo; solo filtramos duplicados idénticos por _id
-                if (seenIds.has(idStr)) continue;
-                seenIds.add(idStr);
-                union.push(d);
-              } else {
-                // En incremental, con _id basta para evitar duplicados entre alias
-                if (seenIds.has(idStr)) continue;
-                seenIds.add(idStr);
-                union.push(d);
-              }
+              if (seenIds.has(idStr)) continue;
+              seenIds.add(idStr);
+              union.push(d);
               lastDoc = d;
             }
           }
 
+          // Trackear máximos para checkpoint compuesto (ts, _id)
           if (lastDoc) {
-            if (temporalField && lastDoc[temporalField] instanceof Date) {
-              st._tmpMaxDate = st._tmpMaxDate && st._tmpMaxDate > lastDoc[temporalField]
-                ? st._tmpMaxDate : lastDoc[temporalField];
-            } else if (lastDoc._id) {
-              const idHex = String(hexFromAny(lastDoc._id));
-              if (idHex) st._tmpMaxId = st._tmpMaxId && st._tmpMaxId > idHex ? st._tmpMaxId : idHex;
+            const ts = temporalField && (lastDoc[temporalField] instanceof Date) ? lastDoc[temporalField] : null;
+            const oidStr = String(hexFromAny(lastDoc._id) || '');
+
+            // Guardamos provisoriamente en memoria del proceso (st._tmp*)
+            if (ts) {
+              // max por fecha
+              if (!st._tmpMaxDate || cmpDate(ts, st._tmpMaxDate) > 0) {
+                st._tmpMaxDate = ts;
+                st._tmpMaxIdAtMaxDate = oidStr;
+              } else if (cmpDate(ts, st._tmpMaxDate) === 0) {
+                // si misma fecha, usar mayor _id
+                if (!st._tmpMaxIdAtMaxDate || oidStr > st._tmpMaxIdAtMaxDate) {
+                  st._tmpMaxIdAtMaxDate = oidStr;
+                }
+              }
+            } else {
+              // sin campo temporal, solo _id
+              if (!st._tmpMaxId || oidStr > st._tmpMaxId) st._tmpMaxId = oidStr;
             }
           }
         } catch (e) {
@@ -1090,8 +1144,12 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
 
       if (union.length && !isMirrorThisCollection) {
         const patch = {};
-        if (st._tmpMaxDate) patch.lastUpdatedAt = st._tmpMaxDate;
-        else if (st._tmpMaxId) patch.lastObjectId = st._tmpMaxId;
+        if (st._tmpMaxDate) {
+          patch.lastUpdatedAt = st._tmpMaxDate;
+          if (st._tmpMaxIdAtMaxDate) patch.lastObjectId = st._tmpMaxIdAtMaxDate;
+        } else if (st._tmpMaxId) {
+          patch.lastObjectId = st._tmpMaxId;
+        }
         if (Object.keys(patch).length) await saveSyncState(canonName, patch);
       }
 

@@ -1184,6 +1184,20 @@ exports.actualizarAbono = async (req, res) => {
       try { await before.save(); } catch (_) {}
     }
 
+    // 🔧 NUEVO: normalizo/limpio abono.cliente si vino raro (Buffer/objeto)
+    const cliIdSafePre =
+      toObjectIdSafe(before.cliente) ||
+      toObjectIdSafe(before.cliente && before.cliente._id) ||
+      (before.cliente && before.cliente.buffer ? toObjectIdSafe(before.cliente) : undefined);
+
+    if (before.cliente && !cliIdSafePre) {
+      before.cliente = undefined;
+      try { await before.save(); } catch (_) {}
+    } else if (cliIdSafePre && String(cliIdSafePre) !== String(before.cliente || '')) {
+      before.cliente = cliIdSafePre;
+      try { await before.save(); } catch (_) {}
+    }
+
     const updates = {};
     const allowed = [
       'nombreApellido','domicilio','localidad','telefonoParticular','telefonoEmergencia',
@@ -1288,16 +1302,44 @@ exports.actualizarAbono = async (req, res) => {
             try { await updated.save(); } catch (e) { console.warn('[actualizarAbono] no pude setear abono.vehiculo:', e?.message); }
           }
 
-          // Aseguro que el cliente tenga el vehículo en el array
-          if (updated.cliente && vehIdFinal) {
+          // 🔧 **NUEVO**: Aseguro que el cliente tenga el vehículo en el array con casteo fuerte + fallback
+          const tryCastClienteId =
+            toObjectIdSafe(updated.cliente) ||
+            toObjectIdSafe(updated.cliente && updated.cliente._id) ||
+            (updated.cliente && updated.cliente.buffer ? toObjectIdSafe(updated.cliente) : undefined) ||
+            null;
+
+          let cliIdFinal = tryCastClienteId;
+          if (!cliIdFinal) {
+            const dni   = String(updated.dniCuitCuil || '').trim();
+            const email = String(updated.email || '').trim().toLowerCase();
+            const name  = String(updated.nombreApellido || '').trim();
+
+            const byDni   = dni   ? await Cliente.findOne({ dniCuitCuil: dni }).select('_id').lean() : null;
+            const byEmail = !byDni && email ? await Cliente.findOne({ email }).select('_id').lean() : null;
+            const byName  = !byDni && !byEmail && name ? await Cliente.findOne({ nombreApellido: name }).select('_id').lean() : null;
+
+            cliIdFinal = (byDni || byEmail || byName)?._id || null;
+
+            if (cliIdFinal) {
+              updated.cliente = cliIdFinal;
+              try { await updated.save(); } catch (_) {}
+            }
+          }
+
+          if (cliIdFinal && vehIdFinal) {
             try {
               await Cliente.updateOne(
-                { _id: updated.cliente },
+                { _id: cliIdFinal },
                 { $addToSet: { vehiculos: vehIdFinal } }
               );
             } catch (e) {
-              console.warn('[actualizarAbono] no pude addToSet vehiculo en cliente:', e?.message);
+              console.warn('[actualizarAbono] addToSet cliente.vehiculos:', e?.message);
             }
+          } else {
+            console.warn('[actualizarAbono] skip addToSet (no cliId o vehId casteables)', {
+              cliId: String(cliIdFinal || ''), vehId: String(vehIdFinal || '')
+            });
           }
         } else {
           // 4) Si no existe vehículo previo: creo uno SOLO si no existe la patente nueva
@@ -1320,10 +1362,40 @@ exports.actualizarAbono = async (req, res) => {
             const vId = toObjectIdSafe(v._id) || v._id;
             updated.vehiculo = vId;
             try { await updated.save(); } catch {}
-            if (updated.cliente && vId) {
+
+            // 🔧 **NUEVO**: $addToSet con cliente casteado/fallback
+            const tryCastClienteId2 =
+              toObjectIdSafe(updated.cliente) ||
+              toObjectIdSafe(updated.cliente && updated.cliente._id) ||
+              (updated.cliente && updated.cliente.buffer ? toObjectIdSafe(updated.cliente) : undefined) ||
+              null;
+
+            let cliIdFinal2 = tryCastClienteId2;
+            if (!cliIdFinal2) {
+              const dni   = String(updated.dniCuitCuil || '').trim();
+              const email = String(updated.email || '').trim().toLowerCase();
+              const name  = String(updated.nombreApellido || '').trim();
+
+              const byDni   = dni   ? await Cliente.findOne({ dniCuitCuil: dni }).select('_id').lean() : null;
+              const byEmail = !byDni && email ? await Cliente.findOne({ email }).select('_id').lean() : null;
+              const byName  = !byDni && !byEmail && name ? await Cliente.findOne({ nombreApellido: name }).select('_id').lean() : null;
+
+              cliIdFinal2 = (byDni || byEmail || byName)?._id || null;
+
+              if (cliIdFinal2) {
+                updated.cliente = cliIdFinal2;
+                try { await updated.save(); } catch (_) {}
+              }
+            }
+
+            if (cliIdFinal2 && vId) {
               try {
-                await Cliente.updateOne({ _id: updated.cliente }, { $addToSet: { vehiculos: vId } });
+                await Cliente.updateOne({ _id: cliIdFinal2 }, { $addToSet: { vehiculos: vId } });
               } catch (e) { console.warn('[actualizarAbono] addToSet cliente.vehiculos (creación):', e?.message); }
+            } else {
+              console.warn('[actualizarAbono] skip addToSet (creación) (no cliId o vehId casteables)', {
+                cliId: String(cliIdFinal2 || ''), vehId: String(vId || '')
+              });
             }
           }
         }
@@ -1459,5 +1531,60 @@ exports.eliminarAbonos = async (_req, res) => {
   } catch (error) {
     console.error('Error al eliminar abonos:', error);
     res.status(500).json({ message: 'Error al eliminar abonos' });
+  }
+};
+
+/* =======================================================
+   (Opcional) TAREA ÚNICA DE saneo de datos viejos
+======================================================= */
+exports._sanearIdsAbonosYClientes = async (_req, res) => {
+  try {
+    const Abono = require('../models/Abono');
+    const Cliente = require('../models/Cliente');
+    const Vehiculo = require('../models/Vehiculo');
+
+    const fixed = { abonos: 0, links: 0, clientes: 0 };
+    const all = await Abono.find().lean();
+
+    const toOid = (v) =>
+      toObjectIdSafe(v) ||
+      toObjectIdSafe(v && v._id) ||
+      (v && v.buffer ? toObjectIdSafe(v) : undefined) ||
+      null;
+
+    for (const a of all) {
+      let cliId = toOid(a.cliente);
+      if (!cliId) {
+        const byDni   = a.dniCuitCuil ? await Cliente.findOne({ dniCuitCuil: a.dniCuitCuil }).select('_id').lean() : null;
+        const byEmail = !byDni && a.email ? await Cliente.findOne({ email: String(a.email).toLowerCase() }).select('_id').lean() : null;
+        const byName  = !byDni && !byEmail && a.nombreApellido ? await Cliente.findOne({ nombreApellido: a.nombreApellido }).select('_id').lean() : null;
+        cliId = (byDni || byEmail || byName)?._id || null;
+        if (cliId) { await Abono.updateOne({ _id: a._id }, { $set: { cliente: cliId } }); fixed.abonos++; }
+      }
+
+      let vehId = toOid(a.vehiculo);
+      if (!vehId && a.patente) {
+        const v = await Vehiculo.findOne({ patente: String(a.patente).toUpperCase() }).select('_id').lean();
+        if (v) { vehId = v._id; await Abono.updateOne({ _id: a._id }, { $set: { vehiculo: vehId } }); fixed.abonos++; }
+      }
+
+      if (cliId && vehId) {
+        await Cliente.updateOne({ _id: cliId }, { $addToSet: { vehiculos: vehId, abonos: a._id } });
+        fixed.links++;
+      }
+    }
+
+    const clientes = await Cliente.find().select('_id vehiculos abonos').lean();
+    for (const c of clientes) {
+      const uniqVeh = [...new Set((c.vehiculos || []).map(x => String(x)))].map(s => toObjectIdSafe(s) || s);
+      const uniqAbo = [...new Set((c.abonos || []).map(x => String(x)))].map(s => toObjectIdSafe(s) || s);
+      await Cliente.updateOne({ _id: c._id }, { $set: { vehiculos: uniqVeh, abonos: uniqAbo } });
+      fixed.clientes++;
+    }
+
+    return res.json({ ok: true, fixed });
+  } catch (e) {
+    console.error('_sanearIdsAbonosYClientes error:', e);
+    return res.status(500).json({ error: 'Error al sanear' });
   }
 };

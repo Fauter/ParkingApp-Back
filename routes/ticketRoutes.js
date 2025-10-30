@@ -1,8 +1,9 @@
 const express = require('express');
-const ticketController = require('../controllers/ticketControllers');
-const barcodeController = require('../controllers/barcodeControllers'); 
 const path = require('path');
 const fs = require('fs');
+
+const ticketController = require('../controllers/ticketControllers');
+const barcodeController = require('../controllers/barcodeControllers');
 const Ticket = require('../models/Ticket');
 
 const router = express.Router();
@@ -36,7 +37,7 @@ function resolveLocalPathFromUrl(url) {
    Rutas
 =========================== */
 
-// Obtener todos los tickets
+// Obtener todos los tickets (últimos primero)
 router.get('/', async (req, res) => {
   try {
     const tickets = await Ticket.find().sort({ creadoEn: -1 });
@@ -53,7 +54,7 @@ router.post('/', ticketController.crearTicket);
 // Obtener último ticket pendiente
 router.get('/pendiente', ticketController.obtenerUltimoTicketPendiente);
 
-// Asociar ticket a vehículo (esta ruta ya PERSISTE foto vía controller.guardarFotoTicket)
+// Asociar ticket a vehículo
 router.put('/:id/asociar', ticketController.asociarTicketAVehiculo);
 
 /**
@@ -121,5 +122,9 @@ router.post('/imprimir-salida', ticketController.imprimirTicketSalida);
 
 // 🖨️ Imprimir ticket de ANTICIPADO (CON barcode y leyenda específica)
 router.post('/imprimir-anticipado', ticketController.imprimirTicketAnticipado);
+
+// 🖨️ **NUEVO**: Imprimir ticket de CIERRE (caja/parcial) – SIN barcode
+// Body: { tipo: "cierreDeCaja" | "cierreParcial", cierre?: {...}, parcial?: {...}, operador?: {...} }
+router.post('/imprimir-cierredecaja', ticketController.imprimirTicketCierreCaja);
 
 module.exports = router;

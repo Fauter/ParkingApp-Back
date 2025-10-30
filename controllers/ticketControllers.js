@@ -1,3 +1,4 @@
+// ticketControllers.js
 const Ticket = require('../models/Ticket');
 const Counter = require('../models/Counter');
 
@@ -45,22 +46,61 @@ async function guardarFotoTicket(ticketId, fotoUrl) {
   }
 }
 
+/**
+ * ================================
+ * 🖨️ Ejecutor Python con “copias”
+ * ================================
+ * Duplicamos automáticamente SOLO para:
+ *  - imprimir_ticket_anticipado.py
+ *  - imprimir_ticket_cierredecaja.py
+ *  - imprimir_ticket_salida.py
+ *  - imprimir_ticket_abono.py
+ * El resto (p.ej. imprimir_ticket.py de ENTRADA) imprime 1 sola copia.
+ */
 function runPython(scriptPath, args, res, okMsg, errMsg) {
-  const pythonProcess = execFile('python', [scriptPath, ...args], {
-    encoding: 'utf8',
-    windowsHide: true
-  }, (error, stdout, stderr) => {
-    if (error) {
+  const base = path.basename(scriptPath);
+  const dobleCopiaScripts = new Set([
+    'imprimir_ticket_anticipado.py',
+    'imprimir_ticket_cierredecaja.py',
+    'imprimir_ticket_salida.py',
+    'imprimir_ticket_abono.py',
+  ]);
+  const copies = dobleCopiaScripts.has(base) ? 2 : 1;
+
+  const execOnce = () =>
+    new Promise((resolve, reject) => {
+      const pythonProcess = execFile(
+        'python',
+        [scriptPath, ...args],
+        { encoding: 'utf8', windowsHide: true },
+        (error, stdout, stderr) => {
+          if (error) return reject(error);
+          if (stdout) console.log(`✅ Salida Python (${base}): ${stdout}`);
+          if (stderr) console.error(`⚠ Python stderr (${base}): ${stderr}`);
+          resolve();
+        }
+      );
+
+      pythonProcess.stdout.on('data', (data) =>
+        console.log(`Python stdout (${base}): ${data}`)
+      );
+      pythonProcess.stderr.on('data', (data) =>
+        console.error(`Python stderr (${base}): ${data}`)
+      );
+    });
+
+  (async () => {
+    try {
+      for (let i = 0; i < copies; i++) {
+        await execOnce();
+      }
+      const finalMsg = copies > 1 ? `${okMsg} (x${copies})` : okMsg;
+      return res.send(finalMsg);
+    } catch (error) {
       console.error(`❌ ${errMsg}:`, error);
       return res.status(500).send(`❌ ${errMsg}`);
     }
-    console.log(`✅ Salida Python: ${stdout}`);
-    if (stderr) console.error(`⚠ Python stderr: ${stderr}`);
-    return res.send(okMsg);
-  });
-
-  pythonProcess.stdout.on('data', (data) => console.log(`Python stdout: ${data}`));
-  pythonProcess.stderr.on('data', (data) => console.error(`Python stderr: ${data}`));
+  })();
 }
 
 // ---- Formateos/compat impresión SALIDA ----
@@ -203,10 +243,10 @@ exports.actualizarFotoTicket = async (req, res) => {
 };
 
 // =====================
-// 🖨️ Impresión
+// 🖨️ Impresión (tickets varios)
 // =====================
 
-// Ticket común (barcode) -> imprimir_ticket.py
+// Ticket común (barcode) -> imprimir_ticket.py (ENTRADA: 1 sola copia)
 exports.imprimirTicket = (req, res) => {
   // no enviar a outbox
   res.locals.__skipOutbox = true;
@@ -238,7 +278,7 @@ exports.imprimirTicket = (req, res) => {
   );
 };
 
-// Ticket de ABONO (SIN barcode) -> imprimir_ticket_abono.py
+// Ticket de ABONO (SIN barcode) -> imprimir_ticket_abono.py (2 copias)
 exports.imprimirTicketAbono = (req, res) => {
   // no enviar a outbox
   res.locals.__skipOutbox = true;
@@ -301,7 +341,7 @@ exports.imprimirTicketAbono = (req, res) => {
   );
 };
 
-// Ticket de SALIDA (CON barcode) -> imprimir_ticket_salida.py
+// Ticket de SALIDA (CON barcode) -> imprimir_ticket_salida.py (2 copias)
 exports.imprimirTicketSalida = (req, res) => {
   // no enviar a outbox
   res.locals.__skipOutbox = true;
@@ -330,6 +370,7 @@ exports.imprimirTicketSalida = (req, res) => {
   const arg1 = barcodeNum;
 
   const meta = {
+    // el script asume strings amigables
     valorFinal:   valorFinalStr || (totalConDescuento != null ? String(totalConDescuento) : ''),
     patente:      patente ? String(patente).toUpperCase() : '',
     tipoVehiculo: tipoVehiculo ? String(tipoVehiculo) : '',
@@ -348,13 +389,7 @@ exports.imprimirTicketSalida = (req, res) => {
   );
 };
 
-// Ticket de ANTICIPADO (CON barcode) -> imprimir_ticket_anticipado.py
-// Acepta (flexible para compat con front actual):
-//  - ticketNumero (o texto)         -> barcode
-//  - nombreTurno                    -> para la leyenda "(NombreTurno)"
-//  - valorAnticipado | precio | valorHora (string o number) -> "(precio)"
-//  - patente, tipoVehiculo          -> bajo barcode
-//  - (opcional) metodoPago, factura, operador, fin, duracionHoras (no se imprimen ahora, pero pueden viajar)
+// Ticket de ANTICIPADO (CON barcode) -> imprimir_ticket_anticipado.py (2 copias)
 exports.imprimirTicketAnticipado = (req, res) => {
   // no enviar a outbox
   res.locals.__skipOutbox = true;
@@ -382,7 +417,6 @@ exports.imprimirTicketAnticipado = (req, res) => {
   else if (precio != null)     precioTxt = String(precio);
   else if (valorHora != null)  precioTxt = String(valorHora);
 
-  // Script Python
   const scriptPath = path.join(__dirname, '..', 'imprimir_ticket_anticipado.py');
   const arg1 = barcodeNum;
 
@@ -402,5 +436,36 @@ exports.imprimirTicketAnticipado = (req, res) => {
     res,
     '✅ Ticket de anticipado impreso correctamente',
     'Error al imprimir ticket de anticipado'
+  );
+};
+
+// =====================
+// 🖨️ **NUEVO**: Ticket de CIERRE (caja/parcial) – SIN barcode (2 copias)
+// Script: imprimir_ticket_cierredecaja.py
+// Body (req.body):
+//  - { tipo: "cierreDeCaja", cierre: {fecha, hora, totalRecaudado, dejoEnCaja, totalRendido}, operador: {...} }
+//  - { tipo: "cierreParcial", parcial: {fecha, hora, monto, nombre?}, operador: {...} }
+exports.imprimirTicketCierreCaja = (req, res) => {
+  // no enviar a outbox
+  res.locals.__skipOutbox = true;
+
+  const payload = req.body || {};
+  const tipo = (payload.tipo || '').trim();
+
+  if (!tipo || (tipo !== 'cierreDeCaja' && tipo !== 'cierreParcial')) {
+    return res.status(400).send('Falta "tipo" válido: cierreDeCaja | cierreParcial');
+  }
+
+  const scriptPath = path.join(__dirname, '..', 'imprimir_ticket_cierredecaja.py');
+
+  // Pasamos TODO el payload como argv[1] (el script parsea el JSON)
+  const arg1 = JSON.stringify(payload);
+
+  runPython(
+    scriptPath,
+    [arg1],
+    res,
+    '✅ Ticket de cierre impreso correctamente',
+    'Error al imprimir ticket de cierre'
   );
 };

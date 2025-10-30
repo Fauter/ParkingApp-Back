@@ -1,10 +1,12 @@
 // controllers/vehiculoControllers.js
 const fs = require("fs");
 const path = require("path");
-const axios = require('axios');
-const mongoose = require('mongoose');
+const axios = require("axios");
+const mongoose = require("mongoose");
 
-const { Types: { ObjectId } } = mongoose;
+const {
+  Types: { ObjectId },
+} = mongoose;
 
 const Vehiculo = require("../models/Vehiculo");
 const Movimiento = require("../models/Movimiento");
@@ -18,7 +20,10 @@ const Counter = require("../models/Counter");
 const UPLOADS_DIR = path.join(__dirname, "../uploads");
 const FOTOS_DIR = path.join(UPLOADS_DIR, "fotos");
 const FOTOS_ENTRADAS_DIR = path.join(FOTOS_DIR, "entradas");
-const RUTA_FOTO_TEMPORAL = path.join(__dirname, "../camara/sacarfoto/captura.jpg");
+const RUTA_FOTO_TEMPORAL = path.join(
+  __dirname,
+  "../camara/sacarfoto/captura.jpg"
+);
 
 [UPLOADS_DIR, FOTOS_DIR, FOTOS_ENTRADAS_DIR].forEach((dir) => {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -32,6 +37,33 @@ function obtenerPrecios() {
   } catch {
     return {};
   }
+}
+
+// --- arriba del archivo (junto a otros helpers) ---
+async function resolveClienteIdForAbono(abonoDoc) {
+  // 1) Intento directo (ObjectId, {_id}, {id}, {buffer})
+  const tryId = (v) => {
+    const id =
+      toObjectIdSafe(v) ||
+      toObjectIdSafe(v && v._id) ||
+      toObjectIdSafe(v && v.id) ||
+      (v && v.buffer ? toObjectIdSafe(v) : undefined);
+    return id || null;
+  };
+
+  let id = tryId(abonoDoc?.cliente);
+  if (id) return id;
+
+  // 2) Heurísticas por datos del abono
+  const dni   = String(abonoDoc?.dniCuitCuil || '').trim();
+  const email = String(abonoDoc?.email || '').trim().toLowerCase();
+  const name  = String(abonoDoc?.nombreApellido || '').trim();
+
+  if (dni)   { const c = await Cliente.findOne({ dniCuitCuil: dni }).select('_id').lean();   if (c) return c._id; }
+  if (email) { const c = await Cliente.findOne({ email }).select('_id').lean();               if (c) return c._id; }
+  if (name)  { const c = await Cliente.findOne({ nombreApellido: name }).select('_id').lean();if (c) return c._id; }
+
+  return null;
 }
 
 async function obtenerProximoTicket() {
@@ -132,35 +164,60 @@ function cap1(s) {
   return t ? t.charAt(0).toUpperCase() + t.slice(1) : t;
 }
 
-// === ObjectId safe cast (acepta string 24hex, Buffer, objeto {buffer:…}, ObjectId) ===
+// === ObjectId safe cast (string 24hex, Buffer, {buffer:{...}}, {_id}, ObjectId) ===
 function toObjectIdSafe(v) {
   if (!v) return undefined;
   if (v instanceof ObjectId) return v;
-  if (typeof v === 'string') {
+
+  if (typeof v === "string") {
     const s = v.trim();
     return /^[0-9a-fA-F]{24}$/.test(s) ? new ObjectId(s) : undefined;
   }
-  // Node Buffer directo
-  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(v)) {
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer(v)) {
     if (v.length === 12 || v.length === 24) return new ObjectId(v);
   }
-  // forma serializada { buffer: { '0':..., ... } }
-  if (typeof v === 'object' && v.buffer && typeof v.buffer === 'object') {
-    try {
-      const arr = Object.keys(v.buffer).map(k => v.buffer[k]);
-      const buf = Buffer.from(arr);
-      if (buf.length === 12 || buf.length === 24) return new ObjectId(buf);
-    } catch (_) {}
+  if (typeof v === "object") {
+    if (v._id) return toObjectIdSafe(v._id);
+    if (v.id) return toObjectIdSafe(v.id);
+    if (v.buffer && typeof v.buffer === "object") {
+      try {
+        const arr = Object.keys(v.buffer)
+          .sort((a, b) => Number(a) - Number(b))
+          .map((k) => v.buffer[k]);
+        const buf = Buffer.from(arr);
+        if (buf.length === 12 || buf.length === 24) return new ObjectId(buf);
+      } catch (_) {}
+    }
   }
   return undefined;
 }
 
+// Helper: devuelve un ObjectId válido si puede; si no, deja el valor original
+function getIdAny(x) {
+  return toObjectIdSafe(x) || toObjectIdSafe(x && x._id) || toObjectIdSafe(x && x.id) || x;
+}
+
+// Helper: devuelve ObjectId o null (NUNCA un objeto crudo)
+function oidOrNull(x) {
+  try {
+    return (
+      toObjectIdSafe(x) ||
+      toObjectIdSafe(x && x._id) ||
+      toObjectIdSafe(x && x.id) ||
+      (x && x.buffer ? toObjectIdSafe(x) : null) ||
+      null
+    );
+  } catch {
+    return null;
+  }
+}
+
 /* =========================================================================
-   🔒 REGLA CLAVE (para evitar duplicados):
-   - JAMÁS crear un vehículo nuevo por un cambio de patente en edición.
-   - Si la nueva patente ya existe (de otro _id), responder 409.
-   - Sync desde Abono primero busca por abonoId, renombra y actualiza.
-   - Además: blindo y CORRIJO abono.vehiculo para que quede ObjectId real.
+   🔒 ANTI-DUPLICADOS / CAST ROBUSTO
+   - Nunca crear un vehículo nuevo por cambiar patente (si colisiona -> 409)
+   - Sync desde Abono: buscar por abonoId, renombrar, actualizar.
+   - Blindar abono.vehiculo como ObjectId real.
+   - Castear SIEMPRE abono.cliente para $addToSet en Cliente.
    ========================================================================= */
 
 // ✅ Sync seguro desde Abono SIN duplicar + fija abono.vehiculo como ObjectId real
@@ -169,7 +226,7 @@ async function ensureVehiculoFromAbono(abonoDoc) {
   const newPat = upperOrEmpty(abonoDoc.patente);
   if (!newPat) throw new Error("El abono no tiene patente definida");
 
-  const abonoId = toObjectIdSafe(abonoDoc._id) || abonoDoc._id;
+  const abonoId = getIdAny(abonoDoc._id);
 
   // 1) Preferir el vehículo vinculado a este abono
   let vehiculo = await Vehiculo.findOne({ abono: abonoId });
@@ -208,31 +265,58 @@ async function ensureVehiculoFromAbono(abonoDoc) {
   vehiculo.companiaSeguro = abonoDoc.companiaSeguro ?? vehiculo.companiaSeguro;
 
   vehiculo.abonado = true;
-  try { vehiculo.abono = abonoId; } catch (_) {}
+  try {
+    vehiculo.abono = abonoId;
+  } catch (_) {}
 
   await vehiculo.save();
 
-  // 6) CORRECCIÓN: asegurar que abono.vehiculo quede como ObjectId real (no Buffer)
-  const vehId = toObjectIdSafe(vehiculo._id) || vehiculo._id;
+  // 6) Asegurar que abono.vehiculo quede como ObjectId real (no Buffer)
+  const vehId = getIdAny(vehiculo._id);
   if (!abonoDoc.vehiculo || String(abonoDoc.vehiculo) !== String(vehId)) {
     abonoDoc.vehiculo = vehId;
-    try { await abonoDoc.save(); } catch (e) { console.warn("[ensureVehiculoFromAbono] No pude guardar abono.vehiculo:", e?.message); }
-  }
-
-  // 7) Asegurar vínculo en Cliente (si aplica)
-  if (abonoDoc.cliente && vehId) {
     try {
-      await Cliente.updateOne({ _id: abonoDoc.cliente }, { $addToSet: { vehiculos: vehId } });
+      await abonoDoc.save();
     } catch (e) {
-      console.warn("[ensureVehiculoFromAbono] addToSet cliente.vehiculos:", e?.message);
+      console.warn(
+        "[ensureVehiculoFromAbono] No pude guardar abono.vehiculo:",
+        e?.message
+      );
     }
   }
 
+  // 7) Vínculo en Cliente con casteo FUERTE y sin romper si no hay ID
+  const cliId = await resolveClienteIdForAbono(abonoDoc);
+  if (cliId && vehId) {
+    try {
+      await Cliente.updateOne({ _id: cliId }, { $addToSet: { vehiculos: vehId } });
+    } catch (e) {
+      console.warn("[ensureVehiculoFromAbono] addToSet cliente.vehiculos:", e?.message);
+    }
+
+    // 👉 Encolar Outbox para que suba al remoto (merge por addToSet)
+    try {
+      const Outbox = require("../models/Outbox");
+      await Outbox.create({
+        method: "PATCH",
+        route: `/api/clientes/${cliId}`,
+        collection: "clientes",
+        status: "pending",
+        document: { _id: String(cliId), vehiculos: [String(vehId)], __merge: "addToSet" },
+        createdAt: new Date(),
+      });
+    } catch (e) {
+      console.warn("[ensureVehiculoFromAbono] no pude encolar Outbox clientes:", e?.message);
+    }
+  } else {
+    console.warn("[ensureVehiculoFromAbono] skip addToSet: no pude resolver cliId para el abono", String(abonoDoc?._id || '¿?'));
+  }
+  
   return vehiculo;
 }
 
 /* =========================================================================
-   Handlers existentes (toco solo lo necesario)
+   Handlers
    ========================================================================= */
 
 // Crear Vehículo (con entrada)
@@ -278,9 +362,7 @@ exports.createVehiculo = async (req, res) => {
         const precioAbono =
           precios[tipoVehiculo.toLowerCase()]?.estadia || 0;
 
-        vehiculo.abonoExpira = new Date(
-          Date.now() + 30 * 24 * 60 * 60 * 1000
-        );
+        vehiculo.abonoExpira = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
 
         const nuevoMovimiento = new Movimiento({
           patente: pat,
@@ -365,9 +447,7 @@ exports.createVehiculoSinEntrada = async (req, res) => {
         const precioAbono =
           precios[tipoVehiculo.toLowerCase()]?.estadia || 0;
 
-        vehiculo.abonoExpira = new Date(
-          Date.now() + 30 * 24 * 60 * 60 * 1000
-        );
+        vehiculo.abonoExpira = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
 
         const nuevoMovimiento = new Movimiento({
           patente: pat,
@@ -611,9 +691,9 @@ exports.registrarSalida = async (req, res) => {
 
     const metodoPago = mpBody || estadiaSnapshot.metodoPago || "Efectivo";
     const factura = facturaBody || "Final";
-    const tipoTarifa = tipoTarifaBody || estadiaSnapshot.tipoTarifa || "estadia";
-    const descripcion =
-      descripcionBody || `Salida ${patente} — ${tipoTarifa}`;
+    const tipoTarifa =
+      tipoTarifaBody || estadiaSnapshot.tipoTarifa || "estadia";
+    const descripcion = descripcionBody || `Salida ${patente} — ${tipoTarifa}`;
 
     const movimientoDoc = {
       patente,
@@ -680,21 +760,28 @@ exports.asignarAbonoAVehiculo = async (req, res) => {
     if (!vehiculo)
       return res.status(404).json({ message: "Vehículo no encontrado." });
 
-    const abono = await Abono.findById(abonoId);
+    const abono = await Abono.findById(getIdAny(abonoId));
     if (!abono) return res.status(404).json({ message: "Abono no encontrado" });
 
     vehiculo.abonado = true;
     try {
-      vehiculo.abono = abono._id;
+      vehiculo.abono = getIdAny(abono._id);
     } catch (_) {}
 
     await vehiculo.save();
 
     // además dejo el vínculo correcto en el abono
-    const vehId = toObjectIdSafe(vehiculo._id) || vehiculo._id;
+    const vehId = getIdAny(vehiculo._id);
     if (!abono.vehiculo || String(abono.vehiculo) !== String(vehId)) {
       abono.vehiculo = vehId;
-      try { await abono.save(); } catch (e) { console.warn("[asignarAbonoAVehiculo] No pude guardar abono.vehiculo:", e?.message); }
+      try {
+        await abono.save();
+      } catch (e) {
+        console.warn(
+          "[asignarAbonoAVehiculo] No pude guardar abono.vehiculo:",
+          e?.message
+        );
+      }
     }
 
     return res
@@ -732,6 +819,7 @@ exports.getVehiculoByTicket = async (req, res) => {
   }
 };
 
+// Buscar vehículo por número de ticket (modo admin: incluye historial y fallback)
 exports.getVehiculoByTicketAdmin = async (req, res) => {
   try {
     const { ticket } = req.params;
@@ -741,37 +829,57 @@ exports.getVehiculoByTicketAdmin = async (req, res) => {
       return res.status(400).json({ msg: "Número de ticket inválido" });
     }
 
+    // 1️⃣ Buscar en estadía actual o historial
     let vehiculo = await Vehiculo.findOne({
-      "estadiaActual.ticket": ticketNum,
+      $or: [
+        { "estadiaActual.ticket": ticketNum },
+        { "historialEstadias.ticket": ticketNum }
+      ]
     }).select("-__v");
 
-    if (vehiculo) {
-      const estadia = vehiculo.estadiaActual;
-      estadia.ticketFormateado = String(estadia.ticket).padStart(10, "0");
-      return res.json({ vehiculo, estadia });
+    if (!vehiculo) {
+      return res.status(404).json({ msg: "Vehículo no encontrado para este ticket" });
     }
 
-    vehiculo = await Vehiculo.findOne({
-      "historialEstadias.ticket": ticketNum,
-    }).select("-__v");
-    if (!vehiculo)
-      return res
-        .status(404)
-        .json({ msg: "Vehículo no encontrado para este ticket" });
+    // 2️⃣ Determinar la estadía exacta
+    let estadia = null;
 
-    const estadia = vehiculo.historialEstadias.find(
-      (e) => String(e.ticket) === String(ticketNum)
-    );
-    if (!estadia)
-      return res
-        .status(404)
-        .json({ msg: "Estadía no encontrada para este ticket en el historial" });
+    if (vehiculo.estadiaActual && vehiculo.estadiaActual.ticket === ticketNum) {
+      estadia = { ...vehiculo.estadiaActual };
+    } else if (Array.isArray(vehiculo.historialEstadias)) {
+      estadia = vehiculo.historialEstadias.find(e => e.ticket === ticketNum) || null;
+    }
 
+    // 3️⃣ Si no hay salida en la estadía, intentar completarla
+    if (estadia && !estadia.salida) {
+      const mov = await Movimiento.findOne({ ticket: ticketNum })
+        .sort({ createdAt: -1 })
+        .lean();
+
+      if (mov) {
+        estadia.salida = mov.fecha || mov.createdAt || mov.updatedAt || new Date();
+        estadia.metodoPago = mov.metodoPago || estadia.metodoPago || null;
+        estadia.operadorNombre = mov.operador || estadia.operadorNombre || "Operador desconocido";
+        estadia.descripcion = mov.descripcion || estadia.descripcion || null;
+      }
+    }
+
+    // 4️⃣ Si sigue sin estadía válida, fabricarla básica (caso extremo)
+    if (!estadia) {
+      estadia = {
+        entrada: null,
+        salida: null,
+        ticket: ticketNum,
+        operadorNombre: "Desconocido"
+      };
+    }
+
+    // 5️⃣ Formato y salida final
     estadia.ticketFormateado = String(estadia.ticket).padStart(10, "0");
-
     return res.json({ vehiculo, estadia });
+
   } catch (err) {
-    console.error("Error en getVehiculoByTicketAdmin:", err);
+    console.error("💥 Error en getVehiculoByTicketAdmin:", err);
     return res.status(500).json({ msg: "Error del servidor" });
   }
 };
@@ -788,7 +896,8 @@ exports.setAbonadoFlagByPatente = async (req, res) => {
     }
 
     const vehiculo = await Vehiculo.findOne({ patente });
-    if (!vehiculo) return res.status(404).json({ msg: "Vehículo no encontrado" });
+    if (!vehiculo)
+      return res.status(404).json({ msg: "Vehículo no encontrado" });
 
     vehiculo.abonado = abonado;
     if (abonado === false) {
@@ -796,11 +905,38 @@ exports.setAbonadoFlagByPatente = async (req, res) => {
     }
     await vehiculo.save();
 
+    // 🔧 NUEVO: desvincular correctamente del/los cliente/s + Outbox para remoto
     if (detachFromCliente) {
-      await Cliente.updateMany(
-        { vehiculos: vehiculo._id },
-        { $pull: { vehiculos: vehiculo._id } }
-      );
+      try {
+        const owners = await Cliente.find({ vehiculos: vehiculo._id }).select('_id').lean();
+        const ownerIds = owners.map(o => o._id);
+
+        if (ownerIds.length) {
+          await Cliente.updateMany(
+            { _id: { $in: ownerIds } },
+            { $pull: { vehiculos: vehiculo._id } }
+          );
+
+          // Encolar Outbox por cada cliente para hacer __merge:'pull' en REMOTO
+          try {
+            const Outbox = require("../models/Outbox");
+            for (const cid of ownerIds) {
+              await Outbox.create({
+                method: "PATCH",
+                route: `/api/clientes/${cid}`,
+                collection: "clientes",
+                status: "pending",
+                document: { _id: String(cid), vehiculos: [String(vehiculo._id)], __merge: "pull" },
+                createdAt: new Date(),
+              });
+            }
+          } catch (e) {
+            console.warn("[setAbonadoFlag] no pude encolar Outbox clientes (pull):", e?.message);
+          }
+        }
+      } catch (e) {
+        console.warn("[setAbonadoFlag] error al $pull de clientes:", e?.message);
+      }
     }
 
     res.json({ msg: "Vehículo actualizado", vehiculo });
@@ -824,7 +960,7 @@ exports.eliminarTodosLosVehiculos = async (_req, res) => {
 };
 
 /* =========================================================================
-   NUEVOS HANDLERS PARA TU FLUJO DE EDICIÓN / SYNC
+   NUEVOS HANDLERS PARA EDICIÓN / SYNC
    ========================================================================= */
 
 /**
@@ -874,8 +1010,7 @@ exports.updateVehiculoByPatente = async (req, res) => {
     if (color !== undefined) vehiculo.color = color;
     if (anio !== undefined) vehiculo.anio = anio;
     if (tipoVehiculo !== undefined) vehiculo.tipoVehiculo = cap1(tipoVehiculo);
-    if (companiaSeguro !== undefined)
-      vehiculo.companiaSeguro = companiaSeguro;
+    if (companiaSeguro !== undefined) vehiculo.companiaSeguro = companiaSeguro;
 
     if (ensureAbonado === true) {
       vehiculo.abonado = true;
@@ -903,17 +1038,31 @@ exports.syncVehiculoFromAbono = async (req, res) => {
 
     try {
       const vehiculo = await ensureVehiculoFromAbono(abono);
-      // Garantizo vínculo en cliente (por si el helper no pudo setear por alguna razón)
-      if (abono.cliente && vehiculo?._id) {
+
+      // Garantizo vínculo en cliente (por si el helper no pudo setear por alguna razón),
+      // PERO SIN USAR getIdAny: casteo fuerte a ObjectId o salteo.
+      const cliId = (await resolveClienteIdForAbono(abono)) || oidOrNull(abono.cliente);
+      const vehId = oidOrNull(vehiculo?._id);
+
+      if (cliId && vehId) {
         try {
           await Cliente.updateOne(
-            { _id: abono.cliente },
-            { $addToSet: { vehiculos: vehiculo._id } }
+            { _id: cliId },
+            { $addToSet: { vehiculos: vehId } }
           );
         } catch (e) {
-          console.warn("[syncVehiculoFromAbono] addToSet cliente.vehiculos:", e?.message);
+          console.warn(
+            "[syncVehiculoFromAbono] addToSet cliente.vehiculos:",
+            e?.message
+          );
         }
+      } else {
+        console.warn(
+          "[syncVehiculoFromAbono] skip addToSet (no cliId o vehId casteables)",
+          { cliId: String(cliId || ''), vehId: String(vehId || '') }
+        );
       }
+
       return res.json({ msg: "Vehículo sincronizado desde Abono", vehiculo });
     } catch (e) {
       if (e?.statusCode === 409) {

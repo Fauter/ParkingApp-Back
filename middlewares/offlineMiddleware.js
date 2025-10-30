@@ -1,4 +1,5 @@
 // middlewares/offlineMiddleware.js
+/* eslint-disable no-console */
 const Outbox = require('../models/Outbox');
 const routeToCollection = require('../configuracion/routeToCollection');
 
@@ -9,7 +10,7 @@ const excludedPaths = [
   '/api/auth/login',
   '/api/tickets/barcode',
   '/api/tickets/imprimir',
-  '/api/sync/run-now',       
+  '/api/sync/run-now',
   '/api/vehiculos/eliminar-foto-temporal'
 ];
 
@@ -40,7 +41,7 @@ function looksLikeEnvelope(obj) {
   const allowed = new Set(['msg', 'message', 'ok', 'token', 'status', 'error']);
   const hasOnlyEnvelopeKeys = keys.every(k => allowed.has(k));
   const hasDomainKeys = keys.some(k =>
-    ['_id','id','user','ticket','vehiculo','cliente','data','result','document','item','payload','username','email'].includes(k)
+    ['_id','id','user','ticket','vehiculo','cliente','data','result','document','item','payload','username','email','operador'].includes(k)
   );
   return hasOnlyEnvelopeKeys && !hasDomainKeys;
 }
@@ -55,57 +56,131 @@ function looksLikeValidDocument(obj) {
   return hasNonEnvelopeKeys && keys.length > 0;
 }
 
-// Función mejorada para seleccionar documento
-function pickDocumentForOutbox(method, collection, reqBody, capturedBody) {
-  // Si capturedBody es un string (mensaje o imagen), preferir reqBody en POST
-  if (typeof capturedBody === 'string') {
-    return method === 'POST' ? reqBody : {};
+/* =======================================================
+   Helpers nuevos: aplanar refs pobladas a ObjectId string
+======================================================= */
+
+// Extrae un ObjectId en string desde múltiples formas comunes: string hex, {_id}, {id}, {$oid}, {_id: {$oid: ...}}, Buffer-like.
+function pluckHexObjectId(ref) {
+  try {
+    if (!ref) return null;
+
+    if (typeof ref === 'string') {
+      return /^[a-fA-F0-9]{24}$/.test(ref.trim()) ? ref.trim() : null;
+    }
+
+    if (typeof ref === 'object') {
+      // Formas directas
+      if (typeof ref._id === 'string' && /^[a-fA-F0-9]{24}$/.test(ref._id)) return ref._id;
+      if (typeof ref.id === 'string'  && /^[a-fA-F0-9]{24}$/.test(ref.id))  return ref.id;
+      if (typeof ref.$oid === 'string' && /^[a-fA-F0-9]{24}$/.test(ref.$oid)) return ref.$oid;
+
+      // _id como documento BSON con $oid
+      if (ref._id && typeof ref._id === 'object' && typeof ref._id.$oid === 'string' && /^[a-fA-F0-9]{24}$/.test(ref._id.$oid)) {
+        return ref._id.$oid;
+      }
+
+      // Buffer/bytes de 12
+      if (ref._bsontype === 'ObjectId' && ref.id && ref.id.length === 12) {
+        return Buffer.from(ref.id).toString('hex');
+      }
+      if (ref.buffer && typeof ref.buffer === 'object') {
+        const keys = Object.keys(ref.buffer).filter(k => /^\d+$/.test(k)).sort((a,b)=>Number(a)-Number(b));
+        if (keys.length === 12) return Buffer.from(keys.map(k => Number(ref.buffer[k]))).toString('hex');
+      }
+      const directKeys = Object.keys(ref).filter(k => /^\d+$/.test(k)).sort((a,b)=>Number(a)-Number(b));
+      if (directKeys.length === 12) return Buffer.from(directKeys.map(k => Number(ref[k]))).toString('hex');
+    }
+  } catch (_) { /* ignore */ }
+  return null;
+}
+
+// Aplana refs conocidas a su _id si vienen pobladas (sin _id → se deja como venía)
+function flattenRefFields(candidate) {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return candidate;
+  const REF_KEYS = ['operador', 'cliente', 'vehiculo', 'abono', 'user', 'usuario'];
+  for (const k of REF_KEYS) {
+    if (candidate[k] !== undefined && candidate[k] !== null) {
+      const hex = pluckHexObjectId(candidate[k]);
+      if (hex) candidate[k] = hex; // sustituye objeto por su ObjectId string
+    }
+  }
+  return candidate;
+}
+
+/* =======================================================
+   Fix clave: asegurar operador en cierres de caja
+======================================================= */
+function ensureOperadorForCierre(candidate, req) {
+  if (!candidate || typeof candidate !== 'object') return candidate;
+  if (candidate.operador) return candidate;
+
+  // intentá recuperar desde req.user si el controller no lo puso en body/respuesta
+  const opHex =
+    pluckHexObjectId(req?.user) ||
+    pluckHexObjectId(req?.user?._id) ||
+    pluckHexObjectId(req?.user?.id) ||
+    null;
+
+  if (opHex) candidate.operador = opHex;
+  return candidate;
+}
+
+/* =======================================================
+   Selección de documento para el Outbox (AJUSTADA)
+   - Nunca "pisa" el _id si la respuesta lo trae
+   - Mergea campos útiles desde req.body (p.ej. operador)
+   - Para cierresdecajas, fuerza operador desde req.user si falta
+======================================================= */
+function pickDocumentForOutbox(method, collection, req, capturedBody) {
+  const reqBody = (req && req.body && typeof req.body === 'object') ? req.body : null;
+
+  // 1) Elegir base: si la respuesta trae un doc válido (mejor si trae _id), usarla. Si es envelope o inválida, usar req.body
+  let candidate = null;
+  if (looksLikeValidDocument(capturedBody) && !looksLikeEnvelope(capturedBody)) {
+    candidate = capturedBody;
+  } else if (reqBody && typeof reqBody === 'object') {
+    candidate = reqBody;
+  } else {
+    candidate = {};
   }
 
-  let candidate = capturedBody || reqBody || {};
-
-  // Ignorar buffers/binarios
-  if (candidate instanceof Buffer || candidate?.type === 'Buffer') {
-    return method === 'POST' ? reqBody : {};
-  }
-
-  // Si viene wrapper típico, intentar extraer objeto real
+  // 2) Si la respuesta vino envuelta tipo {document: {...}} o similares, extraer
   if (candidate && typeof candidate === 'object') {
-    const keysToTry = ['user','ticket','vehiculo','data','result','document','cliente','item','payload'];
+    const keysToTry = ['document','result','data','item','payload','ticket','vehiculo','cliente'];
     for (const k of keysToTry) {
-      if (candidate[k] && typeof candidate[k] === 'object') {
+      if (candidate[k] && typeof candidate[k] === 'object' && candidate[k]._id) {
         candidate = candidate[k];
         break;
       }
     }
   }
 
-  // Si parece un envelope vacío, preferir reqBody
-  if (!looksLikeValidDocument(candidate) && reqBody && typeof reqBody === 'object') {
-    candidate = reqBody;
-  }
-
-  // Para POST, si no hay _id y reqBody tiene campos útiles, preferir reqBody
-  if (
-    method === 'POST' &&
-    candidate && typeof candidate === 'object' && !candidate._id &&
-    reqBody && typeof reqBody === 'object'
-  ) {
-    const hasUsefulReqBodyFields = ['username','email','ticket','vehiculo','cliente']
-      .some(k => reqBody[k] !== undefined);
-    const hasUsefulCandidateFields = ['_id','username','email','ticket','vehiculo','cliente']
-      .some(k => candidate[k] !== undefined);
-    if (hasUsefulReqBodyFields && !hasUsefulCandidateFields) {
-      candidate = reqBody;
+  // 3) Merge conservador: NO perder _id de la respuesta. Copiamos desde req.body solo si faltan en candidate.
+  if (reqBody && typeof reqBody === 'object') {
+    const MERGE_KEYS = ['operador','cliente','vehiculo','abono','user','usuario','fecha','hora'];
+    for (const k of MERGE_KEYS) {
+      if (candidate[k] === undefined && reqBody[k] !== undefined) {
+        candidate[k] = reqBody[k];
+      }
     }
   }
 
-  // Limpieza final
+  // 4) Caso especial: cierresdecajas → asegurar operador (desde req.user si falta)
+  if (String(collection).toLowerCase() === 'cierresdecajas') {
+    candidate = ensureOperadorForCierre(candidate, req);
+  }
+
+  // 5) Aplanar refs pobladas
+  if (candidate && typeof candidate === 'object') {
+    candidate = flattenRefFields(candidate);
+  }
+
+  // 6) Limpieza final
   if (candidate && typeof candidate === 'object') {
     const { __v, _v, createdAt, updatedAt, ...cleanDoc } = candidate;
     return cleanDoc;
   }
-
   return {};
 }
 
@@ -115,6 +190,7 @@ module.exports = function offlineMiddleware(req, res, next) {
     const q = req.query || {};
     const localOnly = ['1','true','yes'].includes(String(q.localOnly || req.headers['x-local-only'] || '').toLowerCase());
     if (localOnly) return next();
+
     // Solo mutaciones sobre /api/*
     if (!['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method) || !req.originalUrl.startsWith('/api/')) {
       return next();
@@ -165,7 +241,7 @@ module.exports = function offlineMiddleware(req, res, next) {
           if (!res.statusCode || res.statusCode >= 400) return;
 
           const method = req.method;
-          const docCandidate = pickDocumentForOutbox(method, collection, req.body, capturedBody) || {};
+          const docCandidate = pickDocumentForOutbox(method, collection, req, capturedBody) || {};
 
           // Extraer id de doc o de la URL
           let idFromDoc = (docCandidate && (docCandidate._id || docCandidate.id)) || null;

@@ -1,4 +1,3 @@
-// controllers/movimientoControllers.js
 'use strict';
 
 const fs = require('fs');
@@ -20,7 +19,6 @@ function pickNonEmpty(...vals) {
   return '';
 }
 function resolveOperadorInfo(req) {
-  // 1) Desde auth
   const u = req.user || {};
   const nombreAp = pickNonEmpty(`${u.nombre || ''} ${u.apellido || ''}`);
   const byAuth = pickNonEmpty(u.username, nombreAp);
@@ -30,17 +28,20 @@ function resolveOperadorInfo(req) {
     return { operador: byAuth, operadorId: idAuth || undefined };
   }
 
-  // 2) Desde body (string u objeto)
   const b = req.body || {};
   let operadorStr = '';
   let operadorId = '';
 
   if (b.operador && typeof b.operador === 'object') {
-    operadorStr = pickNonEmpty(b.operador.username, `${b.operador.nombre || ''} ${b.operador.apellido || ''}`, b.operador.email, b.operador.toString && b.operador.toString());
+    operadorStr = pickNonEmpty(
+      b.operador.username,
+      `${b.operador.nombre || ''} ${b.operador.apellido || ''}`,
+      b.operador.email,
+      b.operador.toString && b.operador.toString()
+    );
     operadorId = pickNonEmpty(b.operador._id, b.operador.id);
   } else if (b.operador && typeof b.operador === 'string') {
     try {
-      // si vino como JSON string (caso reportado):
       const parsed = JSON.parse(b.operador);
       if (parsed && typeof parsed === 'object') {
         operadorStr = pickNonEmpty(parsed.username, `${parsed.nombre || ''} ${parsed.apellido || ''}`, parsed.email);
@@ -53,10 +54,7 @@ function resolveOperadorInfo(req) {
     }
   }
 
-  // 3) Alias directo
   if (!operadorStr) operadorStr = pickNonEmpty(b.operadorUsername, b.username);
-
-  // 4) Fallback
   if (!operadorStr) operadorStr = 'Operador Desconocido';
 
   return { operador: operadorStr, operadorId: operadorId || undefined };
@@ -111,12 +109,12 @@ function persistDataUrlToWebcamPromos(dataUrl, patente) {
 function normalizeFotoUrl(raw) {
   if (!raw) return null;
   const s = String(raw).trim();
-  if (isDataUrl(s)) return s; // se persiste afuera si llega así
+  if (isDataUrl(s)) return s;
   if (/^https?:\/\//i.test(s)) {
     try {
       const u = new URL(s);
       if (u.pathname && /\/uploads\//.test(u.pathname)) return u.pathname;
-    } catch { /* ignore */ }
+    } catch {}
     return s;
   }
   if (s.startsWith('/uploads/')) return s;
@@ -125,9 +123,9 @@ function normalizeFotoUrl(raw) {
 }
 
 // ============================
-// 🔒 Deduplicación defensiva (blanda)
+// 🔒 Deduplicación y merge
 // ============================
-async function findRecentDuplicateMovimiento({
+async function findRecentDuplicateMovimientoExact({
   patente, tipoVehiculo, metodoPago, factura, monto, descripcion, tipoTarifa
 }) {
   const now = Date.now();
@@ -142,6 +140,31 @@ async function findRecentDuplicateMovimiento({
     tipoTarifa,
     createdAt: { $gte: since }
   }).sort({ createdAt: -1 }).lean();
+}
+
+async function findRecentMovimientoByTicket({ patente, ticket }) {
+  if (!Number.isFinite(Number(ticket))) return null;
+  const now = Date.now();
+  const since = new Date(now - SOFT_DEDUP_MS);
+  return await Movimiento.findOne({
+    patente: String(patente).toUpperCase(),
+    ticket: Number(ticket),
+    createdAt: { $gte: since }
+  }).sort({ createdAt: -1 }).lean();
+}
+
+function shouldPreferIncomingDesc(existingDesc, incomingDesc) {
+  if (!incomingDesc) return false;
+  if (!existingDesc) return true;
+  // Si la existente es genérica de "Salida ..." y la nueva es más específica, preferimos la nueva
+  return /^Salida\s/i.test(existingDesc) && !/^Salida\s/i.test(incomingDesc);
+}
+
+function shouldPreferIncomingTipoTarifa(existingTipo, incomingTipo) {
+  if (!incomingTipo) return false;
+  if (!existingTipo) return true;
+  // Si la existente es "estadia" y la nueva es "hora", priorizamos la nueva (más específica al cobro)
+  return existingTipo === 'estadia' && incomingTipo === 'hora';
 }
 
 // ============================
@@ -230,38 +253,88 @@ exports.registrarMovimiento = async (req, res) => {
       }
     }
 
-    // Guard blando (informativo)
-    const dupSoft = await findRecentDuplicateMovimiento({
+    // 1) Dedupe exacto (campos completos)
+    const dupExact = await findRecentDuplicateMovimientoExact({
       patente: patenteUp, tipoVehiculo, metodoPago, factura, monto: montoNum, descripcion, tipoTarifa: tarifa
     });
-    if (dupSoft) {
+    if (dupExact) {
       const updates = {};
-      if (dupSoft.operador === 'Operador Desconocido' && operador && operador !== 'Operador Desconocido') {
+      if (dupExact.operador === 'Operador Desconocido' && operador && operador !== 'Operador Desconocido') {
         updates.operador = operador;
       }
-      if (!dupSoft.operadorId && operadorId) updates.operadorId = operadorId;
-      if (!dupSoft.fotoUrl && fotoUrl) updates.fotoUrl = fotoUrl;
-      if (promoObj && !dupSoft.promo) updates.promo = promoObj;
+      if (!dupExact.operadorId && operadorId) updates.operadorId = operadorId;
+      if (!dupExact.fotoUrl && fotoUrl) updates.fotoUrl = fotoUrl;
+      if (promoObj && !dupExact.promo) updates.promo = promoObj;
 
       if (Object.keys(updates).length) {
-        const fixed = await Movimiento.findByIdAndUpdate(dupSoft._id, { $set: updates }, { new: true });
+        const fixed = await Movimiento.findByIdAndUpdate(dupExact._id, { $set: updates }, { new: true });
         return res.status(200).json({
           msg: "Movimiento (deduplicado) actualizado",
           movimiento: { ...fixed.toObject(), createdAt: fixed.createdAt || fixed.fecha },
           dedup: true,
-          mode: 'soft'
+          mode: 'soft-exact'
         });
       }
 
       return res.status(200).json({
         msg: "Movimiento ya existente (deduplicado)",
-        movimiento: { ...dupSoft, createdAt: dupSoft.createdAt || dupSoft.fecha },
+        movimiento: { ...dupExact, createdAt: dupExact.createdAt || dupExact.fecha },
         dedup: true,
-        mode: 'soft'
+        mode: 'soft-exact'
       });
     }
 
-    // Guard duro (índice único con bucket 2s)
+    // 2) Dedupe por ticket (💡 evita doble asiento registrarSalida + POST manual)
+    let dupByTicket = null;
+    if (Number.isFinite(Number(ticket))) {
+      dupByTicket = await findRecentMovimientoByTicket({ patente: patenteUp, ticket: Number(ticket) });
+    }
+    if (dupByTicket) {
+      const patch = {};
+      // Preferimos info de este POST si aporta más calidad
+      if (!dupByTicket.metodoPago && metodoPago) patch.metodoPago = metodoPago;
+      if (!dupByTicket.factura && factura) patch.factura = factura;
+      if (!dupByTicket.fotoUrl && fotoUrl) patch.fotoUrl = fotoUrl;
+      if (promoObj && !dupByTicket.promo) patch.promo = promoObj;
+
+      if (shouldPreferIncomingDesc(dupByTicket.descripcion, descripcion)) {
+        patch.descripcion = descripcion;
+      }
+      if (shouldPreferIncomingTipoTarifa(dupByTicket.tipoTarifa, tarifa)) {
+        patch.tipoTarifa = tarifa;
+      }
+
+      // Si el monto que trae el operador difiere (por ejemplo aplica promo), priorizamos el nuevo
+      if (Number.isFinite(montoNum) && montoNum !== Number(dupByTicket.monto)) {
+        patch.monto = montoNum;
+      }
+
+      // Operador más rico
+      if (dupByTicket.operador === 'Operador Desconocido' && operador && operador !== 'Operador Desconocido') {
+        patch.operador = operador;
+      }
+      if (!dupByTicket.operadorId && operadorId) patch.operadorId = operadorId;
+
+      if (Object.keys(patch).length) {
+        const updated = await Movimiento.findByIdAndUpdate(dupByTicket._id, { $set: patch }, { new: true });
+        const finalDoc = updated.toObject();
+        return res.status(200).json({
+          msg: "Movimiento fusionado por ticket (sin duplicar)",
+          movimiento: { ...finalDoc, createdAt: finalDoc.createdAt || finalDoc.fecha },
+          dedup: true,
+          mode: 'soft-ticket-merge'
+        });
+      }
+
+      return res.status(200).json({
+        msg: "Movimiento ya existente por ticket (sin duplicar)",
+        movimiento: { ...dupByTicket, createdAt: dupByTicket.createdAt || dupByTicket.fecha },
+        dedup: true,
+        mode: 'soft-ticket'
+      });
+    }
+
+    // 3) Guard duro (índice único con bucket 2s)
     const idemBucket2s = Math.floor(Date.now() / IDEM_WINDOW_MS);
 
     const baseDoc = {
@@ -293,7 +366,6 @@ exports.registrarMovimiento = async (req, res) => {
         mode: 'insert'
       });
     } catch (err) {
-      // Si colisiona el índice único => ya existe uno idéntico en este bucket
       if (err && err.code === 11000) {
         const existing = await Movimiento.findOne({
           idemBucket2s,
