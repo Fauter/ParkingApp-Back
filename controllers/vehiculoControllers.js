@@ -317,9 +317,21 @@ async function ensureVehiculoFromAbono(abonoDoc) {
 
 // Quita cualquier propiedad 'buffer' anidada y normaliza _id a string donde corresponda
 function deepClean(value) {
+  // ✅ PRESERVAR DATES
+  if (
+    value instanceof Date ||
+    (value &&
+      typeof value === "object" &&
+      Object.prototype.toString.call(value) === "[object Date]" &&
+      !isNaN(new Date(value).getTime()))
+  ) {
+    return value; // dejar Date como Date (JSON lo serializa a ISO)
+  }
+
   if (Array.isArray(value)) {
     return value.map((v) => deepClean(v));
   }
+
   if (value && typeof value === "object") {
     const out = {};
     for (const [k, v] of Object.entries(value)) {
@@ -336,6 +348,7 @@ function deepClean(value) {
     }
     return out;
   }
+
   return value;
 }
 
@@ -922,57 +935,112 @@ exports.getVehiculoByTicketAdmin = async (req, res) => {
 };
 
 exports.setAbonadoFlagByPatente = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
   try {
     const patente = upperOrEmpty(req.params.patente);
-    const { abonado, detachFromCliente } = req.body || {};
+    const { abonado, detachFromCliente, clienteId: cliIdFromReq } = req.body || {};
 
     if (typeof abonado !== "boolean") {
       return res.status(400).json({ msg: 'Campo "abonado" requerido (boolean).' });
     }
 
-    const vehiculo = await Vehiculo.findOne({ patente });
+    const vehiculo = await Vehiculo.findOne({ patente }).session(session);
     if (!vehiculo) return res.status(404).json({ msg: "Vehículo no encontrado" });
 
     vehiculo.abonado = abonado;
-    if (abonado === false) {
-      vehiculo.abono = undefined;
+
+    // === LIMPIEZA Y DESVINCULACIÓN ===
+    if (!abonado) {
+      vehiculo.abono = null;
+      vehiculo.cliente = null;
     }
-    await vehiculo.save();
 
-    // 🔧 NUEVO: desvincular correctamente del/los cliente/s + Outbox para remoto
+    await vehiculo.save({ session });
+
+    // === Si hay que desvincular del cliente ===
     if (detachFromCliente) {
-      try {
-        const owners = await Cliente.find({ vehiculos: vehiculo._id }).select("_id").lean();
-        const ownerIds = owners.map((o) => o._id);
+      // 1️⃣ Intentar obtener cliente confiable
+      let clienteId = null;
+      if (cliIdFromReq && ObjectId.isValid(cliIdFromReq)) {
+        clienteId = new ObjectId(cliIdFromReq);
+      } else if (vehiculo.cliente && ObjectId.isValid(vehiculo.cliente)) {
+        clienteId = vehiculo.cliente;
+      } else {
+        const abonoActivo = await Abono.findOne({ patente, activo: true }).session(session);
+        if (abonoActivo && ObjectId.isValid(abonoActivo.cliente))
+          clienteId = abonoActivo.cliente;
+      }
 
-        if (ownerIds.length) {
-          await Cliente.updateMany({ _id: { $in: ownerIds } }, { $pull: { vehiculos: vehiculo._id } });
+      // 2️⃣ Ejecutar pull robusto
+      if (clienteId) {
+        await Cliente.updateOne(
+          { _id: clienteId },
+          {
+            $pull: {
+              vehiculos: {
+                $or: [
+                  { _id: vehiculo._id },
+                  { patente: vehiculo.patente }
+                ]
+              }
+            },
+            $set: { updatedAt: new Date() }
+          },
+          { session }
+        );
 
-          // Encolar Outbox por cada cliente para hacer __merge:'pull' en REMOTO
-          try {
-            const Outbox = require("../models/Outbox");
-            for (const cid of ownerIds) {
-              await Outbox.create({
-                method: "PATCH",
-                route: `/api/clientes/${cid}`,
-                collection: "clientes",
-                status: "pending",
-                document: { _id: String(cid), vehiculos: [String(vehiculo._id)], __merge: "pull" },
-                createdAt: new Date(),
-              });
-            }
-          } catch (e) {
-            console.warn("[setAbonadoFlag] no pude encolar Outbox clientes (pull):", e?.message);
-          }
+        // 3️⃣ Outbox sincronización remota
+        try {
+          const Outbox = require("../models/Outbox");
+          await Outbox.create({
+            method: "PATCH",
+            route: `/api/clientes/${clienteId}`,
+            collection: "clientes",
+            status: "pending",
+            document: { _id: String(clienteId), vehiculos: [String(vehiculo._id)], __merge: "pull" },
+            createdAt: new Date()
+          });
+        } catch (e) {
+          console.warn("[setAbonadoFlagByPatente] Outbox clientes fallo:", e?.message);
         }
-      } catch (e) {
-        console.warn("[setAbonadoFlag] error al $pull de clientes:", e?.message);
+      } else {
+        console.warn("[setAbonadoFlagByPatente] No se pudo resolver clienteId");
       }
     }
 
-    res.json({ msg: "Vehículo actualizado", vehiculo: formatVehiculo(vehiculo.toObject()) });
+    // === Actualizar abono asociado si existiera ===
+    const abonoAsociado = await Abono.findOne({ patente }).session(session);
+    if (abonoAsociado && !abonado) {
+      abonoAsociado.activo = false;
+      abonoAsociado.vehiculo = null;
+      await abonoAsociado.save({ session });
+
+      try {
+        const Outbox = require("../models/Outbox");
+        await Outbox.create({
+          method: "PATCH",
+          route: `/api/abonos/${abonoAsociado._id}`,
+          collection: "abonos",
+          status: "pending",
+          document: { _id: String(abonoAsociado._id), activo: false, vehiculo: null },
+          createdAt: new Date()
+        });
+      } catch (e) {
+        console.warn("[setAbonadoFlagByPatente] Outbox abono fallo:", e?.message);
+      }
+    }
+
+    await session.commitTransaction();
+    session.endSession();
+
+    const vehiculoActualizado = await Vehiculo.findOne({ patente }).lean();
+    return res.json({ msg: "Vehículo actualizado correctamente", vehiculo: formatVehiculo(vehiculoActualizado) });
+
   } catch (err) {
-    console.error("Error en setAbonadoFlagByPatente:", err);
+    await session.abortTransaction();
+    session.endSession();
+    console.error("💥 Error en setAbonadoFlagByPatente:", err);
     res.status(500).json({ msg: "Error del servidor" });
   }
 };

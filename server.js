@@ -304,6 +304,11 @@ app.get('/api/status', (_req, res) => {
     syncStatus
   });
 });
+app.get('/api/outbox/inspect', async (_req, res) => {
+  const Outbox = require('./models/Outbox');
+  const docs = await Outbox.find().sort({ createdAt: -1 }).limit(5).lean();
+  res.json(docs);
+});
 
 // Foto temporal cámara
 app.delete('/api/vehiculos/eliminar-foto-temporal', (_req, res) => {

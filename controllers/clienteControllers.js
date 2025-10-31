@@ -1,8 +1,16 @@
+// controllers/clienteControllers.js
+/* eslint-disable no-console */
 const mongoose = require("mongoose");
 const Cliente = require("../models/Cliente");
 const Vehiculo = require("../models/Vehiculo");
 const Movimiento = require("../models/Movimiento");
 const MovimientoCliente = require("../models/MovimientoCliente");
+
+// 🔧 Servicio de saneo de arrays (abonos inactivos → remover de cliente.abonos y cliente.vehiculos)
+const {
+  cleanAllClientesOnce,
+  cleanClienteById,
+} = require("../services/clienteAbonosService");
 
 const {
   Types: { ObjectId },
@@ -35,7 +43,12 @@ function toObjectIdSafe(v) {
   return undefined;
 }
 function getIdAny(x) {
-  return toObjectIdSafe(x) || toObjectIdSafe(x && x._id) || toObjectIdSafe(x && x.id) || x;
+  return (
+    toObjectIdSafe(x) ||
+    toObjectIdSafe(x && x._id) ||
+    toObjectIdSafe(x && x.id) ||
+    x
+  );
 }
 
 // ---------- Helpers de normalización ----------
@@ -92,6 +105,9 @@ function deriveEstadoAbono(doc) {
   return obj;
 }
 
+/* =======================================================
+   CREAR / ACTUALIZAR BÁSICO
+======================================================= */
 exports.crearClienteSiNoExiste = async (req, res) => {
   const datos = req.body;
   const { nombreApellido, dniCuitCuil } = datos;
@@ -171,14 +187,22 @@ exports.crearClienteSiNoExiste = async (req, res) => {
   }
 };
 
-// ✅ GET /api/clientes LIMPIO
+/* =======================================================
+   LISTADOS / CONSULTAS (con saneo automático previo)
+======================================================= */
+
+// ✅ GET /api/clientes → sanea TODOS los clientes antes de devolver
 exports.obtenerClientes = async (_req, res) => {
   try {
+    // Sanea arrays de todos los clientes (remueve abonos inactivos y sus vehiculos vinculados)
+    await cleanAllClientesOnce();
+
     const clientes = await Cliente.find()
       .populate("vehiculos", "_id patente")
       .populate({
         path: "abonos",
-        select: "_id patente tipoVehiculo precio activo fechaExpiracion cochera exclusiva piso",
+        select:
+          "_id patente tipoVehiculo precio activo fechaExpiracion cochera exclusiva piso",
       });
 
     // Ordenar los campos en la salida
@@ -243,12 +267,20 @@ exports.obtenerClientes = async (_req, res) => {
   }
 };
 
+// ✅ GET /api/clientes/nombre/:nombreApellido → sanea SOLO ese cliente antes de devolver
 exports.obtenerClientePorNombre = async (req, res) => {
   const { nombreApellido } = req.params;
   try {
+    // Primero localizamos el id (sin poblar)
+    const base = await Cliente.findOne({ nombreApellido }).select("_id").lean();
+    if (base?._id) {
+      await cleanClienteById(base._id);
+    }
+
     const cliente = await Cliente.findOne({ nombreApellido })
       .populate("vehiculos", "_id patente")
       .populate("abonos");
+
     if (!cliente) return res.status(404).json({ message: "Cliente no encontrado" });
     res.json(deriveEstadoAbono(cliente));
   } catch (err) {
@@ -256,9 +288,12 @@ exports.obtenerClientePorNombre = async (req, res) => {
   }
 };
 
+// ✅ GET /api/clientes/id/:id → sanea SOLO ese cliente antes de devolver
 exports.obtenerClientePorId = async (req, res) => {
   const { id } = req.params;
   try {
+    await cleanClienteById(id);
+
     const cliente = await Cliente.findById(id)
       .populate("vehiculos")
       .populate("movimientos")
@@ -269,6 +304,10 @@ exports.obtenerClientePorId = async (req, res) => {
     res.status(500).json({ message: "Error al buscar cliente por ID", error: err.message });
   }
 };
+
+/* =======================================================
+   ACCIONES
+======================================================= */
 
 exports.marcarClienteComoAbonado = async (req, res) => {
   const { nombreApellido } = req.body;
@@ -418,9 +457,7 @@ exports.renovarAbono = async (req, res) => {
 
     const movimiento = new Movimiento({
       cliente: id,
-      descripcion: `Renovación abono ${tipoVehiculo} (${mesesAbonar} mes${
-        mesesAbonar > 1 ? "es" : ""
-      })`,
+      descripcion: `Renovación abono ${tipoVehiculo} (${mesesAbonar} mes${mesesAbonar > 1 ? "es" : ""})`,
       monto: precio,
       tipoVehiculo,
       operador: operador || "Sistema",
@@ -433,9 +470,7 @@ exports.renovarAbono = async (req, res) => {
 
     const movimientoCliente = new MovimientoCliente({
       cliente: id,
-      descripcion: `Renovación abono ${tipoVehiculo} (${mesesAbonar} mes${
-        mesesAbonar > 1 ? "es" : ""
-      })`,
+      descripcion: `Renovación abono ${tipoVehiculo} (${mesesAbonar} mes${mesesAbonar > 1 ? "es" : ""})`,
       monto: precio,
       tipoVehiculo,
       operador: operador || "Sistema",
@@ -494,7 +529,8 @@ exports.actualizarClienteBasico = async (req, res) => {
       if (k in req.body) data[k] = req.body[k];
     });
 
-    const cRaw = req.body.cochera !== undefined ? normCochera(req.body.cochera) : undefined;
+    const cRaw =
+      req.body.cochera !== undefined ? normCochera(req.body.cochera) : undefined;
     const pRaw = req.body.piso !== undefined ? normPiso(req.body.piso) : undefined;
     const eRawPresent = req.body.exclusiva !== undefined;
 
