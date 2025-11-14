@@ -317,7 +317,7 @@ async function ensureVehiculoFromAbono(abonoDoc) {
 
 // Quita cualquier propiedad 'buffer' anidada y normaliza _id a string donde corresponda
 function deepClean(value) {
-  // ✅ PRESERVAR DATES
+  // 🧩 1) Fechas = intactas
   if (
     value instanceof Date ||
     (value &&
@@ -325,30 +325,34 @@ function deepClean(value) {
       Object.prototype.toString.call(value) === "[object Date]" &&
       !isNaN(new Date(value).getTime()))
   ) {
-    return value; // dejar Date como Date (JSON lo serializa a ISO)
+    return value;
   }
 
+  // 🧩 2) ObjectId → string
+  if (value instanceof ObjectId) {
+    return String(value);
+  }
+
+  // 🧩 3) Arrays recursivos
   if (Array.isArray(value)) {
     return value.map((v) => deepClean(v));
   }
 
+  // 🧩 4) Objetos planos sin buffer
   if (value && typeof value === "object") {
     const out = {};
     for (const [k, v] of Object.entries(value)) {
-      if (k === "buffer") continue; // basura
+      if (k === "buffer") continue; // evitar serialización basura
       if (k === "_id") {
-        try {
-          out._id = String(v);
-          continue;
-        } catch {
-          // fallthrough
-        }
+        out._id = String(v); // SIEMPRE string
+        continue;
       }
       out[k] = deepClean(v);
     }
     return out;
   }
 
+  // 🧩 5) Primitivos → directos
   return value;
 }
 
@@ -577,8 +581,12 @@ exports.createVehiculoSinEntrada = async (req, res) => {
 // Obtener todos los vehículos (🧹 limpio y ordenado)
 exports.getVehiculos = async (_req, res) => {
   try {
-    const vehiculos = await Vehiculo.find().lean();
-    const out = vehiculos.map((v) => formatVehiculo(v));
+    const vehiculos = await Vehiculo.find()
+      .populate("cliente", "_id nombreApellido dniCuitCuil email cochera exclusiva piso")
+      .populate("abono", "_id activo patente tipoVehiculo cochera piso exclusiva fechaExpiracion")
+      .populate("cocheraId"); // si existe en el modelo
+
+    const out = vehiculos.map((v) => formatVehiculo(v.toObject()));
     res.json(out);
   } catch (err) {
     res.status(500).json({ msg: "Error del servidor" });

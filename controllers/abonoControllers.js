@@ -714,9 +714,11 @@ exports.renovarAbono = async (req, res) => {
   }
 };
 
-/* =========================
-   REGISTRAR / AGREGAR ABONO (NUNCA crear movimientos acá)
-========================= */
+// =========================
+//   REGISTRAR / AGREGAR ABONO
+// =========================
+
+const { ensureCocheraInterno, asignarVehiculoInterno } = require('../services/cocheraService');
 
 exports.registrarAbono = async (req, res) => {
   console.log('📨 [registrarAbono] body:', JSON.stringify({ ...req.body, _files: !!req.files }, null, 2));
@@ -766,7 +768,7 @@ exports.registrarAbono = async (req, res) => {
 
     const pat = String(patente).trim().toUpperCase();
 
-    // 🧠 Cliente: buscar/crear (inline robusto para evitar ReferenceError)
+    // 🧠 Cliente: buscar/crear
     let cliente = null;
     const anyClienteId = clienteIdBody || clienteIdAlt;
     if (anyClienteId) {
@@ -776,7 +778,6 @@ exports.registrarAbono = async (req, res) => {
       cliente = await Cliente.findOne({ dniCuitCuil: String(dniCuitCuil).trim() }, null, sopt);
     }
     if (!cliente) {
-      // crear
       const nuevo = new Cliente({
         nombreApellido: String(nombreApellido).trim(),
         dniCuitCuil: String(dniCuitCuil).trim(),
@@ -800,7 +801,7 @@ exports.registrarAbono = async (req, res) => {
     if (!cliente) throw new Error('No se pudo obtener/crear cliente');
     if (!session) created.cliente = cliente;
 
-    // Fotos (YA VIENEN MAPEADAS A RUTA WEB FINAL)
+    // Fotos (YA VIENEN MAPEADAS)
     const fotoSeguro       = buildFotoPath(req, 'fotoSeguro');
     const fotoDNI          = buildFotoPath(req, 'fotoDNI');
     const fotoCedulaVerde  = buildFotoPath(req, 'fotoCedulaVerde');
@@ -829,7 +830,7 @@ exports.registrarAbono = async (req, res) => {
       console.log('🔗 Vehículo actualizado/vinculado:', vehiculo._id);
     }
 
-    // === 💰 Precio robusto por método + tier (doble intento + fallback opcional) ===
+    // === 💰 Precio robusto ===
     let baseNuevo;
     try {
       const r = await resolverPrecioSeguro({
@@ -889,14 +890,13 @@ exports.registrarAbono = async (req, res) => {
     if (!session) created.abono = AbonoModelo;
     console.log('🧾 Abono creado:', AbonoModelo._id);
 
-    // Vinculaciones
+    // Vinculaciones Cliente ↔ Vehículo ↔ Abono
     vehiculo.abono = AbonoModelo._id;
     await vehiculo.save(sopt);
 
     cliente.abonado = true;
     cliente.finAbono = multi.venceEl;
 
-    // Actualizar "tipo" del cliente si corresponde
     if (baseNuevo >= maxBase) {
       cliente.precioAbono = (tipoVehiculo || '').toLowerCase();
     }
@@ -910,7 +910,24 @@ exports.registrarAbono = async (req, res) => {
     await cliente.save(sopt);
     console.log('🔁 Cliente vinculado a abono/vehículo');
 
-    // ❌ NUNCA crear Movimiento aquí (lo hace movimientoControllers desde el front).
+    // ============================================================
+    //  🔥 COCHERA REAL (ÚNICO AGREGADO NECESARIO)
+    // ============================================================
+    const cocheraReal = await ensureCocheraInterno({
+      clienteId: cliente._id,
+      tipo: cochera,
+      piso,
+      exclusiva,
+      session
+    });
+
+    await asignarVehiculoInterno({
+      cocheraId: cocheraReal._id,
+      vehiculoId: vehiculo._id,
+      session
+    });
+
+    // ============================================================
 
     if (session) {
       await session.commitTransaction();
@@ -933,6 +950,7 @@ exports.registrarAbono = async (req, res) => {
       abono: AbonoModelo,
       vehiculo,
       cliente: clientePopulado,
+      cochera: cocheraReal,   // opcional devolverla
       multi: {
         mesesAbonar: multi.meses,
         proporcionalMesActual: multi.proporcionalMesActual,
@@ -949,7 +967,6 @@ exports.registrarAbono = async (req, res) => {
       session.endSession();
       console.log('↩️ Transacción abort');
     } else {
-      // Rollback compensatorio
       try {
         if (created.abono)    await Abono.deleteOne({ _id: created.abono._id });
         if (created.vehiculo) await Vehiculo.deleteOne({ _id: created.vehiculo._id });

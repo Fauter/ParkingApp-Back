@@ -1,4 +1,3 @@
-// controllers/clienteControllers.js
 /* eslint-disable no-console */
 const mongoose = require("mongoose");
 const Cliente = require("../models/Cliente");
@@ -6,17 +5,16 @@ const Vehiculo = require("../models/Vehiculo");
 const Movimiento = require("../models/Movimiento");
 const MovimientoCliente = require("../models/MovimientoCliente");
 
-// 🔧 Servicio de saneo de arrays (abonos inactivos → remover de cliente.abonos y cliente.vehiculos)
-const {
-  cleanAllClientesOnce,
-  cleanClienteById,
-} = require("../services/clienteAbonosService");
+// 🔧 Servicio de saneo (tu sistema actual)
+const { cleanAllClientesOnce, cleanClienteById } = require("../services/clienteAbonosService");
 
 const {
   Types: { ObjectId },
 } = mongoose;
 
-// === Cast robusto para ObjectId (string, Buffer, {buffer:{…}}, {_id}, ObjectId)
+/* =======================================================
+   HELPERS DE CAST
+======================================================= */
 function toObjectIdSafe(v) {
   if (!v) return undefined;
   if (v instanceof ObjectId) return v;
@@ -42,6 +40,7 @@ function toObjectIdSafe(v) {
   }
   return undefined;
 }
+
 function getIdAny(x) {
   return (
     toObjectIdSafe(x) ||
@@ -51,7 +50,9 @@ function getIdAny(x) {
   );
 }
 
-// ---------- Helpers de normalización ----------
+/* =======================================================
+   NORMALIZADORES (solo campos históricos)
+======================================================= */
 function normCochera(raw) {
   const v = String(raw || "").trim().toLowerCase();
   if (v === "fija") return "Fija";
@@ -65,7 +66,9 @@ function normPiso(raw) {
   return String(raw || "").trim();
 }
 
-// === Fechas auxiliares ===
+/* =======================================================
+   FECHAS AUXILIARES
+======================================================= */
 function clampInt(n, min, max) {
   const v = Number(n);
   if (!Number.isFinite(v)) return min;
@@ -79,7 +82,9 @@ function getUltimoDiaMes(baseDate = new Date(), offsetMonths = 0) {
   return d;
 }
 
-// === Derivar estado de abono por fecha (no persiste, solo adorna la respuesta) ===
+/* =======================================================
+   ESTADO DE ABONO
+======================================================= */
 function deriveEstadoAbono(doc) {
   if (!doc) return doc;
   const now = new Date();
@@ -101,22 +106,18 @@ function deriveEstadoAbono(doc) {
   } else {
     obj.abonado = false;
   }
-
   return obj;
 }
 
 /* =======================================================
-   CREAR / ACTUALIZAR BÁSICO
+   CREAR / ACTUALIZAR
 ======================================================= */
 exports.crearClienteSiNoExiste = async (req, res) => {
   const datos = req.body;
   const { nombreApellido, dniCuitCuil } = datos;
 
-  if (!nombreApellido || typeof nombreApellido !== "string" || nombreApellido.trim() === "") {
-    return res.status(400).json({ message: 'El campo "nombreApellido" es obligatorio.' });
-  }
-  if (!dniCuitCuil || typeof dniCuitCuil !== "string" || dniCuitCuil.trim() === "") {
-    return res.status(400).json({ message: 'El campo "dniCuitCuil" es obligatorio.' });
+  if (!nombreApellido || !dniCuitCuil) {
+    return res.status(400).json({ message: "Campos obligatorios faltantes" });
   }
 
   try {
@@ -136,14 +137,14 @@ exports.crearClienteSiNoExiste = async (req, res) => {
       cliente = new Cliente({
         nombreApellido: nombre,
         dniCuitCuil: dni,
-        domicilio: String(datos.domicilio || ""),
-        localidad: String(datos.localidad || ""),
-        telefonoParticular: String(datos.telefonoParticular || ""),
-        telefonoEmergencia: String(datos.telefonoEmergencia || ""),
-        domicilioTrabajo: String(datos.domicilioTrabajo || ""),
-        telefonoTrabajo: String(datos.telefonoTrabajo || ""),
+        domicilio: datos.domicilio || "",
+        localidad: datos.localidad || "",
+        telefonoParticular: datos.telefonoParticular || "",
+        telefonoEmergencia: datos.telefonoEmergencia || "",
+        domicilioTrabajo: datos.domicilioTrabajo || "",
+        telefonoTrabajo: datos.telefonoTrabajo || "",
         email,
-        precioAbono: String(datos.precioAbono || ""),
+        precioAbono: datos.precioAbono || "",
         cochera,
         exclusiva,
         piso,
@@ -163,6 +164,7 @@ exports.crearClienteSiNoExiste = async (req, res) => {
       "email",
       "nombreApellido",
     ];
+
     campos.forEach((k) => {
       if (datos[k] !== undefined && datos[k] !== null && String(datos[k]).trim() !== "") {
         cliente[k] = String(datos[k]).trim();
@@ -188,98 +190,37 @@ exports.crearClienteSiNoExiste = async (req, res) => {
 };
 
 /* =======================================================
-   LISTADOS / CONSULTAS (con saneo automático previo)
+   CONSULTAS
 ======================================================= */
 
-// ✅ GET /api/clientes → sanea TODOS los clientes antes de devolver
 exports.obtenerClientes = async (_req, res) => {
   try {
-    // Sanea arrays de todos los clientes (remueve abonos inactivos y sus vehiculos vinculados)
     await cleanAllClientesOnce();
-
     const clientes = await Cliente.find()
       .populate("vehiculos", "_id patente")
       .populate({
         path: "abonos",
-        select:
-          "_id patente tipoVehiculo precio activo fechaExpiracion cochera exclusiva piso",
+        select: "-cliente -vehiculo"
       });
 
-    // Ordenar los campos en la salida
-    const out = clientes.map((c) => {
-      const doc = deriveEstadoAbono(c);
-      const {
-        _id,
-        nombreApellido,
-        dniCuitCuil,
-        email,
-        domicilio,
-        localidad,
-        telefonoParticular,
-        telefonoEmergencia,
-        domicilioTrabajo,
-        telefonoTrabajo,
-        abonado,
-        finAbono,
-        precioAbono,
-        cochera,
-        exclusiva,
-        piso,
-        balance,
-        vehiculos,
-        abonos,
-        movimientos,
-        createdAt,
-        updatedAt,
-        __v,
-      } = doc;
-
-      return {
-        _id,
-        nombreApellido,
-        dniCuitCuil,
-        email,
-        domicilio,
-        localidad,
-        telefonoParticular,
-        telefonoEmergencia,
-        domicilioTrabajo,
-        telefonoTrabajo,
-        abonado,
-        finAbono,
-        precioAbono,
-        cochera,
-        exclusiva,
-        piso,
-        balance,
-        vehiculos,
-        abonos,
-        movimientos,
-        createdAt,
-        updatedAt,
-        __v,
-      };
-    });
-
-    res.status(200).json(out);
+    res.status(200).json(clientes);
   } catch (err) {
     res.status(500).json({ message: "Error al obtener clientes", error: err.message });
   }
 };
 
-// ✅ GET /api/clientes/nombre/:nombreApellido → sanea SOLO ese cliente antes de devolver
 exports.obtenerClientePorNombre = async (req, res) => {
   const { nombreApellido } = req.params;
   try {
-    // Primero localizamos el id (sin poblar)
     const base = await Cliente.findOne({ nombreApellido }).select("_id").lean();
-    if (base?._id) {
-      await cleanClienteById(base._id);
-    }
+    if (base?._id) await cleanClienteById(base._id);
 
     const cliente = await Cliente.findOne({ nombreApellido })
       .populate("vehiculos", "_id patente")
-      .populate("abonos");
+      .populate({
+        path: "abonos",
+        select: "-cliente -vehiculo"
+      });
 
     if (!cliente) return res.status(404).json({ message: "Cliente no encontrado" });
     res.json(deriveEstadoAbono(cliente));
@@ -288,20 +229,23 @@ exports.obtenerClientePorNombre = async (req, res) => {
   }
 };
 
-// ✅ GET /api/clientes/id/:id → sanea SOLO ese cliente antes de devolver
 exports.obtenerClientePorId = async (req, res) => {
   const { id } = req.params;
   try {
     await cleanClienteById(id);
-
     const cliente = await Cliente.findById(id)
       .populate("vehiculos")
       .populate("movimientos")
-      .populate("abonos");
+      .populate({
+        path: "abonos",
+        select: "-cliente -vehiculo"
+      });
+
     if (!cliente) return res.status(404).json({ message: "Cliente no encontrado" });
+
     res.json(deriveEstadoAbono(cliente));
   } catch (err) {
-    res.status(500).json({ message: "Error al buscar cliente por ID", error: err.message });
+    res.status(500).json({ message: "Error al obtener cliente por ID", error: err.message });
   }
 };
 
@@ -311,8 +255,8 @@ exports.obtenerClientePorId = async (req, res) => {
 
 exports.marcarClienteComoAbonado = async (req, res) => {
   const { nombreApellido } = req.body;
-  if (!nombreApellido || typeof nombreApellido !== "string" || nombreApellido.trim() === "") {
-    return res.status(400).json({ message: 'El campo "nombreApellido" es obligatorio.' });
+  if (!nombreApellido) {
+    return res.status(400).json({ message: "nombreApellido es obligatorio" });
   }
   try {
     const cliente = await Cliente.findOneAndUpdate(
@@ -320,8 +264,8 @@ exports.marcarClienteComoAbonado = async (req, res) => {
       { abonado: true },
       { new: true }
     );
-    if (!cliente) return res.status(404).json({ message: "Cliente no encontrado." });
-    res.status(200).json({ message: "Cliente marcado como abonado.", cliente });
+    if (!cliente) return res.status(404).json({ message: "Cliente no encontrado" });
+    res.status(200).json({ message: "Cliente marcado como abonado", cliente });
   } catch (err) {
     res.status(500).json({ message: "Error al actualizar cliente", error: err.message });
   }
@@ -333,14 +277,15 @@ exports.actualizarPrecioAbono = async (req, res) => {
   try {
     const cliente = await Cliente.findById(id);
     if (!cliente) return res.status(404).json({ message: "Cliente no encontrado" });
+
     if (tipoVehiculo) {
       cliente.precioAbono = tipoVehiculo;
       await cliente.save();
-      return res.json({ message: "Precio de abono actualizado correctamente", cliente });
     }
-    res.json(cliente);
+
+    res.json({ message: "Precio actualizado", cliente });
   } catch (err) {
-    res.status(500).json({ message: "Error al actualizar precio de abono", error: err.message });
+    res.status(500).json({ message: "Error", error: err.message });
   }
 };
 
@@ -352,6 +297,7 @@ exports.desabonarCliente = async (req, res) => {
       { $set: { abonado: false, finAbono: null } },
       { new: true }
     ).populate("vehiculos abonos movimientos");
+
     if (!cliente) return res.status(404).json({ message: "Cliente no encontrado" });
 
     if (cliente.vehiculos?.length) {
@@ -363,6 +309,7 @@ exports.desabonarCliente = async (req, res) => {
         })
       );
     }
+
     if (cliente.abonos?.length) {
       await Promise.all(
         cliente.abonos.map(async (abono) => {
@@ -372,10 +319,7 @@ exports.desabonarCliente = async (req, res) => {
       );
     }
 
-    res.json({
-      message: "Cliente desabonado correctamente",
-      cliente: await Cliente.findById(id).populate("vehiculos abonos movimientos"),
-    });
+    res.json({ message: "Cliente desabonado", cliente });
   } catch (err) {
     res.status(500).json({ message: "Error al desabonar cliente", error: err.message });
   }
@@ -389,20 +333,13 @@ exports.renovarAbono = async (req, res) => {
     const { precio, metodoPago, factura, operador, patente, tipoVehiculo } = req.body;
     const mesesAbonar = clampInt(req.body?.mesesAbonar ?? 1, 1, 12);
 
-    const cocheraBody = normCochera(req.body.cochera);
-    const exclusivaBody = req.body.exclusiva !== undefined ? Boolean(req.body.exclusiva) : undefined;
-    const pisoBody = req.body.piso !== undefined ? normPiso(req.body.piso) : undefined;
-
     if (!precio || isNaN(precio)) {
       await session.abortTransaction();
-      return res.status(400).json({ message: "Precio inválido o faltante" });
+      return res.status(400).json({ message: "Precio inválido" });
     }
-    if (
-      !metodoPago ||
-      !["Efectivo", "Transferencia", "Débito", "Crédito", "QR"].includes(metodoPago)
-    ) {
+    if (!metodoPago) {
       await session.abortTransaction();
-      return res.status(400).json({ message: "Método de pago inválido" });
+      return res.status(400).json({ message: "Método de pago requerido" });
     }
     if (!tipoVehiculo) {
       await session.abortTransaction();
@@ -416,13 +353,13 @@ exports.renovarAbono = async (req, res) => {
     }
 
     const hoy = new Date();
-    const ultimoDiaMesExtendido = getUltimoDiaMes(hoy, mesesAbonar - 1);
+    const ultimoDia = getUltimoDiaMes(hoy, mesesAbonar - 1);
 
     if (cliente.abonos?.length) {
       await Promise.all(
         cliente.abonos.map(async (abono) => {
           abono.activo = true;
-          abono.fechaExpiracion = ultimoDiaMesExtendido;
+          abono.fechaExpiracion = ultimoDia;
           await abono.save({ session });
         })
       );
@@ -437,27 +374,15 @@ exports.renovarAbono = async (req, res) => {
     }
 
     cliente.abonado = true;
-    cliente.finAbono = ultimoDiaMesExtendido;
+    cliente.finAbono = ultimoDia;
     cliente.precioAbono = tipoVehiculo;
     cliente.updatedAt = new Date();
-
-    if (cocheraBody !== "") {
-      cliente.cochera = cocheraBody;
-      if (cliente.cochera !== "Fija") cliente.exclusiva = false;
-      if (exclusivaBody !== undefined)
-        cliente.exclusiva = normExclusiva(exclusivaBody, cliente.cochera);
-    } else if (exclusivaBody !== undefined) {
-      cliente.exclusiva = normExclusiva(exclusivaBody, cliente.cochera);
-    }
-    if (pisoBody !== undefined) {
-      cliente.piso = pisoBody;
-    }
 
     await cliente.save({ session });
 
     const movimiento = new Movimiento({
       cliente: id,
-      descripcion: `Renovación abono ${tipoVehiculo} (${mesesAbonar} mes${mesesAbonar > 1 ? "es" : ""})`,
+      descripcion: `Renovación abono ${tipoVehiculo} (${mesesAbonar} mes/es)`,
       monto: precio,
       tipoVehiculo,
       operador: operador || "Sistema",
@@ -470,7 +395,7 @@ exports.renovarAbono = async (req, res) => {
 
     const movimientoCliente = new MovimientoCliente({
       cliente: id,
-      descripcion: `Renovación abono ${tipoVehiculo} (${mesesAbonar} mes${mesesAbonar > 1 ? "es" : ""})`,
+      descripcion: `Renovación abono ${tipoVehiculo} (${mesesAbonar} mes/es)`,
       monto: precio,
       tipoVehiculo,
       operador: operador || "Sistema",
@@ -487,7 +412,7 @@ exports.renovarAbono = async (req, res) => {
 
     const clienteActualizado = await Cliente.findById(id).populate("abonos");
     res.status(200).json({
-      message: "Abono renovado exitosamente.",
+      message: "Abono renovado",
       cliente: clienteActualizado,
       movimiento,
       movimientoCliente,
@@ -504,7 +429,7 @@ exports.renovarAbono = async (req, res) => {
 exports.eliminarTodosLosClientes = async (_req, res) => {
   try {
     await Cliente.deleteMany({});
-    res.status(200).json({ message: "Todos los clientes fueron eliminados." });
+    res.status(200).json({ message: "Clientes eliminados" });
   } catch (err) {
     res.status(500).json({ message: "Error al eliminar clientes", error: err.message });
   }
@@ -552,9 +477,7 @@ exports.actualizarClienteBasico = async (req, res) => {
     if (eRawPresent) {
       cliente.exclusiva = normExclusiva(req.body.exclusiva, cliente.cochera);
     }
-    if (pRaw !== undefined) {
-      cliente.piso = pRaw;
-    }
+    if (pRaw !== undefined) cliente.piso = pRaw;
 
     await cliente.save();
     return res.json({ message: "Cliente actualizado", cliente });

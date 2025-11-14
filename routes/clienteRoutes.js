@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const Cliente = require('../models/Cliente');
+
 const {
   obtenerClientes,
   obtenerClientePorNombre,
@@ -11,21 +12,25 @@ const {
   actualizarPrecioAbono,
   desabonarCliente,
   renovarAbono,
-  actualizarClienteBasico
+  actualizarClienteBasico,
 } = require('../controllers/clienteControllers');
 
+// === LISTADOS / CONSULTAS ===
 router.get('/', obtenerClientes);
 router.get('/nombre/:nombreApellido', obtenerClientePorNombre);
 router.get('/id/:id', obtenerClientePorId);
+
+// === CREAR / ACTUALIZAR ===
 router.post('/', crearClienteSiNoExiste);
 router.put('/marcar-abonado', marcarClienteComoAbonado);
 router.put('/:id/actualizar-precio-abono', actualizarPrecioAbono);
 router.put('/:id/desabonar', desabonarCliente);
 router.post('/:id/renovar-abono', renovarAbono);
 
-// Update básico (nombre, contactos, cochera/exclusiva/piso)
+// === UPDATE básico (nombre, contactos, cochera/exclusiva/piso) ===
 router.put('/:id', actualizarClienteBasico);
 
+// === BORRADO ===
 router.delete('/', async (_req, res) => {
   try {
     const { deletedCount } = await Cliente.deleteMany({});

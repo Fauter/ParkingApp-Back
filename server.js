@@ -19,8 +19,6 @@ app.disable('x-powered-by');
 
 /* =========================================
    ⏱️ Prefijo de fecha y hora para TODOS los logs
-   Formato: [dd/MM HH:mm:ss] Mensaje...
-   (sin año, compacto y al inicio)
 ========================================= */
 (function patchConsoleTimestamps() {
   const orig = {
@@ -54,7 +52,7 @@ function resolveRemoteApiBase() {
   return `https://${host}`;
 }
 
-// ---------- Config estándar de precios (efectivo + otros) ----------
+// ---------- Config estándar de precios ----------
 (function ensurePreciosEnv() {
   const base = `${resolveRemoteApiBase()}/api/precios`;
 
@@ -77,17 +75,15 @@ function resolveRemoteApiBase() {
   }
 })();
 
-// Helper: normaliza módulos de rutas que exportan {router}, default, etc.
+// Helper: normaliza módulos de rutas
 const normalizeRouter = (m) => {
   if (typeof m === 'function') return m;
-  if (m && typeof m === 'object') {
-    return m.router || m.default || m.routes || m.route || m;
-  }
+  if (m && typeof m === 'object') return m.router || m.default || m.routes || m.route || m;
   return m;
 };
 
 // =====================
-// 🛡️ CORS robusto
+// 🛡️ CORS
 // =====================
 const DEFAULT_ALLOWED = [
   'http://localhost:3000',
@@ -112,14 +108,18 @@ function compileOriginPatterns(list) {
     const s = item.replace(/\/+$/, '');
     if (s === 'null') return { type: 'null' };
     if (s.endsWith('://')) return { type: 'scheme', value: s };
-    const rx = new RegExp('^' + s.replace(/[.*+?^${}()|[\]\\]/g, m => '\\' + m).replace(/\\\*/g, '.*') + '$');
+    const rx = new RegExp(
+      '^' + s
+        .replace(/[.*+?^${}()|[\]\\]/g, m => '\\' + m)
+        .replace(/\\\*/g, '.*') + '$'
+    );
     return { type: 'regex', value: rx };
   });
 }
 const originPatterns = compileOriginPatterns(allowedOrigins);
 
 function isAllowedOrigin(origin) {
-  if (!origin) return true; // requests sin Origin (curl, same-origin) => OK
+  if (!origin) return true;
   if (origin === 'null') return true;
   for (const rule of originPatterns) {
     if (rule.type === 'null' && origin === 'null') return true;
@@ -130,29 +130,18 @@ function isAllowedOrigin(origin) {
 }
 
 const corsConfig = {
-  origin: function (origin, callback) {
-    if (isAllowedOrigin(origin)) return callback(null, true);
-    return callback(new Error('No permitido por CORS'));
+  origin(origin, cb) {
+    if (isAllowedOrigin(origin)) return cb(null, true);
+    return cb(new Error('No permitido por CORS'));
   },
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: [
-    'Content-Type',
-    'Authorization',
-    'X-Requested-With',
-    'Accept',
-    'Origin',
-    'Cache-Control',
-    'Pragma'
-  ],
-  exposedHeaders: [
-    'Content-Disposition',
-    'X-Request-Id'
-  ]
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','X-Requested-With','Accept','Origin','Cache-Control','Pragma'],
+  exposedHeaders: ['Content-Disposition','X-Request-Id']
 };
 
 app.use(cors(corsConfig));
-app.options('*', cors(corsConfig)); // preflights
+app.options('*', cors(corsConfig));
 
 console.log('[CORS] allowed origins:', allowedOrigins);
 
@@ -163,8 +152,8 @@ app.use(express.json({ limit: BODY_LIMIT }));
 app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 
 /* =======================================================
-   📂 UPLOADS (estáticos) — con carpeta webcamPromos
-   ======================================================= */
+   📂 UPLOADS
+======================================================== */
 const baseUploads = process.env.UPLOADS_BASE || path.join(__dirname, 'uploads');
 const uploadsDir = path.resolve(baseUploads);
 const fotosDir = path.join(uploadsDir, 'fotos');
@@ -196,20 +185,14 @@ console.log('[uploads] auditorias  =', auditoriasDir);
 console.log('[camara ] sacarfoto   =', sacarfotoDir);
 console.log('===================================');
 
-/* =======================================================
-   LOGS PRECIOS (diagnóstico)
-========================================================== */
 console.log('========== LOGS PRECIOS ==========');
 console.log(`[precios] REMOTE_API_BASE=${resolveRemoteApiBase()}`);
 console.log(`[precios] PRECIOS_REMOTE_URL=${process.env.PRECIOS_REMOTE_URL}`);
 console.log(`[precios] PRECIOS_REMOTE_URL_OTROS=${process.env.PRECIOS_REMOTE_URL_OTROS}`);
 console.log(`[precios] PRECIOS_CACHE_FILE=${process.env.PRECIOS_CACHE_FILE}`);
-if (String(process.env.PRECIOS_DEBUG || '').trim() === '1') {
-  console.log('[precios] DEBUG habilitado (PRECIOS_DEBUG=1)');
-}
 console.log('===================================');
 
-// ⚠️ Orden IMPORTA
+// Estáticos
 app.use('/uploads/fotos', express.static(fotosDir, {
   index: false,
   dotfiles: 'deny',
@@ -219,7 +202,6 @@ app.use('/uploads/fotos', express.static(fotosDir, {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   }
 }));
-
 app.use('/uploads/auditorias', express.static(auditoriasDir, {
   index: false,
   dotfiles: 'deny',
@@ -227,7 +209,6 @@ app.use('/uploads/auditorias', express.static(auditoriasDir, {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   }
 }));
-
 app.use('/uploads', express.static(uploadsDir, {
   index: false,
   dotfiles: 'deny',
@@ -235,7 +216,6 @@ app.use('/uploads', express.static(uploadsDir, {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   }
 }));
-
 app.use('/camara/sacarfoto', express.static(sacarfotoDir, {
   index: false,
   dotfiles: 'deny',
@@ -247,27 +227,24 @@ app.use('/camara/sacarfoto', express.static(sacarfotoDir, {
 let syncStatus = { lastRun: null, lastError: null, online: false, pendingOutbox: 0, lastPullCounts: {} };
 
 // =====================
-// 🔄 Sincronización de counters
+// 🔄 Sincronización counters
 // =====================
 async function sincronizarCounters() {
   const Ticket = require('./models/Ticket');
   const Counter = require('./models/Counter');
 
-  // Max local robusto
   let localMax = 0;
   try {
-    const localAgg = await Ticket.collection.aggregate([
-      { $project: { t: { $convert: { input: '$ticket', to: 'double', onError: 0, onNull: 0 } } } },
-      { $group: { _id: null, max: { $max: '$t' } } }
+    const agg = await Ticket.collection.aggregate([
+      { $project: { t: { $convert: { input: '$ticket', to: 'double', onError: 0, onNull: 0 }}}},
+      { $group: { _id: null, max: { $max: '$t' }}}
     ]).toArray();
-    if (localAgg[0] && Number.isFinite(localAgg[0].max)) localMax = localAgg[0].max;
+    if (agg[0] && Number.isFinite(agg[0].max)) localMax = agg[0].max;
   } catch {
-    const localMaxDoc = await Ticket.findOne().sort({ ticket: -1 }).select('ticket').lean();
-    localMax = (localMaxDoc && typeof localMaxDoc.ticket === 'number' && !isNaN(localMaxDoc.ticket))
-      ? localMaxDoc.ticket : 0;
+    const doc = await Ticket.findOne().sort({ ticket: -1 }).select('ticket').lean();
+    localMax = (doc && typeof doc.ticket === 'number') ? doc.ticket : 0;
   }
 
-  // Max remoto
   const atlasUri = process.env.MONGO_URI;
   const remoteDbName = process.env.MONGO_DBNAME_REMOTE || process.env.MONGO_DBNAME || 'parking';
 
@@ -275,13 +252,13 @@ async function sincronizarCounters() {
   if (atlasUri) {
     let client = null;
     try {
-      client = new (require('mongodb').MongoClient)(atlasUri, { serverSelectionTimeoutMS: 2500 });
+      client = new MongoClient(atlasUri, { serverSelectionTimeoutMS: 2500 });
       await client.connect();
-      const remoteAgg = await client.db(remoteDbName).collection('tickets').aggregate([
-        { $project: { t: { $convert: { input: '$ticket', to: 'double', onError: 0, onNull: 0 } } } },
-        { $group: { _id: null, max: { $max: '$t' } } }
+      const agg2 = await client.db(remoteDbName).collection('tickets').aggregate([
+        { $project: { t: { $convert: { input: '$ticket', to: 'double', onError: 0, onNull: 0 }}}},
+        { $group: { _id: null, max: { $max: '$t' }}}
       ]).toArray();
-      if (remoteAgg[0] && Number.isFinite(remoteAgg[0].max)) remoteMax = remoteAgg[0].max;
+      if (agg2[0] && Number.isFinite(agg2[0].max)) remoteMax = agg2[0].max;
     } catch (e) {
       console.warn('[server] no se pudo leer max ticket remoto:', e.message);
     } finally {
@@ -290,11 +267,11 @@ async function sincronizarCounters() {
   }
 
   const maxNumero = Math.max(localMax, remoteMax || 0);
-  const seqActual = await Counter.ensureAtLeast('ticket', maxNumero);
-  console.log(`✅ Counter 'ticket' sincronizado. seq actual: ${seqActual} (>= ${maxNumero})`);
+  const seq = await Counter.ensureAtLeast('ticket', maxNumero);
+  console.log(`✅ Counter 'ticket' sincronizado. seq actual: ${seq} (>= ${maxNumero})`);
 }
 
-// Health
+// Status
 app.get('/api/status', (_req, res) => {
   res.json({
     online: true,
@@ -304,6 +281,7 @@ app.get('/api/status', (_req, res) => {
     syncStatus
   });
 });
+
 app.get('/api/outbox/inspect', async (_req, res) => {
   const Outbox = require('./models/Outbox');
   const docs = await Outbox.find().sort({ createdAt: -1 }).limit(5).lean();
@@ -356,6 +334,10 @@ app.get('/api/sync/inspect', async (req, res) => {
   }
 });
 
+
+// =====================================================
+// 🔥 MAIN
+// =====================================================
 async function main() {
   try {
     const { uri } = await startLocalMongo();
@@ -371,17 +353,20 @@ async function main() {
 
     await sincronizarCounters();
 
-    // Cron
+    // Cron jobs
     require('./cron/turnoChecker');
     require('./cron/abonoChecker');
 
-    // A PARTIR DE ACÁ se capturan requests para Outbox
+    // Outbox middleware
     app.use(offlineMiddleware);
 
-    // Rutas
+    // ======================
+    // ROUTES
+    // ======================
     const authRoutes               = require('./routes/authRoutes.js');
     const vehiculoRoutes           = require('./routes/vehiculoRoutes');
     const abonoRoutes              = require('./routes/abonoRoutes');
+    const cocheraRoutes            = require('./routes/cocheraRoutes');
     const tipoVehiculoRoutes       = require('./routes/tipoVehiculoRoutes');
     const movimientoRoutes         = require('./routes/movimientoRoutes');
     const movimientoClienteRoutes  = require('./routes/movimientoClienteRoutes');
@@ -403,9 +388,11 @@ async function main() {
     const impresoraRoutes          = require('./routes/impresoraRoutes');
     const configRoutes             = require('./routes/configRoutes');
 
+
     app.use('/api/auth',               normalizeRouter(authRoutes));
     app.use('/api/vehiculos',          normalizeRouter(vehiculoRoutes));
     app.use('/api/abonos',             normalizeRouter(abonoRoutes));
+    app.use('/api/cocheras',           normalizeRouter(cocheraRoutes));
     app.use('/api/tipos-vehiculo',     normalizeRouter(tipoVehiculoRoutes));
     app.use('/api/movimientos',        normalizeRouter(movimientoRoutes));
     app.use('/api/movimientosClientes',normalizeRouter(movimientoClienteRoutes));
@@ -429,7 +416,7 @@ async function main() {
     app.use('/api/impresoras',         normalizeRouter(impresoraRoutes));
     app.use('/api/config',             normalizeRouter(configRoutes));
 
-    // Front estático (producción para Electron)
+    // Front-end (producción)
     if ((process.env.NODE_ENV || '').toLowerCase() === 'production') {
       const clientPath = path.join(__dirname, '..', 'front-end', 'dist');
       const indexPath = path.join(clientPath, 'index.html');
@@ -459,8 +446,11 @@ async function main() {
     process.on('unhandledRejection', (e) => { console.error('[UNHANDLED REJECTION]', e); });
 
     const PORT = process.env.PORT || 5000;
-    app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Servidor corriendo en http://0.0.0.0:${PORT}`));
+    app.listen(PORT, '0.0.0.0', () =>
+      console.log(`🚀 Servidor corriendo en http://0.0.0.0:${PORT}`)
+    );
 
+    // SYNC
     if (process.env.MONGO_URI) {
       const envPull = (process.env.SYNC_PULL || '').trim();
       const pullAll = (envPull === '' || envPull === '*' || envPull.toUpperCase() === 'ALL');
@@ -482,6 +472,7 @@ async function main() {
       };
 
       console.log(`[server] SYNC config => pullAll=${syncOpts.pullAll}, mirrorAll=${syncOpts.mirrorAll}, mirrorCollections=[${syncOpts.mirrorCollections.join(', ')}]`);
+
       const { startPeriodicSync } = require('./services/syncService');
       syncHandle = startPeriodicSync(process.env.MONGO_URI, syncOpts, (s) => {
         syncStatus = {
