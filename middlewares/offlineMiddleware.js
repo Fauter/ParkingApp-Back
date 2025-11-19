@@ -135,8 +135,9 @@ function ensureOperadorForCierre(candidate, req) {
 function pickDocumentForOutbox(method, collection, req, capturedBody) {
   const reqBody = (req && req.body && typeof req.body === 'object') ? req.body : null;
 
-  // 1) Elegir base: si la respuesta trae un doc válido (mejor si trae _id), usarla. Si es envelope o inválida, usar req.body
   let candidate = null;
+
+  // 1) Preferir lo que devolvió el controller SI tiene forma de documento
   if (looksLikeValidDocument(capturedBody) && !looksLikeEnvelope(capturedBody)) {
     candidate = capturedBody;
   } else if (reqBody && typeof reqBody === 'object') {
@@ -145,18 +146,47 @@ function pickDocumentForOutbox(method, collection, req, capturedBody) {
     candidate = {};
   }
 
-  // 2) Si la respuesta vino envuelta tipo {document: {...}} o similares, extraer
+  // 2) Desempaquetar "data", "document", etc.
   if (candidate && typeof candidate === 'object') {
     const keysToTry = ['document','result','data','item','payload','ticket','vehiculo','cliente'];
     for (const k of keysToTry) {
-      if (candidate[k] && typeof candidate[k] === 'object' && candidate[k]._id) {
-        candidate = candidate[k];
-        break;
+      if (candidate[k] && typeof candidate[k] === 'object') {
+        const inner = candidate[k];
+        if (inner._id) {
+          candidate = inner;
+          break;
+        }
       }
     }
   }
 
-  // 3) Merge conservador: NO perder _id de la respuesta. Copiamos desde req.body solo si faltan en candidate.
+  // 3) NO-DESTRUCTIVO PARA COCHERAS:
+  if (collection === 'cocheras') {
+
+    // A) Recuperar _id sí o sí
+    const id = (
+      candidate?._id ||
+      candidate?.id ||
+      reqBody?._id ||
+      reqBody?.id ||
+      null
+    );
+    const out = { _id: id };
+
+    // B) SOLO incluir campos que el usuario haya enviado
+    //    (evita mandar PATCH destructivos)
+    const FIELDS = ['tipo','piso','exclusiva'];
+    for (const f of FIELDS) {
+      if (reqBody && Object.prototype.hasOwnProperty.call(reqBody, f)) {
+        out[f] = reqBody[f];
+      }
+    }
+
+    // C) JAMÁS enviar cliente ni vehiculos desde outbox
+    return out;
+  }
+
+  // 4) Merge conservador para el resto de las colecciones
   if (reqBody && typeof reqBody === 'object') {
     const MERGE_KEYS = ['operador','cliente','vehiculo','abono','user','usuario','fecha','hora'];
     for (const k of MERGE_KEYS) {
@@ -166,22 +196,7 @@ function pickDocumentForOutbox(method, collection, req, capturedBody) {
     }
   }
 
-  // 4) Caso especial: cierresdecajas → asegurar operador (desde req.user si falta)
-  if (String(collection).toLowerCase() === 'cierresdecajas') {
-    candidate = ensureOperadorForCierre(candidate, req);
-  }
-
-  // 5) Aplanar refs pobladas
-  if (candidate && typeof candidate === 'object') {
-    candidate = flattenRefFields(candidate);
-  }
-
-  // 6) Limpieza final
-  if (candidate && typeof candidate === 'object') {
-    const { __v, _v, createdAt, updatedAt, ...cleanDoc } = candidate;
-    return cleanDoc;
-  }
-  return {};
+  return candidate;
 }
 
 module.exports = function offlineMiddleware(req, res, next) {

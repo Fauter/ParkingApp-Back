@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 const Cochera = require("../models/Cochera");
 const Cliente = require("../models/Cliente");
 const Vehiculo = require("../models/Vehiculo");
+const Abono = require("../models/Abono");
 
 const {
   Types: { ObjectId },
@@ -11,31 +12,24 @@ const {
 /* =======================================================
    HELPERS – NORMALIZACIÓN A PRUEBA DE BASURA
 ======================================================= */
-
 function normCochera(raw) {
   const v = String(raw || "").trim().toLowerCase();
   if (v === "fija") return "Fija";
   if (v === "movil" || v === "móvil") return "Móvil";
   return "";
 }
-
 function normPiso(raw) {
   return String(raw || "").trim();
 }
-
 function normExclusiva(raw, tipo) {
   if (tipo !== "Fija") return false;
-
   const s = String(raw ?? "").trim().toLowerCase();
-  if (["true", "1", "si", "sí", "yes", "y"].includes(s)) return true;
-
-  return false;
+  return ["true", "1", "si", "sí", "yes", "y"].includes(s);
 }
 
 /* =======================================================
-   🅿️ ENSURE COCHERA (IDEMPOTENTE y 100% Estable)
+   🅿️ ENSURE COCHERA (IDEMPOTENTE)
 ======================================================= */
-
 exports.ensureCochera = async (req, res) => {
   try {
     const { clienteId, tipo, piso, exclusiva } = req.body;
@@ -51,7 +45,6 @@ exports.ensureCochera = async (req, res) => {
     const pisoNorm = normPiso(piso);
     const exclusivaNorm = normExclusiva(exclusiva, tipoNorm);
 
-    // Buscar cochera idéntica
     let coch = await Cochera.findOne({
       cliente: clienteId,
       tipo: tipoNorm,
@@ -62,12 +55,11 @@ exports.ensureCochera = async (req, res) => {
     if (coch) {
       return res.json({
         message: "Cochera existente reutilizada",
+        data: coch,
         cocheraId: coch._id,
-        cochera: coch,
       });
     }
 
-    // Crear nueva
     coch = new Cochera({
       cliente: clienteId,
       tipo: tipoNorm,
@@ -78,10 +70,16 @@ exports.ensureCochera = async (req, res) => {
 
     await coch.save();
 
+    // registrar en cliente.cocheras[]
+    await Cliente.updateOne(
+      { _id: clienteId },
+      { $push: { cocheras: { cocheraId: coch._id } } }
+    );
+
     return res.status(201).json({
       message: "Cochera creada",
+      data: coch,
       cocheraId: coch._id,
-      cochera: coch,
     });
   } catch (err) {
     console.error("Error ensureCochera:", err);
@@ -92,7 +90,6 @@ exports.ensureCochera = async (req, res) => {
 /* =======================================================
    CRUD
 ======================================================= */
-
 exports.crearCochera = async (req, res) => {
   try {
     const { clienteId, tipo, piso, exclusiva } = req.body;
@@ -116,7 +113,7 @@ exports.crearCochera = async (req, res) => {
     });
 
     if (existente)
-      return res.json({ message: "Cochera ya existía", cochera: existente });
+      return res.json({ message: "Cochera ya existía", data: existente });
 
     const nueva = new Cochera({
       cliente: clienteId,
@@ -127,19 +124,27 @@ exports.crearCochera = async (req, res) => {
     });
 
     await nueva.save();
-    res.status(201).json({ message: "Cochera creada", cochera: nueva });
+
+    await Cliente.updateOne(
+      { _id: clienteId },
+      { $push: { cocheras: { cocheraId: nueva._id } } }
+    );
+
+    res.status(201).json({ message: "Cochera creada", data: nueva });
   } catch (err) {
     console.error("Error creando cochera:", err);
     res.status(500).json({ message: "Error interno", error: err.message });
   }
 };
 
+/* =======================================================
+   OBTENER COCHERAS
+======================================================= */
 exports.obtenerCocheras = async (_req, res) => {
   try {
     const data = await Cochera.find()
       .populate("cliente", "nombreApellido")
       .populate("vehiculos", "_id patente");
-
     res.status(200).json(data);
   } catch (err) {
     res.status(500).json({ message: "Error al obtener cocheras", error: err.message });
@@ -151,9 +156,7 @@ exports.obtenerCocheraPorId = async (req, res) => {
     const coch = await Cochera.findById(req.params.id)
       .populate("cliente", "nombreApellido")
       .populate("vehiculos", "_id patente");
-
     if (!coch) return res.status(404).json({ message: "Cochera no encontrada" });
-
     res.json(coch);
   } catch (err) {
     res.status(500).json({ message: "Error al obtener cochera", error: err.message });
@@ -163,29 +166,53 @@ exports.obtenerCocheraPorId = async (req, res) => {
 exports.obtenerCocherasPorCliente = async (req, res) => {
   try {
     const { clienteId } = req.params;
-
     const data = await Cochera.find({ cliente: clienteId })
       .populate("cliente", "nombreApellido")
       .populate("vehiculos", "_id patente");
-
     res.json(data);
   } catch (err) {
     res.status(500).json({ message: "Error al obtener cocheras del cliente", error: err.message });
   }
 };
 
+/* =======================================================
+   PATCH / PUT — NO DESTRUCTIVO
+======================================================= */
 exports.actualizarCochera = async (req, res) => {
   try {
     const { id } = req.params;
-    const { tipo, piso, exclusiva } = req.body;
 
     const coch = await Cochera.findById(id);
     if (!coch) return res.status(404).json({ message: "Cochera no encontrada" });
 
-    const tipoNorm = tipo !== undefined ? normCochera(tipo) || "Móvil" : coch.tipo;
-    const pisoNorm = piso !== undefined ? normPiso(piso) : coch.piso;
-    const exclNorm = exclusiva !== undefined ? normExclusiva(exclusiva, tipoNorm) : coch.exclusiva;
+    // Campos entrantes → SOLO se usan si están definidos Y no son vacíos destructivos
+    const incoming = req.body;
 
+    // PROTECCIÓN TOTAL:
+
+    // 1) cliente NUNCA se actualiza desde aquí
+    if ("cliente" in incoming) delete incoming.cliente;
+
+    // 2) vehiculos JAMÁS se pisa desde un PATCH general
+    if ("vehiculos" in incoming) delete incoming.vehiculos;
+
+    // 3) normalización condicionada
+    const tipoNorm =
+      incoming.tipo !== undefined && incoming.tipo !== ""
+        ? normCochera(incoming.tipo)
+        : coch.tipo;
+
+    const pisoNorm =
+      incoming.piso !== undefined && incoming.piso !== ""
+        ? normPiso(incoming.piso)
+        : coch.piso;
+
+    const exclNorm =
+      incoming.exclusiva !== undefined
+        ? normExclusiva(incoming.exclusiva, tipoNorm)
+        : coch.exclusiva;
+
+    // Validación anti-duplicado
     const existe = await Cochera.findOne({
       cliente: coch.cliente,
       tipo: tipoNorm,
@@ -197,39 +224,105 @@ exports.actualizarCochera = async (req, res) => {
     if (existe) {
       return res.status(400).json({
         message: "Ya existe otra cochera con esos datos para este cliente",
-        existente: existe._id,
+        existenteId: existe._id,
       });
     }
+
+    const pisoViejo = coch.piso;
+    const tipoViejo = coch.tipo;
 
     coch.tipo = tipoNorm;
     coch.piso = pisoNorm;
     coch.exclusiva = exclNorm;
-
     await coch.save();
 
-    res.json({ message: "Cochera actualizada", cochera: coch });
+    // actualizar en cliente.cocheras[]
+    await Cliente.updateOne(
+      { _id: coch.cliente, "cocheras.cocheraId": coch._id },
+      {
+        $set: {
+          "cocheras.$.piso": coch.piso,
+          "cocheras.$.cochera": coch.tipo,
+          "cocheras.$.exclusiva": coch.exclusiva,
+        },
+      }
+    );
+
+    // sincronizar vehículos
+    await Vehiculo.updateMany(
+      { cocheraId: coch._id },
+      { $set: { cocheraId: coch._id, cliente: coch.cliente } }
+    );
+
+    // actualizar abonos vinculados
+    await Abono.updateMany(
+      { cliente: coch.cliente, cochera: tipoViejo, piso: pisoViejo },
+      { $set: { cochera: coch.tipo, piso: coch.piso, exclusiva: coch.exclusiva } }
+    );
+
+    const cocheraActualizada = await Cochera.findById(coch._id)
+      .populate("cliente", "nombreApellido")
+      .populate("vehiculos", "_id patente")
+      .lean();
+
+    return res.json({
+      message: "Cochera actualizada + sincronizada",
+      data: cocheraActualizada,
+      cocheraId: coch._id,
+    });
   } catch (err) {
-    res.status(500).json({ message: "Error al actualizar cochera", error: err.message });
+    console.error("Error al actualizar cochera:", err);
+    return res.status(500).json({
+      message: "Error al actualizar cochera",
+      error: err.message,
+    });
   }
 };
 
+/* =======================================================
+   ELIMINAR
+======================================================= */
 exports.eliminarCochera = async (req, res) => {
   try {
     const { id } = req.params;
     const coch = await Cochera.findById(id);
     if (!coch) return res.status(404).json({ message: "Cochera no encontrada" });
 
+    await Vehiculo.updateMany(
+      { cocheraId: id },
+      { $unset: { cocheraId: "" } }
+    );
+
+    await Cliente.updateOne(
+      { _id: coch.cliente },
+      { $pull: { cocheras: { cocheraId: id } } }
+    );
+
     await coch.deleteOne();
+
     res.json({ message: "Cochera eliminada" });
   } catch (err) {
     res.status(500).json({ message: "Error al eliminar cochera", error: err.message });
   }
 };
 
-/* =======================================================
-   🚗 RELACIÓN VEHÍCULO ↔ COCHERA (BIDIRECCIONAL REAL)
-======================================================= */
+exports.eliminarTodasLasCocheras = async (_req, res) => {
+  try {
+    await Cochera.deleteMany({});
+    await Cliente.updateMany({}, { $set: { cocheras: [] } });
+    res.status(200).json({ message: "Todas las cocheras eliminadas" });
+  } catch (err) {
+    console.error("Error al eliminar todas las cocheras:", err);
+    res.status(500).json({
+      message: "Error al eliminar todas las cocheras",
+      error: err.message,
+    });
+  }
+};
 
+/* =======================================================
+   🚗 VEHÍCULO ↔ COCHERA
+======================================================= */
 exports.asignarVehiculo = async (req, res) => {
   try {
     const { cocheraId, vehiculoId } = req.body;
@@ -245,67 +338,44 @@ exports.asignarVehiculo = async (req, res) => {
 
     const cliId = coch.cliente;
 
-    /* ===================================================
-       🧹 1) Si el vehículo está en OTRA cochera → limpiar
-    =================================================== */
     if (veh.cocheraId && String(veh.cocheraId) !== String(cocheraId)) {
-      console.log(
-        `🔄 Corrigiendo: vehículo ${veh._id} estaba en otra cochera ${veh.cocheraId}`
-      );
-
       await Cochera.updateOne(
         { _id: veh.cocheraId },
         { $pull: { vehiculos: vehiculoId } }
       );
     }
 
-    /* ===================================================
-       🧲 2) Vincular VEHÍCULO → COCHERA
-    =================================================== */
     veh.cocheraId = cocheraId;
     veh.cliente = cliId;
     await veh.save();
 
-    /* ===================================================
-       🧲 3) Vincular COCHERA → VEHÍCULO
-    =================================================== */
     await Cochera.updateOne(
       { _id: cocheraId },
       { $addToSet: { vehiculos: vehiculoId } }
     );
 
-    /* ===================================================
-       🧲 4) Vincular CLIENTE → VEHÍCULO
-    =================================================== */
     await Cliente.updateOne(
       { _id: cliId },
       { $addToSet: { vehiculos: vehiculoId } }
     );
 
-    /* ===================================================
-       🔍 5) Leer cochera final y devolver
-    =================================================== */
     const cochFinal = await Cochera.findById(cocheraId)
       .populate("vehiculos", "_id patente");
 
     return res.json({
       message: "Vehículo asignado correctamente",
-      cochera: cochFinal,
+      data: cochFinal,
     });
-
   } catch (err) {
-    console.error("Error asignando vehículo a cochera:", err);
+    console.error("Error asignando vehículo:", err);
     res.status(500).json({ message: "Error asignando vehículo", error: err.message });
   }
 };
 
-/* =======================================================
-   ❌ REMOVER VEHÍCULO (manteniendo consistencia)
-======================================================= */
-
 exports.removerVehiculo = async (req, res) => {
   try {
     const { cocheraId, vehiculoId } = req.body;
+
     const coch = await Cochera.findById(cocheraId);
     if (!coch) return res.status(404).json({ message: "Cochera no encontrada" });
 
@@ -320,9 +390,9 @@ exports.removerVehiculo = async (req, res) => {
     );
 
     const cochFinal = await Cochera.findById(cocheraId)
-      .populate("vehiculos");
+      .populate("vehiculos", "_id patente");
 
-    res.json({ message: "Vehículo removido", cochera: cochFinal });
+    res.json({ message: "Vehículo removido", data: cochFinal });
   } catch (err) {
     res.status(500).json({ message: "Error removiendo vehículo", error: err.message });
   }

@@ -368,7 +368,8 @@ const REMOTE_ALIASES = {
   tarifas: ['tarifa'],
   promos: ['promociones','promo'],
   precios: ['precio'],
-  parametros: ['parametro','parametros_app','parámetros']
+  parametros: ['parametro','parametros_app','parámetros'],
+  cocheras: ['cochera'],
 };
 
 function getRemoteNames(colName) {
@@ -775,6 +776,43 @@ function cmpDate(a, b) {
 
 async function upsertLocalDocWithConflictResolution(localCollection, collName, remoteDoc, stats, options = {}) {
   const { mirrorArrays = false } = options;
+  // =============================
+  //  FIX 0: Protección ANTES de normalizeIds
+  // =============================
+  if (collName === 'cocheras') {
+
+    // 1) JAMÁS pisar 'cliente' si viene null, undefined o vacío
+    if (
+      remoteDoc.cliente === null ||
+      remoteDoc.cliente === undefined ||
+      remoteDoc.cliente === "" ||
+      (typeof remoteDoc.cliente === 'object' && Object.keys(remoteDoc.cliente).length === 0)
+    ) {
+      delete remoteDoc.cliente;
+    }
+
+    // 2) JAMÁS pisar vehiculos si viene undefined o array vacío
+    if (!Array.isArray(remoteDoc.vehiculos) || remoteDoc.vehiculos.length === 0) {
+      delete remoteDoc.vehiculos;
+    }
+
+    // 3) JAMÁS pisar tipo vacío
+    if (!remoteDoc.tipo || String(remoteDoc.tipo).trim() === "") {
+      delete remoteDoc.tipo;
+    }
+
+    // 4) JAMÁS pisar piso vacío
+    if (!remoteDoc.piso || String(remoteDoc.piso).trim() === "") {
+      delete remoteDoc.piso;
+    }
+
+    // 5) JAMÁS pisar exclusiva si viene null
+    if (remoteDoc.exclusiva === null || remoteDoc.exclusiva === undefined) {
+      delete remoteDoc.exclusiva;
+    }
+  }
+
+  // Ahora sí normalizamos
   const cleaned = normalizeIds(remoteDoc, collName);
   cleaned._id = safeObjectId(cleaned._id);
   const _id = cleaned._id;
@@ -808,7 +846,52 @@ async function upsertLocalDocWithConflictResolution(localCollection, collName, r
     delete rest[field];
   }
 
-  Object.assign(setOps, removeNulls(rest));
+  // =====================
+  // FIX NO-DESTRUCTIVO COMPLETO PARA COCHERAS
+  // =====================
+  if (collName === 'cocheras') {
+
+    for (const key of Object.keys(rest)) {
+      const v = rest[key];
+
+      // 1) NO pisar nunca cliente null/undefined
+      if (key === 'cliente') {
+        if (v === null || v === undefined) continue;
+      }
+
+      // 2) NO pisar vehiculos[] si remoto viene vacío y local tiene algo
+      if (key === 'vehiculos') {
+        if (Array.isArray(v) && v.length === 0) {
+          const localDoc = await localCollection.findOne({ _id }, { vehiculos: 1 }).lean();
+          if (localDoc && Array.isArray(localDoc.vehiculos) && localDoc.vehiculos.length > 0) {
+            continue;
+          }
+        }
+      }
+
+      // 3) NO pisar ningún campo si el remoto viene vacío
+      //    (esto protege: tipo, piso, exclusiva)
+      if (
+        v === null || v === undefined ||
+        (typeof v === 'string' && v.trim() === '') ||
+        (Array.isArray(v) && v.length === 0)
+      ) {
+        continue;
+      }
+
+      // ✔ aplicar valor remoto solo si es válido
+      setOps[key] = v;
+    }
+
+  } else {
+    // comportamiento estándar para otras colecciones
+    for (const key of Object.keys(rest)) {
+      setOps[key] = rest[key];
+    }
+  }
+
+  // También aseguramos que no metas campos null
+  Object.assign(setOps, removeNulls(setOps));
 
   const isMovs = String(collName).toLowerCase() === 'movimientos';
   if (isMovs) {

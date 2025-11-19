@@ -1,3 +1,4 @@
+// routes/cocheraRoutes.js
 const express = require("express");
 const router = express.Router();
 
@@ -8,6 +9,7 @@ const {
   obtenerCocherasPorCliente,
   actualizarCochera,
   eliminarCochera,
+  eliminarTodasLasCocheras,
   asignarVehiculo,
   removerVehiculo,
   ensureCochera,
@@ -24,8 +26,12 @@ router.get("/", obtenerCocheras);
 router.get("/cliente/:clienteId", obtenerCocherasPorCliente);
 router.get("/:id", obtenerCocheraPorId);
 
+// ✅ Actualizar cochera (PUT y PATCH, mismo handler)
 router.put("/:id", actualizarCochera);
+router.patch("/:id", actualizarCochera);
+
 router.delete("/:id", eliminarCochera);
+router.delete("/", eliminarTodasLasCocheras);
 
 // === VEHÍCULOS ===
 router.post("/asignar-vehiculo", asignarVehiculo);

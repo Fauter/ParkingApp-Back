@@ -4,9 +4,10 @@ const Cliente = require("../models/Cliente");
 const Vehiculo = require("../models/Vehiculo");
 const Movimiento = require("../models/Movimiento");
 const MovimientoCliente = require("../models/MovimientoCliente");
-
-// 🔧 Servicio de saneo (tu sistema actual)
-const { cleanAllClientesOnce, cleanClienteById } = require("../services/clienteAbonosService");
+const {
+  cleanAllClientesOnce,
+  cleanClienteById,
+} = require("../services/clienteAbonosService");
 
 const {
   Types: { ObjectId },
@@ -51,7 +52,7 @@ function getIdAny(x) {
 }
 
 /* =======================================================
-   NORMALIZADORES (solo campos históricos)
+   NORMALIZADORES
 ======================================================= */
 function normCochera(raw) {
   const v = String(raw || "").trim().toLowerCase();
@@ -110,7 +111,25 @@ function deriveEstadoAbono(doc) {
 }
 
 /* =======================================================
-   CREAR / ACTUALIZAR
+   🔥 NUEVO: LIMPIAR cocheras[] PARA EL OUTPUT
+======================================================= */
+function stripCocheras(cliente) {
+  if (!cliente) return cliente;
+
+  const obj = cliente.toObject ? cliente.toObject() : { ...cliente };
+
+  if (Array.isArray(obj.cocheras)) {
+    obj.cocheras = obj.cocheras.map((c) => ({
+      _id: c._id,
+      cocheraId: c.cocheraId,
+    }));
+  }
+
+  return obj;
+}
+
+/* =======================================================
+   CREAR / ACTUALIZAR (SIN TOCAR cocheras[])
 ======================================================= */
 exports.crearClienteSiNoExiste = async (req, res) => {
   const datos = req.body;
@@ -129,9 +148,7 @@ exports.crearClienteSiNoExiste = async (req, res) => {
     const exclusiva = normExclusiva(datos.exclusiva, cochera);
     const piso = normPiso(datos.piso);
 
-    let cliente = await Cliente.findOne({
-      $or: [{ dniCuitCuil: dni }, ...(email ? [{ email }] : []), { nombreApellido: nombre }],
-    });
+    let cliente = await Cliente.findOne({ dniCuitCuil: dni });
 
     if (!cliente) {
       cliente = new Cliente({
@@ -145,12 +162,18 @@ exports.crearClienteSiNoExiste = async (req, res) => {
         telefonoTrabajo: datos.telefonoTrabajo || "",
         email,
         precioAbono: datos.precioAbono || "",
+
+        // retrocompatibilidad
         cochera,
         exclusiva,
         piso,
+
+        // sistema nuevo
+        cocheras: [],
       });
+
       await cliente.save();
-      return res.status(201).json(cliente);
+      return res.status(201).json(stripCocheras(cliente));
     }
 
     const campos = [
@@ -183,9 +206,13 @@ exports.crearClienteSiNoExiste = async (req, res) => {
     }
 
     await cliente.save();
-    return res.status(200).json(cliente);
+    return res.status(200).json(stripCocheras(cliente));
   } catch (err) {
-    res.status(500).json({ message: "Error al crear/actualizar cliente", error: err.message });
+    console.error("Error en crearClienteSiNoExiste:", err);
+    res.status(500).json({
+      message: "Error al crear/actualizar cliente",
+      error: err.message,
+    });
   }
 };
 
@@ -200,12 +227,17 @@ exports.obtenerClientes = async (_req, res) => {
       .populate("vehiculos", "_id patente")
       .populate({
         path: "abonos",
-        select: "-cliente -vehiculo"
+        select: "-cliente -vehiculo",
       });
 
-    res.status(200).json(clientes);
+    const out = clientes.map(stripCocheras);
+    res.status(200).json(out);
   } catch (err) {
-    res.status(500).json({ message: "Error al obtener clientes", error: err.message });
+    console.error("Error al obtener clientes:", err);
+    res.status(500).json({
+      message: "Error al obtener clientes",
+      error: err.message,
+    });
   }
 };
 
@@ -219,13 +251,19 @@ exports.obtenerClientePorNombre = async (req, res) => {
       .populate("vehiculos", "_id patente")
       .populate({
         path: "abonos",
-        select: "-cliente -vehiculo"
+        select: "-cliente -vehiculo",
       });
 
-    if (!cliente) return res.status(404).json({ message: "Cliente no encontrado" });
-    res.json(deriveEstadoAbono(cliente));
+    if (!cliente)
+      return res.status(404).json({ message: "Cliente no encontrado" });
+
+    res.json(stripCocheras(deriveEstadoAbono(cliente)));
   } catch (err) {
-    res.status(500).json({ message: "Error al buscar cliente", error: err.message });
+    console.error("Error al buscar cliente por nombre:", err);
+    res.status(500).json({
+      message: "Error al buscar cliente",
+      error: err.message,
+    });
   }
 };
 
@@ -238,14 +276,19 @@ exports.obtenerClientePorId = async (req, res) => {
       .populate("movimientos")
       .populate({
         path: "abonos",
-        select: "-cliente -vehiculo"
+        select: "-cliente -vehiculo",
       });
 
-    if (!cliente) return res.status(404).json({ message: "Cliente no encontrado" });
+    if (!cliente)
+      return res.status(404).json({ message: "Cliente no encontrado" });
 
-    res.json(deriveEstadoAbono(cliente));
+    res.json(stripCocheras(deriveEstadoAbono(cliente)));
   } catch (err) {
-    res.status(500).json({ message: "Error al obtener cliente por ID", error: err.message });
+    console.error("Error al obtener cliente por ID:", err);
+    res.status(500).json({
+      message: "Error al obtener cliente por ID",
+      error: err.message,
+    });
   }
 };
 
@@ -264,10 +307,19 @@ exports.marcarClienteComoAbonado = async (req, res) => {
       { abonado: true },
       { new: true }
     );
-    if (!cliente) return res.status(404).json({ message: "Cliente no encontrado" });
-    res.status(200).json({ message: "Cliente marcado como abonado", cliente });
+    if (!cliente)
+      return res.status(404).json({ message: "Cliente no encontrado" });
+
+    res.status(200).json({
+      message: "Cliente marcado como abonado",
+      cliente: stripCocheras(cliente),
+    });
   } catch (err) {
-    res.status(500).json({ message: "Error al actualizar cliente", error: err.message });
+    console.error("Error al marcar cliente como abonado:", err);
+    res.status(500).json({
+      message: "Error al actualizar cliente",
+      error: err.message,
+    });
   }
 };
 
@@ -276,15 +328,17 @@ exports.actualizarPrecioAbono = async (req, res) => {
   const { tipoVehiculo } = req.body;
   try {
     const cliente = await Cliente.findById(id);
-    if (!cliente) return res.status(404).json({ message: "Cliente no encontrado" });
+    if (!cliente)
+      return res.status(404).json({ message: "Cliente no encontrado" });
 
     if (tipoVehiculo) {
       cliente.precioAbono = tipoVehiculo;
       await cliente.save();
     }
 
-    res.json({ message: "Precio actualizado", cliente });
+    res.json({ message: "Precio actualizado", cliente: stripCocheras(cliente) });
   } catch (err) {
+    console.error("Error al actualizar precio de abono:", err);
     res.status(500).json({ message: "Error", error: err.message });
   }
 };
@@ -298,7 +352,8 @@ exports.desabonarCliente = async (req, res) => {
       { new: true }
     ).populate("vehiculos abonos movimientos");
 
-    if (!cliente) return res.status(404).json({ message: "Cliente no encontrado" });
+    if (!cliente)
+      return res.status(404).json({ message: "Cliente no encontrado" });
 
     if (cliente.vehiculos?.length) {
       await Promise.all(
@@ -319,36 +374,49 @@ exports.desabonarCliente = async (req, res) => {
       );
     }
 
-    res.json({ message: "Cliente desabonado", cliente });
+    res.json({ message: "Cliente desabonado", cliente: stripCocheras(cliente) });
   } catch (err) {
-    res.status(500).json({ message: "Error al desabonar cliente", error: err.message });
+    console.error("Error al desabonar cliente:", err);
+    res.status(500).json({
+      message: "Error al desabonar cliente",
+      error: err.message,
+    });
   }
 };
+
+/* =======================================================
+   RENOVAR
+======================================================= */
 
 exports.renovarAbono = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
   try {
     const { id } = req.params;
-    const { precio, metodoPago, factura, operador, patente, tipoVehiculo } = req.body;
+    const { precio, metodoPago, factura, operador, patente, tipoVehiculo } =
+      req.body;
     const mesesAbonar = clampInt(req.body?.mesesAbonar ?? 1, 1, 12);
 
     if (!precio || isNaN(precio)) {
       await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({ message: "Precio inválido" });
     }
     if (!metodoPago) {
       await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({ message: "Método de pago requerido" });
     }
     if (!tipoVehiculo) {
       await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({ message: "Tipo de vehículo requerido" });
     }
 
     const cliente = await Cliente.findById(id).populate("abonos").session(session);
     if (!cliente) {
       await session.abortTransaction();
+      session.endSession();
       return res.status(404).json({ message: "Cliente no encontrado" });
     }
 
@@ -413,7 +481,7 @@ exports.renovarAbono = async (req, res) => {
     const clienteActualizado = await Cliente.findById(id).populate("abonos");
     res.status(200).json({
       message: "Abono renovado",
-      cliente: clienteActualizado,
+      cliente: stripCocheras(clienteActualizado),
       movimiento,
       movimientoCliente,
       mesesAbonar,
@@ -422,18 +490,32 @@ exports.renovarAbono = async (req, res) => {
     await session.abortTransaction();
     session.endSession();
     console.error("Error al renovar abono:", error);
-    res.status(500).json({ message: "Error al renovar abono", error: error.message });
+    res.status(500).json({
+      message: "Error al renovar abono",
+      error: error.message,
+    });
   }
 };
 
+/* =======================================================
+   ELIMINAR
+======================================================= */
 exports.eliminarTodosLosClientes = async (_req, res) => {
   try {
     await Cliente.deleteMany({});
     res.status(200).json({ message: "Clientes eliminados" });
   } catch (err) {
-    res.status(500).json({ message: "Error al eliminar clientes", error: err.message });
+    console.error("Error al eliminar clientes:", err);
+    res.status(500).json({
+      message: "Error al eliminar clientes",
+      error: err.message,
+    });
   }
 };
+
+/* =======================================================
+   ACTUALIZAR CLIENTE BÁSICO (SIN TOCAR cocheras[])
+======================================================= */
 
 exports.actualizarClienteBasico = async (req, res) => {
   try {
@@ -454,8 +536,7 @@ exports.actualizarClienteBasico = async (req, res) => {
       if (k in req.body) data[k] = req.body[k];
     });
 
-    const cRaw =
-      req.body.cochera !== undefined ? normCochera(req.body.cochera) : undefined;
+    const cRaw = req.body.cochera !== undefined ? normCochera(req.body.cochera) : undefined;
     const pRaw = req.body.piso !== undefined ? normPiso(req.body.piso) : undefined;
     const eRawPresent = req.body.exclusiva !== undefined;
 
@@ -464,7 +545,8 @@ exports.actualizarClienteBasico = async (req, res) => {
       const doc = await Cliente.collection.findOne({ _id: String(id) });
       if (doc) cliente = new Cliente(doc);
     }
-    if (!cliente) return res.status(404).json({ message: "Cliente no encontrado" });
+    if (!cliente)
+      return res.status(404).json({ message: "Cliente no encontrado" });
 
     Object.keys(data).forEach((k) => {
       cliente[k] = data[k];
@@ -480,8 +562,12 @@ exports.actualizarClienteBasico = async (req, res) => {
     if (pRaw !== undefined) cliente.piso = pRaw;
 
     await cliente.save();
-    return res.json({ message: "Cliente actualizado", cliente });
+    return res.json({ message: "Cliente actualizado", cliente: stripCocheras(cliente) });
   } catch (err) {
-    res.status(500).json({ message: "Error al actualizar cliente", error: err.message });
+    console.error("Error al actualizar cliente básico:", err);
+    res.status(500).json({
+      message: "Error al actualizar cliente",
+      error: err.message,
+    });
   }
 };

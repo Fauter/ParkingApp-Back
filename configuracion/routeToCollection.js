@@ -3,9 +3,10 @@ module.exports = {
   // Auth / Users
   '/api/auth': 'users',
 
-  // Vehículos / Abonos
+  // Vehículos / Abonos / Cocheras
   '/api/vehiculos': 'vehiculos',
   '/api/abonos': 'abonos',
+  '/api/cocheras': 'cocheras',
 
   // Tipos de vehículo (cole correcta: tipovehiculos)
   '/api/tipos-vehiculo': 'tipovehiculos',
