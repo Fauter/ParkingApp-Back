@@ -42,8 +42,8 @@ exports.ensureCochera = async (req, res) => {
       return res.status(404).json({ message: "Cliente no encontrado" });
 
     const tipoNorm = normCochera(tipo) || "Móvil";
-    const pisoNorm = normPiso(piso);
-    const exclusivaNorm = normExclusiva(exclusiva, tipoNorm);
+    const pisoNorm = tipoNorm === "Fija" ? normPiso(piso) : "";
+    const exclusivaNorm = tipoNorm === "Fija" ? normExclusiva(exclusiva, tipoNorm) : false;
 
     let coch = await Cochera.findOne({
       cliente: clienteId,
@@ -203,14 +203,16 @@ exports.actualizarCochera = async (req, res) => {
         : coch.tipo;
 
     const pisoNorm =
-      incoming.piso !== undefined && incoming.piso !== ""
-        ? normPiso(incoming.piso)
-        : coch.piso;
+      tipoNorm === "Móvil"
+        ? "" // LAS MÓVILES SIEMPRE DEBEN TENER PISO ""
+        : incoming.piso !== undefined
+          ? normPiso(incoming.piso || "")
+          : coch.piso;
 
     const exclNorm =
-      incoming.exclusiva !== undefined
-        ? normExclusiva(incoming.exclusiva, tipoNorm)
-        : coch.exclusiva;
+      tipoNorm === "Fija"
+        ? Boolean(incoming.exclusiva)
+        : false; // si es Móvil → siempre false
 
     // Validación anti-duplicado
     const existe = await Cochera.findOne({
