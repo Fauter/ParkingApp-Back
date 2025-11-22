@@ -9,6 +9,9 @@ const {
   Types: { ObjectId },
 } = mongoose;
 
+// (el outbox de cocheras para rutas HTTP ahora lo maneja offlineMiddleware.
+//  Este helper interno ya no es necesario y se eliminó.)
+
 /* =======================================================
    HELPERS – NORMALIZACIÓN A PRUEBA DE BASURA
 ======================================================= */
@@ -32,14 +35,23 @@ function normExclusiva(raw, tipo) {
 ======================================================= */
 exports.ensureCochera = async (req, res) => {
   try {
-    const { clienteId, tipo, piso, exclusiva } = req.body;
+    // ✅ aceptar tanto clienteId como cliente
+    const rawClienteId = req.body.clienteId ?? req.body.cliente;
+    const { tipo, piso, exclusiva } = req.body;
 
-    if (!clienteId)
+    if (!rawClienteId) {
       return res.status(400).json({ message: "clienteId es obligatorio" });
+    }
+
+    // ✅ castear a ObjectId si aplica
+    const clienteId = ObjectId.isValid(String(rawClienteId))
+      ? new ObjectId(String(rawClienteId))
+      : rawClienteId;
 
     const cli = await Cliente.findById(clienteId);
-    if (!cli)
+    if (!cli) {
       return res.status(404).json({ message: "Cliente no encontrado" });
+    }
 
     const tipoNorm = normCochera(tipo) || "Móvil";
     const pisoNorm = tipoNorm === "Fija" ? normPiso(piso) : "";
@@ -70,7 +82,6 @@ exports.ensureCochera = async (req, res) => {
 
     await coch.save();
 
-    // registrar en cliente.cocheras[]
     await Cliente.updateOne(
       { _id: clienteId },
       { $push: { cocheras: { cocheraId: coch._id } } }
@@ -92,14 +103,22 @@ exports.ensureCochera = async (req, res) => {
 ======================================================= */
 exports.crearCochera = async (req, res) => {
   try {
-    const { clienteId, tipo, piso, exclusiva } = req.body;
+    // ✅ aceptar tanto clienteId como cliente
+    const rawClienteId = req.body.clienteId ?? req.body.cliente;
+    const { tipo, piso, exclusiva } = req.body;
 
-    if (!clienteId)
+    if (!rawClienteId) {
       return res.status(400).json({ message: "clienteId es obligatorio" });
+    }
+
+    const clienteId = ObjectId.isValid(String(rawClienteId))
+      ? new ObjectId(String(rawClienteId))
+      : rawClienteId;
 
     const cliente = await Cliente.findById(clienteId);
-    if (!cliente)
+    if (!cliente) {
       return res.status(404).json({ message: "Cliente no encontrado" });
+    }
 
     const tipoNorm = normCochera(tipo) || "Móvil";
     const pisoNorm = normPiso(piso);
@@ -112,8 +131,9 @@ exports.crearCochera = async (req, res) => {
       exclusiva: exclusivaNorm,
     });
 
-    if (existente)
+    if (existente) {
       return res.json({ message: "Cochera ya existía", data: existente });
+    }
 
     const nueva = new Cochera({
       cliente: clienteId,
@@ -185,18 +205,11 @@ exports.actualizarCochera = async (req, res) => {
     const coch = await Cochera.findById(id);
     if (!coch) return res.status(404).json({ message: "Cochera no encontrada" });
 
-    // Campos entrantes → SOLO se usan si están definidos Y no son vacíos destructivos
     const incoming = req.body;
 
-    // PROTECCIÓN TOTAL:
-
-    // 1) cliente NUNCA se actualiza desde aquí
     if ("cliente" in incoming) delete incoming.cliente;
-
-    // 2) vehiculos JAMÁS se pisa desde un PATCH general
     if ("vehiculos" in incoming) delete incoming.vehiculos;
 
-    // 3) normalización condicionada
     const tipoNorm =
       incoming.tipo !== undefined && incoming.tipo !== ""
         ? normCochera(incoming.tipo)
@@ -204,7 +217,7 @@ exports.actualizarCochera = async (req, res) => {
 
     const pisoNorm =
       tipoNorm === "Móvil"
-        ? "" // LAS MÓVILES SIEMPRE DEBEN TENER PISO ""
+        ? ""
         : incoming.piso !== undefined
           ? normPiso(incoming.piso || "")
           : coch.piso;
@@ -212,9 +225,8 @@ exports.actualizarCochera = async (req, res) => {
     const exclNorm =
       tipoNorm === "Fija"
         ? Boolean(incoming.exclusiva)
-        : false; // si es Móvil → siempre false
+        : false;
 
-    // Validación anti-duplicado
     const existe = await Cochera.findOne({
       cliente: coch.cliente,
       tipo: tipoNorm,
@@ -238,7 +250,6 @@ exports.actualizarCochera = async (req, res) => {
     coch.exclusiva = exclNorm;
     await coch.save();
 
-    // actualizar en cliente.cocheras[]
     await Cliente.updateOne(
       { _id: coch.cliente, "cocheras.cocheraId": coch._id },
       {
@@ -250,13 +261,11 @@ exports.actualizarCochera = async (req, res) => {
       }
     );
 
-    // sincronizar vehículos
     await Vehiculo.updateMany(
       { cocheraId: coch._id },
       { $set: { cocheraId: coch._id, cliente: coch.cliente } }
     );
 
-    // actualizar abonos vinculados
     await Abono.updateMany(
       { cliente: coch.cliente, cochera: tipoViejo, piso: pisoViejo },
       { $set: { cochera: coch.tipo, piso: coch.piso, exclusiva: coch.exclusiva } }

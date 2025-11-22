@@ -1,33 +1,61 @@
 // /configuracion/routeToCollection.js
+
 module.exports = {
-  // Auth / Users
+  /* ============================
+     AUTH / USERS
+  ============================ */
   '/api/auth': 'users',
 
-  // Vehículos / Abonos / Cocheras
+  /* ============================
+     VEHÍCULOS / ABONOS / COCHERAS
+  ============================ */
   '/api/vehiculos': 'vehiculos',
+
   '/api/abonos': 'abonos',
+  '/api/abonos/registrar-abono': 'abonos',   // rutas específicas
+
+  /* ---- COCHERAS (TODOS LOS CASOS) ---- */
   '/api/cocheras': 'cocheras',
+  '/api/cocheras/': 'cocheras',
+  '/api/cocheras/ensure': 'cocheras',
+  '/api/cocheras/asignar': 'cocheras',
+  '/api/cocheras/remover': 'cocheras',
+  '/api/cocheras/eliminar': 'cocheras',
+  '/api/cocheras/eliminar-todas': 'cocheras',
+  // fallback: **cualquier cosa que comience con /api/cocheras**
+  '/api/cocheras/': 'cocheras',
 
-  // Tipos de vehículo (cole correcta: tipovehiculos)
+  /* ============================
+     TIPOS DE VEHÍCULO
+  ============================ */
   '/api/tipos-vehiculo': 'tipovehiculos',
-  '/api/tipovehiculos': 'tipovehiculos', // alias, por si en algún lado no va el guión
+  '/api/tipovehiculos': 'tipovehiculos', // alias
 
-  // Movimientos (ojo con el nombre de colección)
+  /* ============================
+     MOVIMIENTOS
+  ============================ */
   '/api/movimientos': 'movimientos',
+  '/api/movimientos/registrar': 'movimientos',
   '/api/movimientoclientes': 'movimientoclientes',
 
-  // Clientes
+  /* ============================
+     CLIENTES
+  ============================ */
   '/api/clientes': 'clientes',
 
-  // Cierres de Caja (mapear ambos casings)
+  /* ============================
+     CIERRES DE CAJA
+  ============================ */
   '/api/cierresDeCaja': 'cierresdecajas',
   '/api/cierresdecaja': 'cierresdecajas',
 
-  // Cierres Parciales (ambos casings; cole real: cierreparcials)
+  /* PARCIALES */
   '/api/cierresDeCaja/parcial': 'cierreparcials',
   '/api/cierresdecaja/parcial': 'cierreparcials',
 
-  // Catálogos y otros
+  /* ============================
+     CATÁLOGOS
+  ============================ */
   '/api/parametros': 'parametros',
   '/api/impresoras': 'impresoras',
   '/api/precios': 'precios',
@@ -39,10 +67,15 @@ module.exports = {
   '/api/turnos': 'turnos',
   '/api/config': 'config',
 
-  // Tickets / Counters
+  /* ============================
+     TICKETS / COUNTERS
+  ============================ */
   '/api/tickets': 'tickets',
   '/api/ticket': 'tickets',
   '/api/counters': 'counters',
 
+  /* ============================
+     FOTOS
+  ============================ */
   '/api/fotos': 'fotos',
 };

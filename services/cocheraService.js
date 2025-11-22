@@ -9,6 +9,37 @@ const {
   Types: { ObjectId },
 } = mongoose;
 
+// =======================================================
+// 🔥 Outbox interno (igual al del controller de cocheras)
+// =======================================================
+async function registrarOutboxCocheraInterna(doc) {
+  try {
+    const Outbox = require("../models/Outbox");
+
+    await Outbox.create({
+      method: "POST",
+      route: "/api/cocheras",
+      collection: "cocheras",
+      document: {
+        _id: String(doc._id),
+        clienteId: String(doc.cliente),
+        tipo: doc.tipo,
+        piso: doc.piso,
+        exclusiva: doc.exclusiva,
+        vehiculos: (doc.vehiculos || []).map(v => String(v))
+      },
+      params: { id: String(doc._id) },
+      query: {},
+      status: "pending",
+      createdAt: new Date()
+    });
+
+    console.log(`[cocheras] ✔ Outbox generado desde ensureCocheraInterno: ${doc._id}`);
+  } catch (e) {
+    console.error("[cocheras] ❌ Error generando outbox interno:", e.message);
+  }
+}
+
 function normTipo(raw) {
   const v = String(raw || "").trim().toLowerCase();
   if (v === "fija") return "Fija";
@@ -55,6 +86,7 @@ async function ensureCocheraInterno({ clienteId, tipo, piso, exclusiva, session 
   });
 
   await coch.save({ session });
+
   return coch;
 }
 
@@ -106,4 +138,5 @@ async function asignarVehiculoInterno({ cocheraId, vehiculoId, session }) {
 module.exports = {
   ensureCocheraInterno,
   asignarVehiculoInterno,
+  registrarOutboxCocheraInterna
 };

@@ -963,41 +963,64 @@ exports.registrarAbono = async (req, res) => {
     });
 
     if (cocheraReal && cocheraReal._id) {
-      await asignarVehiculoInterno({
-        cocheraId: cocheraReal._id,
-        vehiculoId: vehiculo._id,
-        session
-      });
+    await asignarVehiculoInterno({
+      cocheraId: cocheraReal._id,
+      vehiculoId: vehiculo._id,
+      session
+    });
 
-      // ============================================================
-      // 📌 SINCRONIZAR cliente.cocheras[] — MODELO A
-      // ============================================================
-      try {
-        if (!Array.isArray(cliente.cocheras)) cliente.cocheras = [];
+    // ============================================================
+    // 📨 OUTBOX FINAL — SIEMPRE DESPUÉS DE ASIGNAR EL VEHÍCULO
+    // ============================================================
+    try {
+      const Cochera = require("../models/Cochera");
 
-        const cocheraIdFinal = toObjectIdSafe(cocheraReal._id) || cocheraReal._id;
-        const idx = cliente.cocheras.findIndex(
-          (c) => String(c.cocheraId || "") === String(cocheraIdFinal)
-        );
+      const cochFinal = await Cochera.findById(cocheraReal._id)
+        .populate("vehiculos", "_id patente")
+        .session(session)   // ← obligatorio
+        .lean();
 
-        // SI NO EXISTE → agregar
-        if (idx === -1) {
-          cliente.cocheras.push({
-            cocheraId: cocheraIdFinal,
-            cochera: cocheraNorm,
-            piso: cocheraNorm === "Fija" ? pisoNorm : "",
-            exclusiva: exclusivaNorm,
-          });
-        }
-        // SI YA EXISTE → NO modificar (modelo A)
-        // No toca piso/exclusiva/tipo existentes
+      await require("../services/cocheraService")
+        .registrarOutboxCocheraInterna({
+          _id: cochFinal._id,
+          cliente: cochFinal.cliente,
+          tipo: cochFinal.tipo,
+          piso: cochFinal.piso,
+          exclusiva: cochFinal.exclusiva,
+          vehiculos: (cochFinal.vehiculos || []).map(v => String(v._id))
+        });
 
-        cliente.markModified("cocheras");
-        await cliente.save(sopt);
-      } catch (e) {
-        console.warn("[registrarAbono] no se pudo sincronizar cliente.cocheras[]:", e);
-      }
+    } catch (e) {
+      console.warn("[registrarAbono] no se pudo generar outbox FINAL cochera:", e.message);
     }
+
+    // ============================================================
+    // 📌 SINCRONIZAR cliente.cocheras[] — MODELO A (sin modificar si existe)
+    // ============================================================
+    try {
+      if (!Array.isArray(cliente.cocheras)) cliente.cocheras = [];
+
+      const cocheraIdFinal = toObjectIdSafe(cocheraReal._id) || cocheraReal._id;
+      const idx = cliente.cocheras.findIndex(
+        (c) => String(c.cocheraId || "") === String(cocheraIdFinal)
+      );
+
+      if (idx === -1) {
+        cliente.cocheras.push({
+          cocheraId: cocheraIdFinal,
+          cochera: cocheraNorm,
+          piso: cocheraNorm === "Fija" ? pisoNorm : "",
+          exclusiva: exclusivaNorm,
+        });
+      }
+
+      cliente.markModified("cocheras");
+      await cliente.save(sopt);
+
+    } catch (e) {
+      console.warn("[registrarAbono] no se pudo sincronizar cliente.cocheras[]:", e);
+    }
+  }
 
     // ============================================================
     // 💾 COMMIT

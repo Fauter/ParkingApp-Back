@@ -354,6 +354,7 @@ const NATURAL_KEYS = {
   users: ['username', 'email'],
   vehiculos: ['patente'],
   clientes: ['dniCuitCuil', 'email'],
+  cocheras: ['tipo', 'piso', 'exclusiva'],
   tipovehiculos: ['nombre'],
   tarifas: ['nombre'],
   promos: ['codigo'],
@@ -780,36 +781,28 @@ async function upsertLocalDocWithConflictResolution(localCollection, collName, r
   //  FIX 0: Protección ANTES de normalizeIds
   // =============================
   if (collName === 'cocheras') {
+    // JAMÁS tocar cliente aquí
+    // JAMÁS tocar vehiculos aquí
+    // Solo limpiar remoto si trae strings vacíos o null explícitos
 
-    // 1) JAMÁS pisar 'cliente' si viene null, undefined o vacío
-    if (
-      remoteDoc.cliente === null ||
-      remoteDoc.cliente === undefined ||
-      remoteDoc.cliente === "" ||
-      (typeof remoteDoc.cliente === 'object' && Object.keys(remoteDoc.cliente).length === 0)
-    ) {
-      delete remoteDoc.cliente;
-    }
-
-    // 2) JAMÁS pisar vehiculos si viene undefined o array vacío
-    if (!Array.isArray(remoteDoc.vehiculos) || remoteDoc.vehiculos.length === 0) {
-      delete remoteDoc.vehiculos;
-    }
-
-    // 3) JAMÁS pisar tipo vacío
-    if (!remoteDoc.tipo || String(remoteDoc.tipo).trim() === "") {
+    if (remoteDoc.tipo !== undefined && String(remoteDoc.tipo).trim() === "") {
       delete remoteDoc.tipo;
     }
 
-    // 4) JAMÁS pisar piso vacío
-    if (!remoteDoc.piso || String(remoteDoc.piso).trim() === "") {
+    if (remoteDoc.piso !== undefined && String(remoteDoc.piso).trim() === "") {
       delete remoteDoc.piso;
     }
 
-    // 5) JAMÁS pisar exclusiva si viene null
     if (remoteDoc.exclusiva === null || remoteDoc.exclusiva === undefined) {
       delete remoteDoc.exclusiva;
     }
+
+    // vehiculos vacío no pisa local
+    if (Array.isArray(remoteDoc.vehiculos) && remoteDoc.vehiculos.length === 0) {
+      delete remoteDoc.vehiculos;
+    }
+
+    // cliente null NO se toca: lo decide después el patch NO-DESTRUCTIVO
   }
 
   // Ahora sí normalizamos

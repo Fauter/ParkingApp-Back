@@ -163,26 +163,49 @@ function pickDocumentForOutbox(method, collection, req, capturedBody) {
   // 3) NO-DESTRUCTIVO PARA COCHERAS:
   if (collection === 'cocheras') {
 
-    // A) Recuperar _id sí o sí
-    const id = (
+    // A) Recuperar _id sí o sí (incluyendo data._id y objetos poblados)
+    let id =
       candidate?._id ||
       candidate?.id ||
+      candidate?.data?._id ||
+      candidate?.data?.id ||
       reqBody?._id ||
       reqBody?.id ||
-      null
-    );
+      null;
+
+    if (id && typeof id === 'object' && id._id) {
+      id = id._id;
+    }
+
     const out = { _id: id };
 
+    // 🔹 PARA POST: necesitamos saber a qué cliente pertenece la cochera
+    if (method === 'POST' && reqBody && typeof reqBody === 'object') {
+      if (Object.prototype.hasOwnProperty.call(reqBody, 'clienteId')) {
+        out.clienteId = reqBody.clienteId;
+      } else if (Object.prototype.hasOwnProperty.call(reqBody, 'cliente')) {
+        out.clienteId = reqBody.cliente;
+      }
+    }
+
     // B) SOLO incluir campos que el usuario haya enviado
-    //    (evita mandar PATCH destructivos)
-    const FIELDS = ['tipo','piso','exclusiva'];
+    const FIELDS = ['tipo','piso','exclusiva','vehiculos'];
+
     for (const f of FIELDS) {
       if (reqBody && Object.prototype.hasOwnProperty.call(reqBody, f)) {
+
+        // 🔥 vehiculos debe transformarse a array de ObjectId string
+        if (f === 'vehiculos' && Array.isArray(reqBody.vehiculos)) {
+          out.vehiculos = reqBody.vehiculos.map(v => String(v));
+          continue;
+        }
+
+        // el resto pasa limpio
         out[f] = reqBody[f];
       }
     }
 
-    // C) JAMÁS enviar cliente ni vehiculos desde outbox
+    // 🔸 IMPORTANTE: para PATCH/PUT no enviamos cliente ni vehiculos si no vienen en body
     return out;
   }
 
