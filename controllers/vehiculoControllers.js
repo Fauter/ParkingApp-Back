@@ -706,6 +706,9 @@ exports.registrarSalida = async (req, res) => {
       tipoTarifa: tipoTarifaBody,
       descripcion: descripcionBody,
       operador: operadorBody,
+      tiempoHoras: tiempoHorasBody,
+      promo: promoBody,
+      fotoUrl: fotoMovBody,
     } = req.body || {};
 
     const vehiculo = await Vehiculo.findOne({ patente }).session(session);
@@ -716,6 +719,8 @@ exports.registrarSalida = async (req, res) => {
 
     const salida = salidaBody ? new Date(salidaBody) : new Date();
     const entrada = new Date(vehiculo.estadiaActual.entrada);
+
+    // snapshot ANTES de tocar nada
     const estadiaSnapshot = JSON.parse(JSON.stringify(vehiculo.estadiaActual));
     estadiaSnapshot.salida = salida;
 
@@ -761,6 +766,7 @@ exports.registrarSalida = async (req, res) => {
 
     estadiaSnapshot.costoTotal = Number(costoFinal) || 0;
 
+    // Pasar estadía actual al historial + limpiar estadíaActual
     await Vehiculo.updateOne(
       { _id: vehiculo._id },
       {
@@ -771,27 +777,7 @@ exports.registrarSalida = async (req, res) => {
       { session }
     );
 
-    const operadorNombre =
-      (typeof operadorBody === "string" && operadorBody.trim()) || getOperadorNombre(req) || "Operador Desconocido";
-
-    const metodoPago = mpBody || estadiaSnapshot.metodoPago || "Efectivo";
-    const factura = facturaBody || "Final";
-    const tipoTarifa = tipoTarifaBody || estadiaSnapshot.tipoTarifa || "estadia";
-    const descripcion = descripcionBody || `Salida ${patente} — ${tipoTarifa}`;
-
-    const movimientoDoc = {
-      patente,
-      operador: operadorNombre,
-      tipoVehiculo: vehiculo.tipoVehiculo || "auto",
-      metodoPago,
-      factura,
-      monto: Number(costoFinal) || 0,
-      descripcion,
-      tipoTarifa,
-      ticket: estadiaSnapshot.ticket,
-    };
-    await Movimiento.create([movimientoDoc], { session });
-
+    // Mantener flag turno coherente
     const ahora = new Date();
     const sigueConTurnoActivo = await Turno.exists({
       patente: patenteUp,
@@ -800,16 +786,113 @@ exports.registrarSalida = async (req, res) => {
       fin: { $gt: ahora },
     }).session(session);
     if (!sigueConTurnoActivo) {
-      await Vehiculo.updateOne({ _id: vehiculo._id }, { $set: { turno: false, updatedAt: new Date() } }, { session });
+      await Vehiculo.updateOne(
+        { _id: vehiculo._id },
+        { $set: { turno: false, updatedAt: new Date() } },
+        { session }
+      );
     }
 
     await session.commitTransaction();
+    session.endSession();
+
+    // ================================
+    // 🔥 2) CREAR MOVIMIENTO VÍA API INTERNA
+    // ================================
+    let movimientoDoc = null;
+
+    try {
+      // recomputo algunas cosas fuera de la tx
+      const horas =
+        Number.isFinite(Number(tiempoHorasBody)) && Number(tiempoHorasBody) > 0
+          ? Number(tiempoHorasBody)
+          : 1;
+
+      const tipoTarifa = tipoTarifaBody || "hora";
+      const descripcion =
+        descripcionBody ||
+        `Pago por ${horas} Hora${horas > 1 ? "s" : ""}`;
+
+      const metodoPago = mpBody || estadiaSnapshot.metodoPago || "Efectivo";
+      const factura = facturaBody || "Final";
+
+      const authHeader =
+        req.headers["authorization"] || req.headers["Authorization"];
+
+      // 🔥🔥🔥 OPERADOR — SIEMPRE STRING + OPERADORID 🔥🔥🔥
+      let operadorNombreFinal = "Operador Desconocido";
+      let operadorIdFinal = null;
+
+      if (operadorBody && typeof operadorBody === "object") {
+        const o = operadorBody;
+        operadorNombreFinal =
+          o.username ||
+          `${o.nombre || ""} ${o.apellido || ""}`.trim() ||
+          o.email ||
+          "Operador Desconocido";
+
+        operadorIdFinal = o._id || o.id || null;
+
+      } else if (req.body.operadorUsername) {
+        operadorNombreFinal = req.body.operadorUsername;
+        operadorIdFinal = req.body.operadorId || null;
+
+      } else {
+        operadorNombreFinal = getOperadorNombre(req) || "Operador Desconocido";
+      }
+
+      // ================================
+      // 🔥 ARMADO DEL OBJETO MOVIMIENTO
+      // ================================
+      const datosMovimiento = {
+        patente: patenteUp,
+        tipoVehiculo: vehiculo.tipoVehiculo || "Desconocido",
+        metodoPago,
+        factura,
+        descripcion,
+        monto: Number(costoFinal) || 0,
+        tipoTarifa,
+        ticket: estadiaSnapshot.ticket || undefined,
+        fotoUrl: fotoMovBody || estadiaSnapshot.fotoUrl || undefined,
+        entrada: estadiaSnapshot.entrada || undefined,
+        salida: salida,
+        tiempoHoras: horas,
+        operador: operadorNombreFinal,
+        operadorId: operadorIdFinal,
+        promo: promoBody || undefined,
+
+        // 🔥 Clave para DEDUPE FUERTE (evita duplicados)
+        ticketPago: estadiaSnapshot.ticket,
+      };
+
+      const respMov = await axios.post(
+        "http://localhost:5000/api/movimientos/registrar",
+        datosMovimiento,
+        {
+          headers: {
+            "Content-Type": "application/json",
+            ...(authHeader ? { Authorization: authHeader } : {}),
+          },
+        }
+      );
+
+      if (respMov.data && respMov.data.movimiento) {
+        movimientoDoc = respMov.data.movimiento;
+      } else {
+        console.warn(
+          "[registrarSalida] /api/movimientos/registrar no devolvió movimiento"
+        );
+      }
+    } catch (e) {
+      console.error("[registrarSalida] Error creando Movimiento:", e.message || e);
+    }
 
     const vehiculoActualizado = await Vehiculo.findOne({ _id: vehiculo._id }).lean();
+
     return res.json({
       msg: "Salida registrada",
       estadia: estadiaSnapshot,
-      movimiento: movimientoDoc,
+      movimiento: movimientoDoc || null,
       turnoUsado: turnoElegible
         ? { _id: turnoElegible._id, inicio: turnoElegible.inicio, fin: turnoElegible.fin }
         : null,
@@ -817,10 +900,9 @@ exports.registrarSalida = async (req, res) => {
     });
   } catch (err) {
     await session.abortTransaction();
+    session.endSession();
     console.error("💥 Error en registrarSalida:", err);
     res.status(500).json({ msg: err.message || "Error del servidor" });
-  } finally {
-    session.endSession();
   }
 };
 

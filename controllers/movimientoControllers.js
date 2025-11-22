@@ -285,54 +285,6 @@ exports.registrarMovimiento = async (req, res) => {
     }
 
     // 2) Dedupe por ticket (💡 evita doble asiento registrarSalida + POST manual)
-    let dupByTicket = null;
-    if (Number.isFinite(Number(ticket))) {
-      dupByTicket = await findRecentMovimientoByTicket({ patente: patenteUp, ticket: Number(ticket) });
-    }
-    if (dupByTicket) {
-      const patch = {};
-      // Preferimos info de este POST si aporta más calidad
-      if (!dupByTicket.metodoPago && metodoPago) patch.metodoPago = metodoPago;
-      if (!dupByTicket.factura && factura) patch.factura = factura;
-      if (!dupByTicket.fotoUrl && fotoUrl) patch.fotoUrl = fotoUrl;
-      if (promoObj && !dupByTicket.promo) patch.promo = promoObj;
-
-      if (shouldPreferIncomingDesc(dupByTicket.descripcion, descripcion)) {
-        patch.descripcion = descripcion;
-      }
-      if (shouldPreferIncomingTipoTarifa(dupByTicket.tipoTarifa, tarifa)) {
-        patch.tipoTarifa = tarifa;
-      }
-
-      // Si el monto que trae el operador difiere (por ejemplo aplica promo), priorizamos el nuevo
-      if (Number.isFinite(montoNum) && montoNum !== Number(dupByTicket.monto)) {
-        patch.monto = montoNum;
-      }
-
-      // Operador más rico
-      if (dupByTicket.operador === 'Operador Desconocido' && operador && operador !== 'Operador Desconocido') {
-        patch.operador = operador;
-      }
-      if (!dupByTicket.operadorId && operadorId) patch.operadorId = operadorId;
-
-      if (Object.keys(patch).length) {
-        const updated = await Movimiento.findByIdAndUpdate(dupByTicket._id, { $set: patch }, { new: true });
-        const finalDoc = updated.toObject();
-        return res.status(200).json({
-          msg: "Movimiento fusionado por ticket (sin duplicar)",
-          movimiento: { ...finalDoc, createdAt: finalDoc.createdAt || finalDoc.fecha },
-          dedup: true,
-          mode: 'soft-ticket-merge'
-        });
-      }
-
-      return res.status(200).json({
-        msg: "Movimiento ya existente por ticket (sin duplicar)",
-        movimiento: { ...dupByTicket, createdAt: dupByTicket.createdAt || dupByTicket.fecha },
-        dedup: true,
-        mode: 'soft-ticket'
-      });
-    }
 
     // 3) Guard duro (índice único con bucket 2s)
     const idemBucket2s = Math.floor(Date.now() / IDEM_WINDOW_MS);

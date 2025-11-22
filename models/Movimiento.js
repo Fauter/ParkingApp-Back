@@ -15,7 +15,7 @@ const MovimientoSchema = new mongoose.Schema({
 
   // 👤 Operador (string mostrado) + referencia opcional
   operador: { type: String, required: true },
-  operadorId: { type: String }, // opcional (por si querés enlazar al usuario)
+  operadorId: { type: String },
 
   tipoVehiculo: { type: String, required: true },
 
@@ -32,22 +32,54 @@ const MovimientoSchema = new mongoose.Schema({
 
   monto: { type: Number, required: true },
 
-  // 🎟️ Info de promo asociada (objeto libre) o null
   promo: { type: mongoose.Schema.Types.Mixed, default: null },
 
   tipoTarifa: { type: String },
   ticket: { type: Number },
 
-  // ✅ Foto asociada al movimiento
+  // ✔ NUEVO: ticketPago autoincremental
+  ticketPago: { type: Number, default: null },
+
   fotoUrl: { type: String, default: null },
 
-  // 🔑 Bucket de idempotencia en milisegundos (p.ej. 2s => floor(now/2000))
   idemBucket2s: { type: Number, default: null }
 }, { timestamps: true });
 
-MovimientoSchema.pre('save', function(next) {
-  if (!this.fecha) this.fecha = this.createdAt || new Date();
-  next();
+MovimientoSchema.pre('save', async function(next) {
+  try {
+    // Fecha fija al crear
+    if (!this.fecha) {
+      this.fecha = this.createdAt || new Date();
+    }
+
+    // Autoincremento simple basado en la colección
+    if (this.isNew && (this.ticketPago == null)) {
+      const Modelo = this.constructor;
+
+      // Buscar SOLO movimientos reales
+      const last = await Modelo
+        .findOne(
+          {
+            ticketPago: { $gte: 1 },        // solo válidos
+            movimiento: { $exists: false }  // ignora basura del syncService
+          },
+          { ticketPago: 1 }
+        )
+        .sort({ ticketPago: -1 })
+        .lean()
+        .catch(() => null);
+
+      // 🎯 EXACTAMENTE como vos querés:
+      // Si no hay movimientos válidos → ticketPago = 1
+      // Si hay → ticketPago = último + 1
+      const lastValue = Number(last?.ticketPago) || 0;
+      this.ticketPago = lastValue + 1;
+    }
+
+    next();
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Índices útiles
@@ -55,11 +87,12 @@ MovimientoSchema.index({ createdAt: -1 });
 MovimientoSchema.index({ fecha: -1 });
 MovimientoSchema.index({ patente: 1, createdAt: -1 });
 MovimientoSchema.index({ ticket: -1 });
+MovimientoSchema.index({ ticketPago: 1 });
 MovimientoSchema.index({ fotoUrl: 1 });
 MovimientoSchema.index({ operador: 1 });
 MovimientoSchema.index({ operadorId: 1 });
 
-// 🧱 Índice ÚNICO de idempotencia (solo si idemBucket2s existe)
+// 🧱 Índice ÚNICO de idempotencia
 MovimientoSchema.index({
   idemBucket2s: 1,
   patente: 1,

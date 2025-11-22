@@ -370,22 +370,40 @@ exports.imprimirTicketSalida = (req, res) => {
   const arg1 = barcodeNum;
 
   const meta = {
-    // el script asume strings amigables
     valorFinal:   valorFinalStr || (totalConDescuento != null ? String(totalConDescuento) : ''),
     patente:      patente ? String(patente).toUpperCase() : '',
     tipoVehiculo: tipoVehiculo ? String(tipoVehiculo) : '',
     ingreso:      ingresoAR,
-    egreso:       egresoAR
+    egreso:       egresoAR,
+    ticketPago:   req.body.ticketPago != null ? String(req.body.ticketPago) : ""
   };
 
   const arg2 = JSON.stringify(meta);
 
-  runPython(
-    scriptPath,
-    [arg1, arg2],
-    res,
-    '✅ Ticket de salida impreso correctamente',
-    'Error al imprimir ticket de salida'
+  const env = {
+    ...process.env,
+    VALOR_FINAL: meta.valorFinal,
+    PATENTE: meta.patente,
+    TIPO_VEHICULO: meta.tipoVehiculo,
+    INGRESO: meta.ingreso,
+    EGRESO: meta.egreso,
+    TICKET_PAGO: req.body.ticketPago != null ? String(req.body.ticketPago) : ""
+  };
+
+  execFile(
+    'python',
+    [scriptPath, arg1, arg2],
+    { env, windowsHide: true, encoding: 'utf8' },
+    (error, stdout, stderr) => {
+      if (error) {
+        console.error("❌ Error imprimir_ticket_salida.py:", error);
+        return res.status(500).send("❌ Error al imprimir ticket de salida");
+      }
+      if (stdout) console.log("Python stdout:", stdout);
+      if (stderr) console.log("Python stderr:", stderr);
+
+      return res.send("✅ Ticket de salida impreso correctamente");
+    }
   );
 };
 

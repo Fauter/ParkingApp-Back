@@ -293,10 +293,13 @@ def _make_barcode_image(number: str, target_w: int):
         img_bar = img_bar.resize((target_w, h), PILImage.LANCZOS)
     return img_bar
 
-def render_ticket_canvas(lines, barcode_number,
-                         valor_final: str = "", patente: str = "", tipo_vehiculo: str = "",
-                         not_pdf: bool = False,
-                         ticket_number: str = ""):
+def render_ticket_canvas(
+        lines, barcode_number,
+        valor_final: str = "", patente: str = "", tipo_vehiculo: str = "",
+        not_pdf: bool = False,
+        ticket_number: str = "",
+        ticket_pago_str: str = ""   # ← NUEVO
+    ):
     """
     Devuelve un PIL.Image 'L' (grises) del ticket de SALIDA.
     Misma disposición en PDF y en térmica. En térmica se usa escala mayor y “heavy”.
@@ -365,8 +368,9 @@ def render_ticket_canvas(lines, barcode_number,
     y = _draw_box_with_x(draw, center_x, y, cross_size, padding=cross_pad, stroke=2, color=0, fill=None)
     y += cross_gap
 
-    # "Ticket: NNNNN"
-    y = _draw_center(draw, f"Ticket: {ticket_number}", y, font_ticket, canvas_w, heavy=heavy); y += gap
+    # "Ticket: <ticketPago>"  (NO el barcode)
+    y = _draw_center(draw, f"Ticket: {ticket_pago_str}", y, font_ticket, canvas_w, heavy=heavy); 
+    y += gap
 
     # "Estacionamiento Agüero"
     y = _draw_center(draw, header, y, font_title, canvas_w, heavy=heavy); y += gap
@@ -588,7 +592,8 @@ def main():
                 lines, number_to_encode,
                 valor_final=valor_final, patente=patente, tipo_vehiculo=tipo_vehiculo,
                 not_pdf=False,
-                ticket_number=number_to_encode
+                ticket_number=number_to_encode,     # barcode
+                ticket_pago_str=os.environ.get("TICKET_PAGO", "")  # texto arriba
             )
             _save_preview(canvas, number_to_encode)
             return
@@ -604,7 +609,8 @@ def main():
             lines, number_to_encode,
             valor_final=valor_final, patente=patente, tipo_vehiculo=tipo_vehiculo,
             not_pdf=True,
-            ticket_number=number_to_encode
+            ticket_number=number_to_encode,     # barcode
+            ticket_pago_str=os.environ.get("TICKET_PAGO", "")
         )
         _print_bitmap_via_gdi(printer_name, canvas.convert("RGB"))
         return

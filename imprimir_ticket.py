@@ -358,7 +358,7 @@ def render_ticket_canvas(
     y += cross_gap
 
     # Ticket
-    y = _draw_center(draw, f"Ticket: {barcode_number}", y, font_ticket, canvas_w, heavy=heavy); y += gap
+    y = _draw_center(draw, f"Ingreso: {barcode_number}", y, font_ticket, canvas_w, heavy=heavy); y += gap
     # Título
     y = _draw_center(draw, header_title, y, font_title, canvas_w, heavy=heavy); y += gap
     # Dirección

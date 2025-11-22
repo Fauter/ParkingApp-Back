@@ -894,10 +894,41 @@ async function upsertLocalDocWithConflictResolution(localCollection, collName, r
   }
 
   if (String(collName).toLowerCase() === 'vehiculos') {
+
+    // 🔥 1) detectar si LOCAL ya no tiene estadiaActual
+    const localDoc = await localCollection.findOne(
+      { _id },
+      { projection: { estadiaActual: 1 } }
+    ).lean();
+
+    const localTieneSalida =
+      !localDoc?.estadiaActual ||
+      (typeof localDoc.estadiaActual === 'object' &&
+      !Array.isArray(localDoc.estadiaActual) &&
+      Object.keys(localDoc.estadiaActual).length === 0);
+
+    // 🔥 2) si local tiene salida => bloquear SIEMPRE estadiaActual del remoto
+    if (localTieneSalida) {
+      unsetOps.estadiaActual = "";
+      if (setOps && Object.prototype.hasOwnProperty.call(setOps, 'estadiaActual')) {
+        delete setOps.estadiaActual;
+      }
+      // 🔥 NO seguir procesando estadiaActual
+      // (Esto impide revivir una estadía remota vieja)
+      if (cleaned.estadiaActual) delete cleaned.estadiaActual;
+      return true;
+    }
+
+    // 🔥 3) caso normal:
+    //     Si remoto manda estadiaActual vacío → unset
     const hasEstadia = Object.prototype.hasOwnProperty.call(cleaned, 'estadiaActual');
     const isEmpty =
-      hasEstadia && cleaned.estadiaActual && typeof cleaned.estadiaActual === 'object' &&
-      !Array.isArray(cleaned.estadiaActual) && Object.keys(cleaned.estadiaActual).length === 0;
+      hasEstadia &&
+      cleaned.estadiaActual &&
+      typeof cleaned.estadiaActual === 'object' &&
+      !Array.isArray(cleaned.estadiaActual) &&
+      Object.keys(cleaned.estadiaActual).length === 0;
+
     if (!hasEstadia || isEmpty) {
       unsetOps.estadiaActual = "";
       if (hasEstadia && setOps && Object.prototype.hasOwnProperty.call(setOps, 'estadiaActual')) {
