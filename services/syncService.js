@@ -894,29 +894,30 @@ async function upsertLocalDocWithConflictResolution(localCollection, collName, r
   }
 
   if (String(collName).toLowerCase() === 'vehiculos') {
-
-    // 🔥 1) detectar si LOCAL ya no tiene estadiaActual
+    // 🔥 1) detectar si LOCAL ya no tiene estadiaActual (solo si el doc EXISTE)
     const localDoc = await localCollection.findOne(
       { _id },
       { projection: { estadiaActual: 1 } }
-    ).lean();
+    );
 
-    const localTieneSalida =
-      !localDoc?.estadiaActual ||
-      (typeof localDoc.estadiaActual === 'object' &&
-      !Array.isArray(localDoc.estadiaActual) &&
-      Object.keys(localDoc.estadiaActual).length === 0);
+    if (localDoc) {
+      const localSinEstadia =
+        !localDoc.estadiaActual ||
+        (typeof localDoc.estadiaActual === 'object' &&
+          !Array.isArray(localDoc.estadiaActual) &&
+          Object.keys(localDoc.estadiaActual).length === 0);
 
-    // 🔥 2) si local tiene salida => bloquear SIEMPRE estadiaActual del remoto
-    if (localTieneSalida) {
-      unsetOps.estadiaActual = "";
-      if (setOps && Object.prototype.hasOwnProperty.call(setOps, 'estadiaActual')) {
-        delete setOps.estadiaActual;
+      // 🔥 2) si local ya NO tiene estadía, NO revivir una vieja del remoto
+      if (localSinEstadia) {
+        unsetOps.estadiaActual = "";
+        if (setOps && Object.prototype.hasOwnProperty.call(setOps, 'estadiaActual')) {
+          delete setOps.estadiaActual;
+        }
+        // 👇 OJO: NO hacemos return acá.
+        // Dejamos que el updateOne de abajo se ejecute igual,
+        // solo que sin tocar estadiaActual.
+        if (cleaned.estadiaActual) delete cleaned.estadiaActual;
       }
-      // 🔥 NO seguir procesando estadiaActual
-      // (Esto impide revivir una estadía remota vieja)
-      if (cleaned.estadiaActual) delete cleaned.estadiaActual;
-      return true;
     }
 
     // 🔥 3) caso normal:
@@ -1306,7 +1307,48 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
     console.warn('[syncService] no se pudo ajustar counter post-pull:', e.message);
   }
 
+  // ============================================
+  // 🔥 AJUSTE ticketPago post-pull (necesario SIEMPRE)
+  // ============================================
+  try {
+    let max = 0;
+
+    // 1) ticketPago en root
+    const lastRoot = await Movimiento.findOne({ ticketPago: { $gte: 1 } })
+      .sort({ ticketPago: -1 })
+      .select('ticketPago')
+      .lean();
+
+    if (lastRoot && typeof lastRoot.ticketPago === 'number') {
+      max = Math.max(max, lastRoot.ticketPago);
+    }
+
+    // 2) ticketPago en movimiento.ticketPago (logs que vienen del remoto)
+    const lastNested = await Movimiento.findOne({ 'movimiento.ticketPago': { $gte: 1 } })
+      .sort({ 'movimiento.ticketPago': -1 })
+      .select('movimiento.ticketPago')
+      .lean();
+
+    if (lastNested && lastNested.movimiento && typeof lastNested.movimiento.ticketPago === 'number') {
+      max = Math.max(max, lastNested.movimiento.ticketPago);
+    }
+
+    const valor = max;
+
+    const ctrl = require('../controllers/movimientoControllers');
+    if (typeof ctrl._setLastTicketPago === 'function') {
+      ctrl._setLastTicketPago(valor);
+      console.log(`[syncService] ticketPago ajustado post-pull a ${valor}`);
+    } else {
+      console.warn('[syncService] _setLastTicketPago no encontrado en movimientoControllers');
+    }
+  } catch (e) {
+    console.warn('[syncService] no se pudo ajustar ticketPago post-pull:', e.message);
+  }
+
+
   return resultCounts;
+
 }
 
 // =======================
@@ -1488,20 +1530,10 @@ async function syncTick(atlasUri, opts = {}, statusCb = () => {}) {
       }
     }
 
-    // === C) MINI-PULL FINAL SOLO ESPEJOS
-    const pullOptsC = {
-      pullAll: !!opts.mirrorAll,
-      mirrorAll: !!opts.mirrorAll,
-      mirrorCollections: opts.mirrorCollections || [],
-      skipCollections: opts.skipCollections || [],
-      skipCollectionsSet: bulkDeletedCollections,
-    };
-    const reqC = pullOptsC.pullAll ? [] : (pullOptsC.mirrorCollections || []);
-    const pullCountsC = await pullCollectionsFromRemote(remoteDb, reqC, pullOptsC);
-
-    status.lastPullCounts = { ...status.lastPullCounts, ...pullCountsC };
-    status.lastError = null;
-    statusCb(status);
+    // === C) MINI-PULL FINAL DESHABILITADO ===
+    // No hacemos un segundo pull/mirror para evitar que colecciones locales
+    // como vehículos, clientes, cocheras, etc. queden pisadas.
+    console.log('[syncService] mini-pull espejo final DESHABILITADO');
 
   } catch (err) {
     status.lastError = String(err).slice(0, 2000);

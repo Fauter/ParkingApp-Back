@@ -45,41 +45,11 @@ const MovimientoSchema = new mongoose.Schema({
   idemBucket2s: { type: Number, default: null }
 }, { timestamps: true });
 
-MovimientoSchema.pre('save', async function(next) {
-  try {
-    // Fecha fija al crear
-    if (!this.fecha) {
-      this.fecha = this.createdAt || new Date();
-    }
-
-    // Autoincremento simple basado en la colección
-    if (this.isNew && (this.ticketPago == null)) {
-      const Modelo = this.constructor;
-
-      // Buscar SOLO movimientos reales
-      const last = await Modelo
-        .findOne(
-          {
-            ticketPago: { $gte: 1 },        // solo válidos
-            movimiento: { $exists: false }  // ignora basura del syncService
-          },
-          { ticketPago: 1 }
-        )
-        .sort({ ticketPago: -1 })
-        .lean()
-        .catch(() => null);
-
-      // 🎯 EXACTAMENTE como vos querés:
-      // Si no hay movimientos válidos → ticketPago = 1
-      // Si hay → ticketPago = último + 1
-      const lastValue = Number(last?.ticketPago) || 0;
-      this.ticketPago = lastValue + 1;
-    }
-
-    next();
-  } catch (err) {
-    next(err);
+MovimientoSchema.pre('save', function(next) {
+  if (!this.fecha) {
+    this.fecha = this.createdAt || new Date();
   }
+  next();
 });
 
 // Índices útiles

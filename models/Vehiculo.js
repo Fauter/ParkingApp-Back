@@ -95,7 +95,6 @@ vehiculoSchema.pre('save', async function (next) {
    ÍNDICES
 ======================================================= */
 
-vehiculoSchema.index({ patente: 1 }, { unique: true });
 vehiculoSchema.index({ cliente: 1 });
 vehiculoSchema.index({ cocheraId: 1 });
 vehiculoSchema.index({ turno: 1 });

@@ -8,6 +8,66 @@ let Vehiculo = null; // lazy require para evitar ciclos
 const IDEM_WINDOW_MS = parseInt(process.env.MOV_DEDUP_WINDOW_MS || '2000', 10); // 2s por pedido
 const SOFT_DEDUP_MS  = parseInt(process.env.MOV_SOFT_DEDUP_MS  || '15000', 10); // respaldo 15s
 
+// ============================================
+// 🔢 ticketPago Global Cache (persistencia entre reinicios)
+// ============================================
+let LAST_TICKET_PAGO = 0;
+let TICKET_PAGO_READY = false;
+
+function _setLastTicketPagoInternal(n) {
+  const num = Number.isFinite(Number(n)) ? Number(n) : 0;
+  LAST_TICKET_PAGO = num;
+  TICKET_PAGO_READY = true;
+  console.log(`[ticketPago] Actualizado a ${LAST_TICKET_PAGO}`);
+}
+
+async function recomputeTicketPagoFromDB() {
+  try {
+    let max = 0;
+
+    // 1) ticketPago en root
+    const lastRoot = await Movimiento.findOne({ ticketPago: { $gte: 1 } })
+      .sort({ ticketPago: -1 })
+      .select('ticketPago')
+      .lean();
+
+    if (lastRoot && typeof lastRoot.ticketPago === 'number') {
+      max = Math.max(max, lastRoot.ticketPago);
+    }
+
+    // 2) ticketPago en movimiento.ticketPago (logs que vienen de Atlas)
+    const lastNested = await Movimiento.findOne({ 'movimiento.ticketPago': { $gte: 1 } })
+      .sort({ 'movimiento.ticketPago': -1 })
+      .select('movimiento.ticketPago')
+      .lean();
+
+    if (lastNested && lastNested.movimiento && typeof lastNested.movimiento.ticketPago === 'number') {
+      max = Math.max(max, lastNested.movimiento.ticketPago);
+    }
+
+    LAST_TICKET_PAGO = max;
+    TICKET_PAGO_READY = true;
+
+    console.log(`[ticketPago] Recalculado desde DB -> ${LAST_TICKET_PAGO}`);
+  } catch (err) {
+    console.error('[ticketPago] Error recalculando desde DB:', err);
+  }
+}
+
+// Se llama luego de que mongo local levante (fallback por si no corrió syncService aún)
+async function initTicketPagoFromDB() {
+  await recomputeTicketPagoFromDB();
+}
+
+// Espera a que mongo local levante + primer pull
+setTimeout(initTicketPagoFromDB, 2500);
+
+// 👉 Setter expuesto para syncService
+exports._setLastTicketPago = function (n) {
+  _setLastTicketPagoInternal(n);
+};
+
+
 // ============================
 // 👤 Operador (robusto): req.user > body
 // ============================
@@ -305,6 +365,18 @@ exports.registrarMovimiento = async (req, res) => {
       ...(fotoUrl ? { fotoUrl } : {}),
       idemBucket2s
     };
+
+    // ==================================
+    // ✔ Asignación robusta de ticketPago
+    // ==================================
+    if (!TICKET_PAGO_READY) {
+      // fallback si todavía no terminó el pull inicial
+      await recomputeTicketPagoFromDB();
+    }
+
+    LAST_TICKET_PAGO += 1;
+    baseDoc.ticketPago = LAST_TICKET_PAGO;
+    // ==================================
 
     try {
       const nuevoMovimiento = new Movimiento(baseDoc);
