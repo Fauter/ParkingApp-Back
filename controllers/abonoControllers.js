@@ -974,20 +974,27 @@ exports.registrarAbono = async (req, res) => {
     // ============================================================
     try {
       const Cochera = require("../models/Cochera");
+      const Vehiculo = require("../models/Vehiculo");
 
-      const cochFinal = await Cochera.findById(cocheraReal._id)
-        .populate("vehiculos", "_id patente")
-        .session(session)   // ← obligatorio
+      // cochera “cruda” sin populate para evitar buffers raros
+      const coch = await Cochera.findById(cocheraReal._id)
+        .session(session)
+        .lean();
+
+      // listado limpio de vehículos por cocheraId
+      const vehs = await Vehiculo.find({ cocheraId: cocheraReal._id })
+        .select("_id")
+        .session(session)
         .lean();
 
       await require("../services/cocheraService")
         .registrarOutboxCocheraInterna({
-          _id: cochFinal._id,
-          cliente: cochFinal.cliente,
-          tipo: cochFinal.tipo,
-          piso: cochFinal.piso,
-          exclusiva: cochFinal.exclusiva,
-          vehiculos: (cochFinal.vehiculos || []).map(v => String(v._id))
+          _id: coch._id,
+          cliente: coch.cliente,
+          tipo: coch.tipo,
+          piso: coch.piso,
+          exclusiva: coch.exclusiva,
+          vehiculos: vehs.map(v => String(v._id)),
         });
 
     } catch (e) {
@@ -1005,14 +1012,15 @@ exports.registrarAbono = async (req, res) => {
         (c) => String(c.cocheraId || "") === String(cocheraIdFinal)
       );
 
+      // ✅ Reemplazalo por esto (cocheras[] = sólo referencia, los datos viven en Cochera)
       if (idx === -1) {
         cliente.cocheras.push({
           cocheraId: cocheraIdFinal,
-          cochera: cocheraNorm,
-          piso: cocheraNorm === "Fija" ? pisoNorm : "",
-          exclusiva: exclusivaNorm,
         });
       }
+
+      cliente.markModified("cocheras");
+      await cliente.save(sopt);
 
       cliente.markModified("cocheras");
       await cliente.save(sopt);
