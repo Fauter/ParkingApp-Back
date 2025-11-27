@@ -1546,27 +1546,95 @@ async function syncTick(atlasUri, opts = {}, statusCb = () => {}) {
   }
 }
 
-// =======================
+// ===============================
+// MASTER SWITCH DE SINCRONIZACIÓN
+// ===============================
+// SYNC_ENABLED:
+// 1 → sync completo: inicial + periódico + push
+// 0 → SOLO PULL INICIAL ABSOLUTO DESDE REMOTO → LOCAL
+//     (SIN loop periódico, SIN push, SIN incremental)
+const SYNC_ENABLED = process.env.SYNC_ENABLED !== '0';
+
+if (!SYNC_ENABLED) {
+  // Garantizar que NO haya push jamás cuando está apagado
+  process.env.SYNC_DISABLE_PUSH = '1';
+  // No permitir incremental
+  process.env.SYNC_PULL = '*'; // obligamos pull completo inicial
+}
+
+// ===============================
 function startPeriodicSync(atlasUri, opts = {}, statusCb = () => {}) {
-  const intervalMs = opts.intervalMs || 30_000;
+  console.log("[syncService] SYNC_ENABLED =", SYNC_ENABLED);
+
+  const intervalMs = opts.intervalMs || 30000;
+
+  // ============================================================
+  // 🔴 MODO SYNC DESACTIVADO (SYNC_ENABLED=0)
+  //     → solo pull inicial absoluto, SIN loop periódico
+  // ============================================================
+  if (!SYNC_ENABLED) {
+    console.log("[syncService] SYNC desactivado. Ejecutando SOLO PULL INICIAL...");
+
+    // ⬇️ opciones PARA EL PULL INICIAL
+    const initialOpts = {
+      pullAll: true,                // 🔥 FULL desde remoto
+      mirrorAll: false,
+      mirrorCollections: opts.mirrorCollections || [],
+      skipCollections: opts.skipCollections || [],
+      remoteDbName: opts.remoteDbName
+    };
+
+    // Ejecutamos una sola vez
+    syncTick(atlasUri, initialOpts, statusCb)
+      .then(() => console.log("[syncService] PULL INICIAL COMPLETADO (SYNC apagado)."))
+      .catch(e => console.error("[syncService] Error en pull inicial:", e));
+
+    // devolvemos handle vacío
+    return {
+      stop: () => {},
+      runOnce: () => Promise.resolve(),
+      getStatus: () => ({ ...status }),
+      inspectRemote: async () => ({ remoteDbName: null, counts: {} })
+    };
+  }
+
+  // ============================================================
+  // 🔵 MODO SYNC ACTIVADO (SYNC_ENABLED=1)
+  //     → todo igual que siempre
+  // ============================================================
   console.log('[syncService] iniciando sincronizador. Intervalo:', intervalMs, 'ms');
+
   if (opts.remoteDbName) {
     SELECTED_REMOTE_DBNAME = opts.remoteDbName;
     console.log(`[syncService] DB remota seleccionada: "${SELECTED_REMOTE_DBNAME}"`);
   }
 
-  syncTick(atlasUri, opts, statusCb).catch(e => console.error('[syncService] primer tick falló:', e));
+  const effectiveOpts = {
+    ...opts,
+    pullCollections: process.env.SYNC_PULL
+      ? process.env.SYNC_PULL.split(',').filter(Boolean)
+      : [],
+  };
 
-  const handle = setInterval(() => syncTick(atlasUri, opts, statusCb), intervalMs);
+  // Primer tick
+  syncTick(atlasUri, effectiveOpts, statusCb)
+    .catch(e => console.error('[syncService] primer tick falló:', e));
+
+  // Loop periódico
+  const handle = setInterval(
+    () => syncTick(atlasUri, effectiveOpts, statusCb),
+    intervalMs
+  );
 
   return {
     stop: () => clearInterval(handle),
-    runOnce: () => syncTick(atlasUri, opts, statusCb),
+    runOnce: () => syncTick(atlasUri, effectiveOpts, statusCb),
     getStatus: () => ({ ...status }),
     inspectRemote: async (cols = []) => {
       const db = getRemoteDbInstance() || await connectRemote(atlasUri, SELECTED_REMOTE_DBNAME);
-      let collections = cols.length ? cols : (await db.listCollections().toArray()).map(c => canonicalizeName(c.name));
-      collections = Array.from(new Set(collections));
+      let collections = cols.length
+        ? cols
+        : (await db.listCollections().toArray()).map(c => canonicalizeName(c.name));
       const out = {};
       for (const c of collections) {
         try {

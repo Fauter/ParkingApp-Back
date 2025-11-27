@@ -10,31 +10,39 @@ const {
 } = mongoose;
 
 // =======================================================
-// 🔥 Outbox interno (igual al del controller de cocheras)
+// 🔥 Outbox interno (UPDATE idempotente de cochera)
 // =======================================================
 async function registrarOutboxCocheraInterna(doc) {
   try {
     const Outbox = require("../models/Outbox");
 
+    const id = String(doc._id || "");
+    if (!id) {
+      console.warn("[cocheras] registrarOutboxCocheraInterna sin _id, skip");
+      return;
+    }
+
     await Outbox.create({
-      method: "POST",
-      route: "/api/cocheras",
+      // ⚠️ Acá tiene que ser UPDATE, no alta nueva
+      method: "PATCH",
+      route: `/api/cocheras/${id}`,
       collection: "cocheras",
       document: {
-        _id: String(doc._id),
-        clienteId: String(doc.cliente),
+        _id: id,
+        // el modelo se llama 'cliente' (ObjectId), no 'clienteId'
+        cliente: String(doc.cliente || ""),
         tipo: doc.tipo,
         piso: doc.piso,
         exclusiva: doc.exclusiva,
-        vehiculos: (doc.vehiculos || []).map(v => String(v))
+        vehiculos: (doc.vehiculos || []).map((v) => String(v)),
       },
-      params: { id: String(doc._id) },
+      params: { id },
       query: {},
       status: "pending",
-      createdAt: new Date()
+      createdAt: new Date(),
     });
 
-    console.log(`[cocheras] ✔ Outbox generado desde ensureCocheraInterno: ${doc._id}`);
+    console.log(`[cocheras] ✔ Outbox PATCH generado para cochera: ${id}`);
   } catch (e) {
     console.error("[cocheras] ❌ Error generando outbox interno:", e.message);
   }
@@ -57,35 +65,37 @@ function normExclusiva(raw, tipo) {
   return ["true", "1", "si", "sí", "yes", "y"].includes(s);
 }
 
-/* =======================================================
-   ✔ ensureCocheraInterno (NO HTTP)
-======================================================= */
+// =======================================================
+// 🚫 NO MÁS DUPLICADOS — 1 cochera por (tipo,piso,exclusiva)
+// cliente ya NO forma parte del filtro
+// =======================================================
 async function ensureCocheraInterno({ clienteId, tipo, piso, exclusiva, session }) {
-  const cli = await Cliente.findById(clienteId).session(session);
-  if (!cli) throw new Error("Cliente no encontrado");
-
   const tipoNorm = normTipo(tipo) || "Móvil";
   const pisoNorm = normPiso(piso);
   const exclusivaNorm = normExclusiva(exclusiva, tipoNorm);
 
-  let coch = await Cochera.findOne({
+  // 🔎 filtro SIN cliente — evita duplicar cocheras
+  const filter = {
     cliente: clienteId,
     tipo: tipoNorm,
     piso: pisoNorm,
-    exclusiva: exclusivaNorm,
-  }).session(session);
+    exclusiva: exclusivaNorm
+  };
 
-  if (coch) return coch;
-
-  coch = new Cochera({
-    cliente: clienteId,
-    tipo: tipoNorm,
-    piso: pisoNorm,
-    exclusiva: exclusivaNorm,
-    vehiculos: [],
-  });
-
-  await coch.save({ session });
+  // upsert atómico, sin duplicados
+  let coch = await Cochera.findOneAndUpdate(
+    filter,
+    {
+      $setOnInsert: {
+        tipo: tipoNorm,
+        piso: pisoNorm,
+        exclusiva: exclusivaNorm,
+        cliente: clienteId,
+        vehiculos: []
+      }
+    },
+    { new: true, upsert: true, session }
+  );
 
   return coch;
 }
@@ -116,11 +126,14 @@ async function asignarVehiculoInterno({ cocheraId, vehiculoId, session }) {
   veh.cliente = clienteId;
   await veh.save({ session });
 
-  // vincular cochera
+  // vincular cochera + cliente del vehículo
   await Cochera.updateOne(
     { _id: cocheraId },
-    { $addToSet: { vehiculos: vehiculoId } },
-    { session },
+    {
+      $addToSet: { vehiculos: vehiculoId },
+      $set: { cliente: clienteId }   // actualizo dueño si antes era null
+    },
+    { session }
   );
 
   // vincular cliente

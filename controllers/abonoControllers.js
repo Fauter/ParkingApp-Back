@@ -447,6 +447,37 @@ async function ensureClienteBackend(payload, sopt) {
   return cliente;
 }
 
+async function getBaseCocheraVigente(clienteId, cocheraNorm, pisoNorm, hoy = new Date(), sopt) {
+  if (!clienteId) return { existe: false, base: 0 };
+
+  const inicioMes = new Date(hoy.getFullYear(), hoy.getMonth(), 1);
+  const finMesLocal = new Date(hoy.getFullYear(), hoy.getMonth() + 1, 0, 23, 59, 59);
+  // misma tolerancia que getClienteMaxBaseMensualVigente
+  const finMesTolerante = new Date(finMesLocal.getTime() + 12 * 60 * 60 * 1000);
+
+  const abono = await Abono.findOne({
+    cliente: clienteId,
+    activo: true,
+    cochera: cocheraNorm,
+    piso: pisoNorm,
+    fechaExpiracion: { $gte: inicioMes, $lte: finMesTolerante }
+  }, null, sopt).lean();
+
+  if (!abono) return { existe: false, base: 0 };
+
+  try {
+    const r = await resolverPrecioSeguro({
+      tipoVehiculo: abono.tipoVehiculo,
+      metodoPago: abono.metodoPago || "Efectivo",
+      cochera: abono.cochera,
+      exclusiva: abono.exclusiva
+    });
+    return { existe: true, base: r.precio };
+  } catch {
+    return { existe: true, base: 0 };
+  }
+}
+
 /* =========================
    PREVIEWS
 ========================= */
@@ -460,15 +491,31 @@ exports.previewAbono = async (req, res) => {
       metodoPago = 'Efectivo',
       cochera = 'Móvil',
       exclusiva = 'false',
-      mesesAbonar = '1'
+      mesesAbonar = '1',
+      piso = ''
     } = req.query;
 
     if (!tipoVehiculo) {
       return res.status(400).json({ error: 'Falta tipoVehiculo' });
     }
 
-    const exBool = String(exclusiva) === 'true';
     const meses = clampInt(mesesAbonar, 1, 12);
+
+    // 🧠 Normalización coherente con registrarAbono
+    const cochKey = String(cochera || '').trim().toLowerCase();
+    const cocheraNorm = cochKey === 'fija' ? 'Fija' : 'Móvil';
+
+    let pisoNorm = '';
+    if (cocheraNorm === 'Fija') {
+      pisoNorm = String(piso || '').trim();
+      if (!pisoNorm) {
+        return res.status(400).json({ error: 'Las cocheras fijas deben tener número/piso asignado.' });
+      }
+    }
+
+    const exBool = cocheraNorm === 'Fija'
+      ? (String(exclusiva) === 'true' || exclusiva === true)
+      : false;
 
     // Resolver cliente por id o por dni (opcional)
     let cliente = null;
@@ -486,8 +533,8 @@ exports.previewAbono = async (req, res) => {
       const r = await resolverPrecioSeguro({
         tipoVehiculo,
         metodoPago,
-        cochera,
-        exclusiva: cochera === 'Fija' ? exBool : false
+        cochera: cocheraNorm,
+        exclusiva: exBool
       });
       baseNuevo = r.precio;
       tier = r.tier;
@@ -496,11 +543,14 @@ exports.previewAbono = async (req, res) => {
       return res.status(status).json({ error: e.message });
     }
 
-    // máximo base ya abonado este mes
+    // máximo base ya abonado este mes SOLO en esta cochera/piso
     let baseActual = 0;
+    let existeAbonoEnEstaCochera = false;
+
     if (cliente && cliente._id) {
-      const r = await getClienteMaxBaseMensualVigente(cliente._id, hoy, null);
-      baseActual = r.maxBase || 0;
+      const r = await getBaseCocheraVigente(cliente._id, cocheraNorm, pisoNorm, hoy);
+      baseActual = r.base;
+      existeAbonoEnEstaCochera = r.existe;
     }
 
     const multi = calcularCobroMultiMes(baseNuevo, baseActual, hoy, meses);
@@ -508,8 +558,9 @@ exports.previewAbono = async (req, res) => {
     return res.json({
       ok: true,
       metodoPago,
-      cochera,
-      exclusiva: cochera === 'Fija' ? exBool : false,
+      cochera: cocheraNorm,
+      piso: pisoNorm,
+      exclusiva: cocheraNorm === 'Fija' ? exBool : false,
       tipoVehiculo,
       mesesAbonar: multi.meses,
       baseActual,
@@ -522,7 +573,8 @@ exports.previewAbono = async (req, res) => {
       proporcionalMesActual: multi.proporcionalMesActual,
       subtotalMesesCompletos: multi.subtotalMesesCompletos,
       monto: multi.totalCobrar,
-      venceEl: multi.venceEl
+      venceEl: multi.venceEl,
+      existeAbonoEnEstaCochera
     });
   } catch (e) {
     console.error('previewAbono error:', e);
@@ -534,8 +586,13 @@ exports.previewAbono = async (req, res) => {
 exports.previewRenovacion = async (req, res) => {
   try {
     const { clienteId, metodoPago = 'Efectivo' } = req.query;
-    let { cochera = 'Móvil', exclusiva = 'false', mesesAbonar = '1' } = req.query;
-    const exBool = String(exclusiva) === 'true';
+    let {
+      cochera = 'Móvil',
+      exclusiva = 'false',
+      mesesAbonar = '1',
+      piso = ''
+    } = req.query;
+
     const meses = clampInt(mesesAbonar, 1, 12);
 
     if (!clienteId) return res.status(400).json({ error: 'Falta clienteId' });
@@ -550,10 +607,29 @@ exports.previewRenovacion = async (req, res) => {
         .sort({ fechaExpiracion: -1, createdAt: -1 })
         .lean();
       tipo = (ultimo?.tipoVehiculo || '').toLowerCase();
+
+      // Si no vino cochera/exclusiva/piso en el query, heredamos del último abono
       if (!req.query.cochera && ultimo?.cochera) cochera = ultimo.cochera;
       if (!req.query.exclusiva && typeof ultimo?.exclusiva === 'boolean') exclusiva = String(ultimo.exclusiva);
+      if (!req.query.piso && typeof ultimo?.piso === 'string') piso = ultimo.piso;
     }
     if (!tipo) return res.status(400).json({ error: 'No hay tipo asignado para renovar' });
+
+    // 🧠 Normalización de cochera/piso/exclusiva coherente con el resto
+    const cochKey = String(cochera || '').trim().toLowerCase();
+    const cocheraNorm = cochKey === 'fija' ? 'Fija' : 'Móvil';
+
+    let pisoNorm = '';
+    if (cocheraNorm === 'Fija') {
+      pisoNorm = String(piso || '').trim();
+      if (!pisoNorm) {
+        return res.status(400).json({ error: 'Las cocheras fijas deben tener número/piso asignado.' });
+      }
+    }
+
+    const exBool = cocheraNorm === 'Fija'
+      ? (String(exclusiva) === 'true' || exclusiva === true)
+      : false;
 
     const hoy = new Date();
 
@@ -562,8 +638,8 @@ exports.previewRenovacion = async (req, res) => {
       const r = await resolverPrecioSeguro({
         tipoVehiculo: tipo,
         metodoPago,
-        cochera,
-        exclusiva: cochera === 'Fija' ? exBool : false
+        cochera: cocheraNorm,
+        exclusiva: exBool
       });
       baseNuevo = r.precio;
       tier = r.tier;
@@ -572,14 +648,16 @@ exports.previewRenovacion = async (req, res) => {
       return res.status(status).json({ error: e.message });
     }
 
+    // Renovación: por diseño seguimos sin restar base previa (0)
     const multi = calcularCobroMultiMes(baseNuevo, 0, hoy, meses);
 
     return res.json({
       ok: true,
       metodoPago,
       tipoVehiculo: tipo,
-      cochera,
-      exclusiva: cochera === 'Fija' ? exBool : false,
+      cochera: cocheraNorm,
+      piso: pisoNorm,
+      exclusiva: cocheraNorm === 'Fija' ? exBool : false,
       mesesAbonar: multi.meses,
       baseNuevo,
       tier,
@@ -608,10 +686,10 @@ exports.renovarAbono = async (req, res) => {
   const sopt = session ? { session } : {};
 
   try {
-    const {
+    let {
       clienteId,
-      metodoPago='Efectivo',
-      factura='CC',
+      metodoPago = 'Efectivo',
+      factura = 'CC',
       operador,
       patente,
       cochera = 'Móvil',
@@ -619,6 +697,7 @@ exports.renovarAbono = async (req, res) => {
       exclusiva = false,
       mesesAbonar = 1
     } = req.body;
+
     if (!clienteId) throw new Error('Falta clienteId');
 
     const cliente = await findClienteFlexible(clienteId, sopt);
@@ -631,10 +710,26 @@ exports.renovarAbono = async (req, res) => {
         .sort({ fechaExpiracion: -1, createdAt: -1 })
         .lean();
       tipo = (ultimo?.tipoVehiculo || '').toLowerCase();
-      if (!req.body.cochera && ultimo?.cochera) req.body.cochera = ultimo.cochera;
-      if (!('exclusiva' in req.body) && typeof ultimo?.exclusiva === 'boolean') req.body.exclusiva = ultimo.exclusiva;
+
+      if (!('cochera' in req.body) && ultimo?.cochera) cochera = ultimo.cochera;
+      if (!('exclusiva' in req.body) && typeof ultimo?.exclusiva === 'boolean') exclusiva = ultimo.exclusiva;
+      if (!('piso' in req.body) && typeof ultimo?.piso === 'string') piso = ultimo.piso;
     }
     if (!tipo) throw new Error('El cliente no tiene tipo asociado para renovar');
+
+    // 🧠 Normalización de cochera/piso/exclusiva
+    const cochKey = String(cochera || '').trim().toLowerCase();
+    const cocheraNorm = cochKey === 'fija' ? 'Fija' : 'Móvil';
+
+    let pisoNorm = '';
+    if (cocheraNorm === 'Fija') {
+      pisoNorm = String(piso || '').trim();
+      if (!pisoNorm) throw new Error('Las cocheras fijas deben tener número/piso asignado.');
+    }
+
+    const exclusivaNorm = cocheraNorm === 'Fija'
+      ? (String(exclusiva).trim().toLowerCase() === 'true' || exclusiva === true)
+      : false;
 
     const hoy = new Date();
 
@@ -643,8 +738,8 @@ exports.renovarAbono = async (req, res) => {
       const r = await resolverPrecioSeguro({
         tipoVehiculo: tipo,
         metodoPago,
-        cochera,
-        exclusiva: cochera === 'Fija' ? Boolean(exclusiva) : false
+        cochera: cocheraNorm,
+        exclusiva: exclusivaNorm
       });
       baseNuevo = r.precio;
     } catch (e) {
@@ -673,9 +768,9 @@ exports.renovarAbono = async (req, res) => {
       fechaExpiracion: multi.venceEl,
       cliente: cliente._id,
       activo: true,
-      cochera: ['Fija','Móvil'].includes(String(cochera)) ? cochera : '',
-      piso: String(piso || ''),
-      exclusiva: cochera === 'Fija' ? Boolean(exclusiva) : false
+      cochera: cocheraNorm,
+      piso: pisoNorm,
+      exclusiva: exclusivaNorm
     });
     await abono.save(sopt);
 
@@ -718,7 +813,11 @@ exports.renovarAbono = async (req, res) => {
 //   REGISTRAR / AGREGAR ABONO
 // =========================
 
-const { ensureCocheraInterno, asignarVehiculoInterno } = require('../services/cocheraService');
+const {
+  ensureCocheraInterno,
+  asignarVehiculoInterno,
+  registrarOutboxCocheraInterna
+} = require('../services/cocheraService');
 
 exports.registrarAbono = async (req, res) => {
   console.log('📨 [registrarAbono] body:', JSON.stringify({ ...req.body, _files: !!req.files }, null, 2));
@@ -885,7 +984,9 @@ exports.registrarAbono = async (req, res) => {
     // ============================================================
     // 📅 MAX BASE MENSUAL YA ABONADO
     // ============================================================
-    const { maxBase } = await getClienteMaxBaseMensualVigente(cliente._id, new Date(), sopt);
+    const rBase = await getBaseCocheraVigente(cliente._id, cocheraNorm, pisoNorm, new Date(), sopt);
+    const maxBase = rBase.base; // solo para esta cochera
+    const existeAbonoEnEstaCochera = rBase.existe;
 
     // ============================================================
     // 📦 MULTIMES
@@ -970,61 +1071,23 @@ exports.registrarAbono = async (req, res) => {
     });
 
     // ============================================================
-    // 📨 OUTBOX FINAL — SIEMPRE DESPUÉS DE ASIGNAR EL VEHÍCULO
-    // ============================================================
-    try {
-      const Cochera = require("../models/Cochera");
-      const Vehiculo = require("../models/Vehiculo");
-
-      // cochera “cruda” sin populate para evitar buffers raros
-      const coch = await Cochera.findById(cocheraReal._id)
-        .session(session)
-        .lean();
-
-      // listado limpio de vehículos por cocheraId
-      const vehs = await Vehiculo.find({ cocheraId: cocheraReal._id })
-        .select("_id")
-        .session(session)
-        .lean();
-
-      await require("../services/cocheraService")
-        .registrarOutboxCocheraInterna({
-          _id: coch._id,
-          cliente: coch.cliente,
-          tipo: coch.tipo,
-          piso: coch.piso,
-          exclusiva: coch.exclusiva,
-          vehiculos: vehs.map(v => String(v._id)),
-        });
-
-    } catch (e) {
-      console.warn("[registrarAbono] no se pudo generar outbox FINAL cochera:", e.message);
-    }
-
-    // ============================================================
     // 📌 SINCRONIZAR cliente.cocheras[] — MODELO A (sin modificar si existe)
     // ============================================================
     try {
-      if (!Array.isArray(cliente.cocheras)) cliente.cocheras = [];
+            if (!Array.isArray(cliente.cocheras)) cliente.cocheras = [];
 
       const cocheraIdFinal = toObjectIdSafe(cocheraReal._id) || cocheraReal._id;
       const idx = cliente.cocheras.findIndex(
         (c) => String(c.cocheraId || "") === String(cocheraIdFinal)
       );
 
-      // ✅ Reemplazalo por esto (cocheras[] = sólo referencia, los datos viven en Cochera)
+      // cocheras[] = sólo referencia, los datos viven en Cochera
       if (idx === -1) {
-        cliente.cocheras.push({
-          cocheraId: cocheraIdFinal,
-        });
+        cliente.cocheras.push({ cocheraId: cocheraIdFinal });
       }
 
       cliente.markModified("cocheras");
       await cliente.save(sopt);
-
-      cliente.markModified("cocheras");
-      await cliente.save(sopt);
-
     } catch (e) {
       console.warn("[registrarAbono] no se pudo sincronizar cliente.cocheras[]:", e);
     }
@@ -1036,6 +1099,40 @@ exports.registrarAbono = async (req, res) => {
     if (session) {
       await session.commitTransaction();
       session.endSession();
+    }
+
+    // ============================================================
+    // 📨 OUTBOX FINAL COCHERA — POST-COMMIT (sin session)
+    // ============================================================
+    try {
+      if (cocheraReal && cocheraReal._id) {
+
+        const Cochera = require("../models/Cochera");
+        const Vehiculo = require("../models/Vehiculo");
+
+        // re-leer cochera SIN session (ya committeado)
+        const coch = await Cochera.findById(cocheraReal._id).lean();
+
+        if (coch) {
+          const vehs = await Vehiculo.find({ cocheraId: cocheraReal._id })
+            .select("_id")
+            .lean();
+
+          await registrarOutboxCocheraInterna({
+            _id: coch._id,
+            cliente: coch.cliente,
+            tipo: coch.tipo,
+            piso: coch.piso,
+            exclusiva: coch.exclusiva,
+            vehiculos: vehs.map(v => String(v._id)),
+          });
+        } else {
+          console.warn("[registrarAbono] cochera no encontrada post-commit para outbox");
+        }
+
+      }
+    } catch (e) {
+      console.warn("[registrarAbono] no se pudo generar OUTBOX FINAL cochera post-commit:", e.message);
     }
 
     const clientePopulado = await Cliente.findById(cliente._id)
