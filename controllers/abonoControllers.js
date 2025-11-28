@@ -447,35 +447,69 @@ async function ensureClienteBackend(payload, sopt) {
   return cliente;
 }
 
-async function getBaseCocheraVigente(clienteId, cocheraNorm, pisoNorm, hoy = new Date(), sopt) {
+// ahora incluye cocheraId opcional
+async function getBaseCocheraVigente(
+  clienteId,
+  cocheraNorm,
+  pisoNorm,
+  hoy = new Date(),
+  sopt,
+  cocheraId = null
+) {
   if (!clienteId) return { existe: false, base: 0 };
 
   const inicioMes = new Date(hoy.getFullYear(), hoy.getMonth(), 1);
   const finMesLocal = new Date(hoy.getFullYear(), hoy.getMonth() + 1, 0, 23, 59, 59);
-  // misma tolerancia que getClienteMaxBaseMensualVigente
   const finMesTolerante = new Date(finMesLocal.getTime() + 12 * 60 * 60 * 1000);
 
-  const abono = await Abono.findOne({
-    cliente: clienteId,
-    activo: true,
-    cochera: cocheraNorm,
-    piso: pisoNorm,
-    fechaExpiracion: { $gte: inicioMes, $lte: finMesTolerante }
-  }, null, sopt).lean();
+  const k = normKey(cocheraNorm || '');
+  let cocheraCandidates = [];
 
-  if (!abono) return { existe: false, base: 0 };
-
-  try {
-    const r = await resolverPrecioSeguro({
-      tipoVehiculo: abono.tipoVehiculo,
-      metodoPago: abono.metodoPago || "Efectivo",
-      cochera: abono.cochera,
-      exclusiva: abono.exclusiva
-    });
-    return { existe: true, base: r.precio };
-  } catch {
-    return { existe: true, base: 0 };
+  if (k === 'fija') {
+    cocheraCandidates = ['Fija', 'fija'];
+  } else if (k === 'movil') {
+    cocheraCandidates = ['Móvil', 'Movil', 'móvil', 'movil', 'MÓVIL'];
+  } else if (cocheraNorm) {
+    cocheraCandidates = [String(cocheraNorm)];
+  } else {
+    cocheraCandidates = ['Fija', 'fija', 'Móvil', 'Movil', 'móvil', 'movil'];
   }
+
+  // 🔥 query creado correctamente
+  const query = {
+    cliente: clienteId,
+    fechaExpiracion: { $gte: inicioMes, $lte: finMesTolerante }
+  };
+
+  // 🔥 si vino cocheraId → solo esa cochera
+  if (cocheraId) {
+    query.cocheraId = toObjectIdSafe(cocheraId);
+  } else {
+    query.cochera = { $in: cocheraCandidates };
+    query.piso = pisoNorm;
+  }
+
+  // 🔥 Buscar TODOS los abonos de esta misma cochera/piso
+  const abonos = await Abono.find(query, null, sopt).lean();
+
+  if (!abonos || !abonos.length) return { existe: false, base: 0 };
+
+  let maxBase = 0;
+  for (const a of abonos) {
+    try {
+      const r = await resolverPrecioSeguro({
+        tipoVehiculo: a.tipoVehiculo,
+        metodoPago: a.metodoPago || 'Efectivo',
+        cochera: a.cochera,
+        exclusiva: a.exclusiva,
+      });
+      if (r.precio > maxBase) maxBase = r.precio;
+    } catch {
+      // ignoramos errores individuales
+    }
+  }
+
+  return { existe: true, base: maxBase };
 }
 
 /* =========================
@@ -821,6 +855,14 @@ const {
 
 exports.registrarAbono = async (req, res) => {
   console.log('📨 [registrarAbono] body:', JSON.stringify({ ...req.body, _files: !!req.files }, null, 2));
+  
+  // 🧼 SANEAR ENTRADA ANTES DE TODO
+  if (req.body.cliente && typeof req.body.cliente === 'object') {
+    req.body.cliente = req.body.cliente._id || undefined;
+  }
+  if (req.body.cliente === undefined) {
+    delete req.body.cliente;
+  }
 
   // ============================================================
   // 🧱 TRANSACCIÓN
@@ -984,8 +1026,16 @@ exports.registrarAbono = async (req, res) => {
     // ============================================================
     // 📅 MAX BASE MENSUAL YA ABONADO
     // ============================================================
-    const rBase = await getBaseCocheraVigente(cliente._id, cocheraNorm, pisoNorm, new Date(), sopt);
-    const maxBase = rBase.base; // solo para esta cochera
+    // 📅 MAX BASE MENSUAL YA ABONADO
+    // 🔥 Primero LLAMADA SIN cocheraId (porque cocheraReal todavía no existe)
+    const rBase = await getBaseCocheraVigente(
+      cliente._id,
+      cocheraNorm,
+      pisoNorm,
+      new Date(),
+      sopt
+    );
+    const maxBase = rBase.base;
     const existeAbonoEnEstaCochera = rBase.existe;
 
     // ============================================================
@@ -1052,46 +1102,40 @@ exports.registrarAbono = async (req, res) => {
     }
     await cliente.save(sopt);
 
-    // ============================================================
-    // 🅿️ COCHERA — ensure + asignarVehiculoInterno
-    // ============================================================
-    const cocheraReal = await ensureCocheraInterno({
-      clienteId: cliente._id,
-      tipo: cocheraNorm,
-      piso: pisoNorm,
-      exclusiva: exclusivaNorm,
-      session
-    });
+    // 🅿️ COCHERA — RESPETAR cocheraId si viene del FRONT
+    let cocheraReal = null;
 
-    if (cocheraReal && cocheraReal._id) {
+    // 1) Si viene cocheraId → usamos esa cochera directamente
+    if (req.body.cocheraId) {
+      const Cochera = require("../models/Cochera");
+
+      cocheraReal = await Cochera.findById(req.body.cocheraId).session(session || null);
+
+      if (!cocheraReal) {
+        throw new Error(`cocheraId ${req.body.cocheraId} no existe`);
+      }
+
+      // ⚠️ NO tocamos cliente.cocheras acá.
+      // Se asume que esa cochera ya estaba asociada al cliente si corresponde.
+
+    } else {
+      // 2) Si NO viene cocheraId → ensure normal (tipo+piso+exclusiva)
+      //    ESTE helper es el ÚNICO que agrega en cliente.cocheras[]
+      cocheraReal = await ensureCocheraInterno({
+        clienteId: cliente._id,
+        tipo: cocheraNorm,
+        piso: pisoNorm,
+        exclusiva: exclusivaNorm,
+        session
+      });
+    }
+
+    // Asignar vehículo a esa cochera (siempre)
     await asignarVehiculoInterno({
       cocheraId: cocheraReal._id,
       vehiculoId: vehiculo._id,
       session
     });
-
-    // ============================================================
-    // 📌 SINCRONIZAR cliente.cocheras[] — MODELO A (sin modificar si existe)
-    // ============================================================
-    try {
-            if (!Array.isArray(cliente.cocheras)) cliente.cocheras = [];
-
-      const cocheraIdFinal = toObjectIdSafe(cocheraReal._id) || cocheraReal._id;
-      const idx = cliente.cocheras.findIndex(
-        (c) => String(c.cocheraId || "") === String(cocheraIdFinal)
-      );
-
-      // cocheras[] = sólo referencia, los datos viven en Cochera
-      if (idx === -1) {
-        cliente.cocheras.push({ cocheraId: cocheraIdFinal });
-      }
-
-      cliente.markModified("cocheras");
-      await cliente.save(sopt);
-    } catch (e) {
-      console.warn("[registrarAbono] no se pudo sincronizar cliente.cocheras[]:", e);
-    }
-  }
 
     // ============================================================
     // 💾 COMMIT
@@ -1178,6 +1222,11 @@ exports.registrarAbono = async (req, res) => {
 };
 
 exports.agregarAbono = async (req, res) => {
+  // JAMÁS aceptar un cliente objeto desde el front
+  if (req.body.cliente && typeof req.body.cliente === 'object') {
+    delete req.body.cliente;
+  }
+
   if (!req.body.cliente && req.body.clienteId) {
     req.body.cliente = req.body.clienteId;
   }
@@ -1271,11 +1320,21 @@ exports.getAbonos = async (req, res) => {
 
     // Filtros opcionales
     if (cochera !== undefined) {
-      const c = String(cochera);
-      if (['Fija', 'Móvil', ''].includes(c)) q.cochera = c;
+      const k = normKey(cochera); // soporta mayúsculas/minúsculas y tildes
+      if (k === 'fija') {
+        q.cochera = 'Fija';
+      } else if (k === 'movil') {
+        q.cochera = 'Móvil';
+      }
+      // cualquier otra cosa => no filtra por cochera
     }
-    if (exclusiva === 'true' || exclusiva === 'false') q.exclusiva = (exclusiva === 'true');
-    if (activo === 'true' || activo === 'false') q.activo = (activo === 'true');
+
+    if (exclusiva === 'true' || exclusiva === 'false') {
+      q.exclusiva = (exclusiva === 'true');
+    }
+    if (activo === 'true' || activo === 'false') {
+      q.activo = (activo === 'true');
+    }
 
     if (clienteId && mongoose.Types.ObjectId.isValid(String(clienteId))) q.cliente = clienteId;
     if (patente) q.patente = String(patente).toUpperCase();

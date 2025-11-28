@@ -151,6 +151,10 @@ app.use(cookieParser());
 app.use(express.json({ limit: BODY_LIMIT }));
 app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 
+// 🧼 Sanitizar IDs ANTES de llegar a cualquier controller
+const sanitizeIds = require('./middlewares/sanitizeIds');
+app.use(sanitizeIds);
+
 /* =======================================================
    📂 UPLOADS
 ======================================================== */

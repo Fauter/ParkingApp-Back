@@ -9,7 +9,7 @@ const clienteCocheraSchema = new Schema(
   {
     cocheraId: { type: Schema.Types.ObjectId, ref: "Cochera", required: true },
   },
-  { _id: true }
+  { _id: false }
 );
 
 /* =======================================================
