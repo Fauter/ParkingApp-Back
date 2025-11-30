@@ -47,11 +47,7 @@ function normExclusiva(raw, tipo) {
   return ['true', '1', 'si', 'sí', 'yes', 'y'].includes(s);
 }
 
-/* =======================================================
-   🅿️ ENSURE COCHERA INTERNO (IDEMPOTENTE)
-   Usado por registrarAbono (backend puro, con session opcional)
-======================================================= */
-
+// 🅿️ ENSURE COCHERA INTERNO (IDEMPOTENTE + SANEANDO cliente SIEMPRE)
 async function ensureCocheraInterno({
   clienteId,
   tipo,
@@ -89,9 +85,24 @@ async function ensureCocheraInterno({
   }).session(session || null);
 
   if (coch) {
+    // 🧼 SANEAMOS cochera.cliente si está mal o apunta a otro lado
+    const currentCliId =
+      asObjectId(coch.cliente) ||
+      (coch.cliente && coch.cliente._id && asObjectId(coch.cliente._id));
+
+    if (!currentCliId || String(currentCliId) !== String(cli._id)) {
+      coch.cliente = cli._id;
+      try {
+        await coch.save({ session });
+      } catch (e) {
+        console.warn('[ensureCocheraInterno] no pude sanear cochera.cliente:', e.message || e);
+      }
+    }
+
     return coch;
   }
 
+  // 🆕 Creación de cochera nueva, siempre con cliente bien seteado
   coch = new Cochera({
     cliente: cli._id,
     tipo: tipoNorm,
@@ -103,8 +114,6 @@ async function ensureCocheraInterno({
   await coch.save({ session });
 
   // MODELO A: referencia única por cocheraId (sin duplicados)
-  // IMPORTANTE: $addToSet NO sirve cuando el subdocumento tiene _id → duplica.
-  // Usamos "update only if not exists" + push controlado.
   await Cliente.updateOne(
     {
       _id: cli._id,
@@ -123,12 +132,13 @@ async function ensureCocheraInterno({
 
 /* =======================================================
    🚗 ASIGNAR VEHÍCULO INTERNO
-   (equivalente a cocheraControllers.asignarVehiculo pero sin HTTP)
+   Ahora con fallback usando clienteId (del flujo de abono)
 ======================================================= */
 
 async function asignarVehiculoInterno({
   cocheraId,
   vehiculoId,
+  clienteId,   // 👈 NUEVO parámetro opcional
   session,
 } = {}) {
   if (!cocheraId || !vehiculoId) {
@@ -160,14 +170,35 @@ async function asignarVehiculoInterno({
     return null;
   }
 
-  // 🔐 Aca blindamos sí o sí a ObjectId
-  const cliId =
+  // 1️⃣ Intento normal: sacar cliId desde cochera.cliente
+  let cliId =
     asObjectId(coch.cliente) ||
     (coch.cliente && coch.cliente._id && asObjectId(coch.cliente._id));
 
+  // 2️⃣ Fallback: si cochera.cliente está roto, uso clienteId que viene del flujo
+  if (!cliId && clienteId) {
+    const fromParam =
+      asObjectId(clienteId) ||
+      (clienteId && clienteId._id && asObjectId(clienteId._id)) ||
+      (typeof clienteId === 'string' ? clienteId : null);
+
+    if (fromParam) {
+      cliId = fromParam;
+      coch.cliente = fromParam;
+      try {
+        await coch.save({ session });
+      } catch (e) {
+        console.warn(
+          '[asignarVehiculoInterno] no pude sanear cochera.cliente desde clienteId:',
+          e.message || e
+        );
+      }
+    }
+  }
+
   if (!cliId) {
     console.warn(
-      '[asignarVehiculoInterno] cochera.cliente inválido:',
+      '[asignarVehiculoInterno] cochera.cliente inválido incluso con fallback:',
       coch.cliente
     );
     return null;
@@ -183,7 +214,7 @@ async function asignarVehiculoInterno({
   }
 
   veh.cocheraId = cochId;
-  veh.cliente = cliId; // 👈 ahora SIEMPRE es ObjectId válido
+  veh.cliente = cliId;
   await veh.save({ session });
 
   await Cochera.updateOne(

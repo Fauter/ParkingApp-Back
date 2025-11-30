@@ -18,7 +18,8 @@ const {
   getAbonosPorCliente,
   getAbonosPorPatente,
   getCatalogoCocherasYPisos,
-  updateVehiculoDeAbono, // 👈 NUEVO
+  updateVehiculoDeAbono, 
+  desactivarAbonoDeCochera
 } = require('../controllers/abonoControllers');
 
 const router = express.Router();
@@ -167,6 +168,8 @@ router.post('/agregar-abono',   uploadFields, mapUploadedPaths, agregarAbono);
 
 // Renovación (NO crea movimientos)
 router.post('/renovar', renovarAbono);
+// Desabonar
+router.post("/desactivar-cochera", desactivarAbonoDeCochera);
 
 // Updates (con upload opcional).
 // ⚠️ Nota: aunque uses multipart, ahora el controlador encola Outbox manualmente,

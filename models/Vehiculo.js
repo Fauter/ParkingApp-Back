@@ -47,7 +47,7 @@ const vehiculoSchema = new Schema({
    * Relación REAL a la cochera asignada.
    * La manejan ensureCocheraInterno + asignarVehiculo.
    */
-  cocheraId: { type: Schema.Types.ObjectId },
+  cocheraId: { type: Schema.Types.ObjectId, ref: 'Cochera' },  // 👈 IMPORTANTE: ref agregado
 
   // Estadía / turnos
   turno: { type: Boolean, default: false },

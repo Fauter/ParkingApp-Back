@@ -783,6 +783,35 @@ exports.renovarAbono = async (req, res) => {
     const multi = calcularCobroMultiMes(baseNuevo, 0, hoy, mesesAbonar);
     const monto = multi.totalCobrar;
 
+    // ========= 🔥 CREAR ABONO — HEREDAR DATOS DEL VEHÍCULO REAL (CON RESCATE DEL ABONO PREVIO) =========
+    // 1) Buscar vehículo real
+    let vehiculoReal = await Vehiculo.findOne(
+      { patente: (patente || '').toUpperCase() },
+      null,
+      sopt
+    );
+
+    // 2) Buscar el abono previo REAL de esta patente
+    const abonoPrevio = await Abono.findOne({
+      patente: (patente || '').toUpperCase(),
+      cliente: cliente._id
+    })
+    .sort({ fechaExpiracion: -1, createdAt: -1 })
+    .lean();
+
+    // 3) Resolver datos del vehículo → si vehiculoReal está vacío, usar abono previo
+    const finalMarca  = vehiculoReal?.marca  || abonoPrevio?.marca  || '';
+    const finalModelo = vehiculoReal?.modelo || abonoPrevio?.modelo || '';
+    const finalColor  = vehiculoReal?.color  || abonoPrevio?.color  || '';
+    const finalAnio   = vehiculoReal?.anio   || abonoPrevio?.anio   || null;
+
+    // 🔥 FIX PRINCIPAL: recuperar seguro
+    const finalSeguro =
+      vehiculoReal?.companiaSeguro ||
+      abonoPrevio?.companiaSeguro ||
+      '';
+
+    // 4) Crear abono con datos fusionados
     const abono = new Abono({
       nombreApellido: cliente.nombreApellido || '',
       domicilio: cliente.domicilio || '',
@@ -793,31 +822,117 @@ exports.renovarAbono = async (req, res) => {
       telefonoTrabajo: cliente.telefonoTrabajo || '',
       email: cliente.email || '',
       dniCuitCuil: cliente.dniCuitCuil || '',
+
       patente: (patente || '').toUpperCase(),
+      tipoVehiculo: tipo,
+
+      marca: finalMarca,
+      modelo: finalModelo,
+      color: finalColor,
+      anio: finalAnio,
+      companiaSeguro: finalSeguro,
+
       precio: monto,
       metodoPago,
       factura,
-      tipoVehiculo: tipo,
       tipoAbono: { nombre: 'Mensual', dias: multi.totalDiasMes },
+
       fechaExpiracion: multi.venceEl,
       cliente: cliente._id,
       activo: true,
+
       cochera: cocheraNorm,
       piso: pisoNorm,
-      exclusiva: exclusivaNorm
+      exclusiva: exclusivaNorm,
+
+      // 🔥 EL FIX CORRECTO:
+      // El abono nuevo SIEMPRE apunta al vehículo renovado,
+      // que en tu flujo se llama vehiculoReal en este punto.
+      vehiculo: vehiculoReal?._id || null
     });
+
     await abono.save(sopt);
 
-    // Reactivar cliente y extender fin
+    // ========= 🔥 CREAR / ACTUALIZAR VEHÍCULO SEGÚN LA RENOVACIÓN =========
+
+    // 1) Buscar vehículo por patente
+    let vehiculo = await Vehiculo.findOne({ patente: (patente || '').toUpperCase() }, null, sopt);
+
+    // 2) Si no existe, crearlo
+    if (!vehiculo) {
+      vehiculo = new Vehiculo({
+        patente: (patente || '').toUpperCase(),
+        tipoVehiculo: tipo,
+        abonado: true,
+        cliente: cliente._id,
+      });
+      await vehiculo.save(sopt);
+    } else {
+      // Actualizar
+      vehiculo.tipoVehiculo = tipo;
+      vehiculo.abonado = true;
+      vehiculo.cliente = cliente._id;
+      vehiculo.abono = abono._id;
+      await vehiculo.save(sopt);
+    }
+
+    // ========= 🔥 VINCULAR COCHERA =========
+
+    const { ensureCocheraInterno, asignarVehiculoInterno } = require('../services/cocheraService');
+
+    const cocheraReal = await ensureCocheraInterno({
+      clienteId: cliente._id,
+      tipo: cocheraNorm,
+      piso: pisoNorm,
+      exclusiva: exclusivaNorm,
+      session
+    });
+
+    await asignarVehiculoInterno({
+      cocheraId: cocheraReal?._id,
+      vehiculoId: vehiculo._id,
+      clienteId: cliente._id,
+      session
+    });
+
+    // 🔥 NUEVO BLOQUE: RENOVAR ABONO POR COCHERA → TODOS LOS VEHÍCULOS DE ESA COCHERA QUEDAN ABONADOS
+    if (cocheraReal && cocheraReal._id) {
+      await Vehiculo.updateMany(
+        { cocheraId: cocheraReal._id },
+        {
+          $set: {
+            abonado: true,
+            abonoExpira: multi.venceEl,
+            abono: abono._id
+          }
+        },
+        sopt
+      );
+    }
+
+    // ========= 🔥 ACTUALIZAR CLIENTE =========
+
     cliente.abonado = true;
     cliente.finAbono = multi.venceEl;
-    if (!cliente.precioAbono) cliente.precioAbono = tipo;
+
     if (!cliente.abonos.some(id => String(id) === String(abono._id))) {
       cliente.abonos.push(abono._id);
     }
+
+    if (!cliente.vehiculos.some(id => String(id) === String(vehiculo._id))) {
+      cliente.vehiculos.push(vehiculo._id);
+    }
+
     await cliente.save(sopt);
 
-    if (session) { await session.commitTransaction(); session.endSession(); }
+    // ========= 🔥 COMMIT TRANSACCIÓN =========
+
+    if (session) {
+      await session.commitTransaction();
+      session.endSession();
+    }
+
+    // ========= 🔥 RESPUESTA FINAL =========
 
     const clientePop = await Cliente.findById(cliente._id)
       .populate('abonos')
@@ -829,7 +944,9 @@ exports.renovarAbono = async (req, res) => {
       message: `Renovación registrada por $${monto}.`,
       cobrado: monto,
       abono,
+      vehiculo,
       cliente: clientePop,
+      cochera: cocheraReal,
       multi: {
         mesesAbonar: multi.meses,
         proporcionalMesActual: multi.proporcionalMesActual,
@@ -934,29 +1051,50 @@ exports.registrarAbono = async (req, res) => {
       : false;
 
     // ============================================================
-    // 👤 CLIENTE: buscar / crear
+    // 👤 CLIENTE: buscar / crear (ANTI-DUPLICADOS)
     // ============================================================
     let cliente = null;
     const anyClienteId = clienteIdBody || clienteIdAlt;
+    const dniNorm   = String(dniCuitCuil || '').trim();
+    const emailNorm = String(email || '').trim().toLowerCase();
+    const nameNorm  = String(nombreApellido || '').trim();
 
+    // 1) Si vino un clienteId desde el front → lo respetamos y lo buscamos
     if (anyClienteId) {
       cliente = await findClienteFlexible(anyClienteId, sopt);
     }
-    if (!cliente && dniCuitCuil) {
-      cliente = await Cliente.findOne({ dniCuitCuil: String(dniCuitCuil).trim() }, null, sopt);
+
+    // 2) Si no lo encontramos por id, intentamos por DNI (clave más fuerte)
+    if (!cliente && dniNorm) {
+      cliente = await Cliente.findOne({ dniCuitCuil: dniNorm }, null, sopt);
     }
+
+    // 3) Si tampoco, intentamos por email (segundo identificador fuerte)
+    if (!cliente && emailNorm) {
+      cliente = await Cliente.findOne({ email: emailNorm }, null, sopt);
+    }
+
+    // 4) Último recurso antes de crear: nombre + email
+    if (!cliente && emailNorm && nameNorm) {
+      cliente = await Cliente.findOne(
+        { email: emailNorm, nombreApellido: nameNorm },
+        null,
+        sopt
+      );
+    }
+
+    // 5) Si después de todos los intentos no existe, recién ahí creamos UNO nuevo
     if (!cliente) {
-      // nuevo cliente
       const nuevo = new Cliente({
-        nombreApellido: String(nombreApellido).trim(),
-        dniCuitCuil: String(dniCuitCuil).trim(),
+        nombreApellido: nameNorm,
+        dniCuitCuil: dniNorm,
         domicilio: domicilio || '',
         localidad: localidad || '',
         telefonoParticular: telefonoParticular || '',
         telefonoEmergencia: telefonoEmergencia || '',
         domicilioTrabajo: domicilioTrabajo || '',
         telefonoTrabajo: telefonoTrabajo || '',
-        email: String(email).trim(),
+        email: emailNorm,
         abonado: false,
         finAbono: null,
         precioAbono: String(tipoVehiculo || '').toLowerCase(),
@@ -965,12 +1103,15 @@ exports.registrarAbono = async (req, res) => {
         movimientos: [],
         cocheras: []
       });
+
       await nuevo.save(sopt);
       cliente = nuevo;
-      if (!session) created.cliente = nuevo;
+      if (!session) created.cliente = nuevo; // para rollback manual si no hay transacción
     }
 
-    if (!cliente) throw new Error('No se pudo obtener/crear cliente');
+    if (!cliente) {
+      throw new Error('No se pudo obtener/crear cliente');
+    }
 
     // ============================================================
     // 🖼️ FOTOS
@@ -1115,8 +1256,19 @@ exports.registrarAbono = async (req, res) => {
         throw new Error(`cocheraId ${req.body.cocheraId} no existe`);
       }
 
-      // ⚠️ NO tocamos cliente.cocheras acá.
-      // Se asume que esa cochera ya estaba asociada al cliente si corresponde.
+      // 🧼 SANEAMOS por si esa cochera vino sin cliente o con cliente raro
+      const cliIdFromCoch =
+        toObjectIdSafe(cocheraReal.cliente) ||
+        toObjectIdSafe(cocheraReal.cliente && cocheraReal.cliente._id);
+
+      if (!cliIdFromCoch || String(cliIdFromCoch) !== String(cliente._id)) {
+        cocheraReal.cliente = cliente._id;
+        try {
+          await cocheraReal.save(sopt);
+        } catch (e) {
+          console.warn('[registrarAbono] no pude sanear cocheraReal.cliente:', e.message || e);
+        }
+      }
 
     } else {
       // 2) Si NO viene cocheraId → ensure normal (tipo+piso+exclusiva)
@@ -1132,10 +1284,26 @@ exports.registrarAbono = async (req, res) => {
 
     // Asignar vehículo a esa cochera (siempre)
     await asignarVehiculoInterno({
-      cocheraId: cocheraReal._id,
+      cocheraId: cocheraReal && cocheraReal._id,
       vehiculoId: vehiculo._id,
+      clienteId: cliente._id,
       session
     });
+
+    // 🔥 NUEVO BLOQUE: ABONO POR COCHERA → TODOS LOS VEHÍCULOS DE ESA COCHERA QUEDAN ABONADOS
+    if (cocheraReal && cocheraReal._id) {
+      await Vehiculo.updateMany(
+        { cocheraId: cocheraReal._id },
+        {
+          $set: {
+            abonado: true,
+            abonoExpira: multi.venceEl,
+            abono: AbonoModelo._id
+          }
+        },
+        sopt
+      );
+    }
 
     // ============================================================
     // 💾 COMMIT
@@ -1848,6 +2016,102 @@ exports.updateVehiculoDeAbono = async (req, res) => {
     res.status(500).json({ message: 'Error al actualizar vínculo de vehículo del abono' });
   }
 };
+
+
+
+/* =========================
+   DESABONAR POR COCHERA
+   - Desactiva abonos de esa cochera
+   - Desabona vehículos dentro de esa cochera
+========================= */
+exports.desactivarAbonoDeCochera = async (req, res) => {
+  try {
+    const Cochera = require("../models/Cochera");
+
+    const { cocheraId } = req.body;
+    if (!cocheraId) {
+      return res.status(400).json({ message: "cocheraId es obligatorio" });
+    }
+
+    // Validación básica de ObjectId para evitar errores tontos
+    if (!mongoose.Types.ObjectId.isValid(String(cocheraId))) {
+      return res.status(400).json({ message: "cocheraId inválido" });
+    }
+
+    // 1) Traigo la cochera con sus vehículos (solo _id y patente para no inflar)
+    const coch = await Cochera.findById(cocheraId)
+      .populate("vehiculos", "_id patente")
+      .lean();
+
+    if (!coch) {
+      return res.status(404).json({ message: "Cochera no encontrada" });
+    }
+
+    const clienteId = coch.cliente;
+    const vehiculoIds = (coch.vehiculos || []).map((v) => v._id);
+
+    // 2) Desactivar TODOS los abonos activos asociados a ESTA cochera lógica
+    //    y, además, vinculados a vehículos que están dentro de esta cochera.
+    const abonoFilter = {
+      cliente: clienteId,
+      cochera: coch.tipo,       // "Fija" / "Móvil" (mapea con Abono.cochera)
+      piso: coch.piso || "",
+      exclusiva: !!coch.exclusiva,
+      activo: true,
+    };
+
+    // Queremos desactivar abonos de esa cochera, aunque tengan vehiculo:null
+    abonoFilter.$or = [
+      { vehiculo: { $in: vehiculoIds } },
+      { vehiculo: null }
+    ];
+
+    const abonosResult = await Abono.updateMany(
+      abonoFilter,
+      {
+        $set: {
+          activo: false,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    const abonosDesactivados =
+      abonosResult?.modifiedCount ?? abonosResult?.nModified ?? 0;
+
+    // 3) Desactivar los vehículos dentro de esa cochera
+    let vehiculosResult = { modifiedCount: 0, nModified: 0 };
+    if (vehiculoIds.length) {
+      vehiculosResult = await Vehiculo.updateMany(
+        { _id: { $in: vehiculoIds } },
+        {
+          $set: {
+            abonado: false,
+            abonoExpira: null,
+            // ❌ no tocar vehiculo.abono
+          },
+        }
+      );
+    }
+
+    const vehiculosDesabonados =
+      vehiculosResult?.modifiedCount ?? vehiculosResult?.nModified ?? 0;
+
+    return res.json({
+      ok: true,
+      message: "Abonos y vehículos desabonados para la cochera indicada",
+      cocheraId: String(cocheraId),
+      clienteId: String(clienteId),
+      abonosDesactivados,
+      vehiculosDesabonados,
+      vehiculosAfectados: vehiculoIds.map(String),
+    });
+  } catch (err) {
+    console.error("Error desactivando cochera:", err);
+    res.status(500).json({ message: "Error interno", error: err.message });
+  }
+};
+
 
 /* =========================
    BORRADO MASIVO

@@ -179,12 +179,12 @@ function pickDocumentForOutbox(method, collection, req, capturedBody) {
 
     const out = { _id: id };
 
-    // 🔹 PARA POST: necesitamos saber a qué cliente pertenece la cochera
+    // PARA POST: asegurar cliente correcto en la cochera
     if (method === 'POST' && reqBody && typeof reqBody === 'object') {
       if (Object.prototype.hasOwnProperty.call(reqBody, 'clienteId')) {
-        out.clienteId = reqBody.clienteId;
+        out.cliente = String(reqBody.clienteId);
       } else if (Object.prototype.hasOwnProperty.call(reqBody, 'cliente')) {
-        out.clienteId = reqBody.cliente;
+        out.cliente = String(reqBody.cliente);
       }
     }
 

@@ -3,7 +3,7 @@ const mongoose = require("mongoose");
 const { Schema } = mongoose;
 
 /* =======================================================
-   SUBESQUEMA: COCHERAS MINIMALISTAS DEL CLIENTE (MODELO A)
+   SUBESQUEMA: cocheras[] (sistema real)
 ======================================================= */
 const clienteCocheraSchema = new Schema(
   {
@@ -13,7 +13,7 @@ const clienteCocheraSchema = new Schema(
 );
 
 /* =======================================================
-   ESQUEMA PRINCIPAL CLIENTE
+   ESQUEMA PRINCIPAL CLIENTE — LIMPIO
 ======================================================= */
 const clienteSchema = new Schema(
   {
@@ -27,16 +27,7 @@ const clienteSchema = new Schema(
     telefonoTrabajo: String,
     email: String,
 
-    abonado: { type: Boolean, default: false },
-    finAbono: { type: Date, default: null },
-    precioAbono: { type: String, default: "" },
-
-    /* ===== RETROCOMPATIBILIDAD (NO USAR, PERO MANTENEMOS) ===== */
-    cochera: { type: String, enum: ["Fija", "Móvil", ""], default: "" },
-    exclusiva: { type: Boolean, default: false },
-    piso: { type: String, default: "" },
-
-    /* ===== SISTEMA NUEVO ===== */
+    /* ===== SISTEMA NUEVO REAL ===== */
     cocheras: [clienteCocheraSchema],
 
     /* ===== RELACIONES ===== */
