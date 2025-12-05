@@ -162,50 +162,59 @@ function pickDocumentForOutbox(method, collection, req, capturedBody) {
 
   // 3) NO-DESTRUCTIVO PARA COCHERAS:
   if (collection === 'cocheras') {
+    const url = req.originalUrl;
+    const body = req.body || {};
 
-    // A) Recuperar _id sí o sí (incluyendo data._id y objetos poblados)
+    // A) Caso especial: /asignar → push remoto del vehiculo
+    if (url.includes('/asignar')) {
+      return {
+        _id: body.cocheraId,
+        $add: { vehiculos: String(body.vehiculoId) }
+      };
+    }
+
+    // B) Caso especial: /remover → pull remoto del vehiculo
+    if (url.includes('/remover')) {
+      return {
+        _id: body.cocheraId,
+        $pull: { vehiculos: String(body.vehiculoId) }
+      };
+    }
+
+    // C) Creación / PATCH normales
+    const reqBody = req.body || {};
     let id =
       candidate?._id ||
       candidate?.id ||
-      candidate?.data?._id ||
-      candidate?.data?.id ||
       reqBody?._id ||
       reqBody?.id ||
       null;
 
-    if (id && typeof id === 'object' && id._id) {
-      id = id._id;
-    }
+    if (id && typeof id === 'object' && id._id) id = id._id;
 
     const out = { _id: id };
 
-    // PARA POST: asegurar cliente correcto en la cochera
-    if (method === 'POST' && reqBody && typeof reqBody === 'object') {
-      if (Object.prototype.hasOwnProperty.call(reqBody, 'clienteId')) {
-        out.cliente = String(reqBody.clienteId);
-      } else if (Object.prototype.hasOwnProperty.call(reqBody, 'cliente')) {
-        out.cliente = String(reqBody.cliente);
-      }
+    // cliente SIEMPRE se preserva (nunca se elimina desde PATCH)
+    if (reqBody.clienteId) out.cliente = String(reqBody.clienteId);
+    else if (reqBody.cliente) out.cliente = String(reqBody.cliente);
+    else if (candidate && candidate.cliente) {
+        // si vino de la respuesta, preservarlo
+        const hex = pluckHexObjectId(candidate.cliente);
+        if (hex) out.cliente = hex;
     }
 
-    // B) SOLO incluir campos que el usuario haya enviado
     const FIELDS = ['tipo','piso','exclusiva','vehiculos'];
 
     for (const f of FIELDS) {
-      if (reqBody && Object.prototype.hasOwnProperty.call(reqBody, f)) {
-
-        // 🔥 vehiculos debe transformarse a array de ObjectId string
+      if (f in reqBody) {
         if (f === 'vehiculos' && Array.isArray(reqBody.vehiculos)) {
           out.vehiculos = reqBody.vehiculos.map(v => String(v));
-          continue;
+        } else {
+          out[f] = reqBody[f];
         }
-
-        // el resto pasa limpio
-        out[f] = reqBody[f];
       }
     }
 
-    // 🔸 IMPORTANTE: para PATCH/PUT no enviamos cliente ni vehiculos si no vienen en body
     return out;
   }
 

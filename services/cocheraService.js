@@ -275,11 +275,24 @@ async function registrarOutboxCocheraInterna({
       vehiculos: vehIds,
     };
 
+    // ⛔️ Jamás enviar cliente=null al outbox → produce $unset
+    const clienteSafe =
+      cliente && String(cliente).length === 24
+        ? cliente
+        : undefined; // eliminar campo → NO tocar cliente en remoto/local
+
     await Outbox.create({
       method: 'PATCH',
-      route: `/api/cocheras/${String(cochId)}`,
-      params: { id: String(cochId) },
-      document: doc,
+      route: `/api/cocheras/${_id}`,
+      params: { id: String(_id) },
+      document: {
+        _id,
+        tipo,
+        piso,
+        exclusiva,
+        vehiculos,
+        ...(clienteSafe ? { cliente: clienteSafe } : {}) // solo si es válido
+      },
       status: 'pending',
       createdAt: new Date(),
     });

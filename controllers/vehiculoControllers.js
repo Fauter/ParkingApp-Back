@@ -793,6 +793,14 @@ exports.registrarSalida = async (req, res) => {
     const entrada = new Date(vehiculo.estadiaActual.entrada);
 
     // snapshot ANTES de tocar nada
+    // ⚠️ FIX CRÍTICO: estadiaActual a veces trae _id basura (Buffer->objeto plano)
+    // Eso rompe el $push dentro de la transacción y NO guarda la salida.
+    // Lo eliminamos SIEMPRE antes del snapshot.
+    if (vehiculo.estadiaActual._id) {
+      delete vehiculo.estadiaActual._id;
+    }
+
+    // Snapshot limpio
     const estadiaSnapshot = JSON.parse(JSON.stringify(vehiculo.estadiaActual));
     estadiaSnapshot.salida = salida;
 
