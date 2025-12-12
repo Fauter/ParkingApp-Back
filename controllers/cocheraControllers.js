@@ -429,26 +429,177 @@ exports.asignarVehiculo = async (req, res) => {
 
 exports.removerVehiculo = async (req, res) => {
   try {
+    console.log("==== removerVehiculo() ====");
+    console.log("BODY:", req.body);
+
     const { cocheraId, vehiculoId } = req.body;
 
+    if (!cocheraId || !String(vehiculoId).trim()) {
+      return res
+        .status(400)
+        .json({ message: "cocheraId y vehiculoId obligatorios" });
+    }
+
+    // 1) Buscar cochera y vehículo reales
     const coch = await Cochera.findById(cocheraId);
-    if (!coch) return res.status(404).json({ message: "Cochera no encontrada" });
+    if (!coch) {
+      return res.status(404).json({ message: "Cochera no encontrada" });
+    }
 
+    const veh = await Vehiculo.findById(vehiculoId);
+    if (!veh) {
+      return res.status(404).json({ message: "Vehículo no encontrado" });
+    }
+
+    // ⚠️ IMPORTANTE:
+    // Priorizar siempre coch.cliente (ObjectId / string limpio) sobre veh.cliente (que puede venir populado)
+    const rawCli = coch.cliente || veh.cliente || null;
+    let cliIdSafe = null;
+
+    if (rawCli) {
+      // Si viene documento populado (tiene _id)
+      if (rawCli._id) {
+        cliIdSafe = rawCli._id;
+      } else {
+        const asStr = String(rawCli);
+        if (ObjectId.isValid(asStr)) {
+          cliIdSafe = new ObjectId(asStr);
+        } else {
+          cliIdSafe = null; // basura → no lo usamos
+        }
+      }
+    }
+
+    console.log("[removerVehiculo] rawCli:", rawCli);
+    console.log("[removerVehiculo] cliIdSafe:", cliIdSafe);
+
+    console.log("COCHERA ANTES:", JSON.stringify(coch.toObject(), null, 2));
+
+    // 2) Desactivar abonos activos asociados a ESTE vehículo (del mismo cliente)
+    let abonosDesactivados = 0;
+    if (cliIdSafe) {
+      const vehIdObj = veh._id;
+      const vehIdStr = String(veh._id);
+
+      const abonoFilter = {
+        cliente: cliIdSafe,
+        activo: true,
+        $or: [
+          { vehiculo: vehIdObj }, // ObjectId normal
+          { vehiculo: vehIdStr }, // legacy string
+        ],
+      };
+
+      console.log("[removerVehiculo] abonoFilter:", abonoFilter);
+
+      const abonosAntes = await Abono.find(abonoFilter)
+        .select("_id fechaExpiracion")
+        .lean();
+
+      const abonosIds = abonosAntes.map((a) => a._id);
+
+      if (abonosIds.length) {
+        const upd = await Abono.updateMany(
+          { _id: { $in: abonosIds } },
+          {
+            $set: {
+              activo: false,
+              updatedAt: new Date(),
+            },
+          }
+        );
+        abonosDesactivados =
+          upd?.modifiedCount ?? upd?.nModified ?? 0;
+      }
+
+      console.log(
+        "[removerVehiculo] abonos desactivados para vehiculo:",
+        abonosDesactivados
+      );
+    } else {
+      console.warn(
+        "[removerVehiculo] cliIdSafe nulo: se omite desactivar abonos por cliente."
+      );
+    }
+
+    // 3) Sacar el vehículo de la cochera
     await Cochera.updateOne(
-      { _id: cocheraId },
-      { $pull: { vehiculos: vehiculoId } }
+      { _id: coch._id },
+      { $pull: { vehiculos: veh._id } }
     );
 
-    await Vehiculo.updateOne(
-      { _id: vehiculoId },
-      { $unset: { cocheraId: "" } }
-    );
+    // 4) Sacar el vehículo del cliente (si lo tenía)
+    if (cliIdSafe) {
+      await Cliente.updateOne(
+        { _id: cliIdSafe },
+        {
+          $pull: { vehiculos: veh._id },
+          $set: { updatedAt: new Date() },
+        }
+      );
+    }
 
-    const cochFinal = await Cochera.findById(cocheraId)
-      .populate("vehiculos", "_id patente");
+    // 5) Desasociar completamente en el propio vehículo
+    veh.cocheraId = undefined;
+    veh.cliente = null;
+    veh.abonado = false;
+    veh.abono = null;       // limpio puntero al abono
+    veh.abonoExpira = null; // limpio fecha de expiración
+    await veh.save();
 
-    res.json({ message: "Vehículo removido", data: cochFinal });
+    // 6) Recalcular estado del cliente (abonado / finAbono) si tenemos cliIdSafe
+    if (cliIdSafe) {
+      const activos = await Abono.find({
+        cliente: cliIdSafe,
+        activo: true,
+      })
+        .select("fechaExpiracion")
+        .lean();
+
+      let finAbono = null;
+      if (activos.length) {
+        const maxTs = Math.max(
+          ...activos.map((a) =>
+            a.fechaExpiracion
+              ? new Date(a.fechaExpiracion).getTime()
+              : 0
+          )
+        );
+        finAbono = maxTs > 0 ? new Date(maxTs) : null;
+      }
+
+      await Cliente.updateOne(
+        { _id: cliIdSafe },
+        {
+          $set: {
+            abonado: activos.length > 0,
+            finAbono,
+            updatedAt: new Date(),
+          },
+        }
+      );
+    }
+
+    const cochFinal = await Cochera.findById(coch._id)
+      .populate("vehiculos", "_id patente")
+      .lean();
+
+    console.log("COCHERA DESPUÉS:", JSON.stringify(cochFinal, null, 2));
+
+    return res.json({
+      message:
+        "Vehículo removido de la cochera, del cliente y abonos asociados desactivados",
+      data: cochFinal,
+      detalle: {
+        abonosDesactivados,
+      },
+    });
   } catch (err) {
-    res.status(500).json({ message: "Error removiendo vehículo", error: err.message });
+    console.error("Error removiendo vehículo:", err);
+    return res.status(500).json({
+      message: "Error removiendo vehículo",
+      error: err.message,
+    });
   }
 };
+

@@ -6,6 +6,7 @@ const mongoose = require('mongoose');
 const Abono = require('../models/Abono');
 const Vehiculo = require('../models/Vehiculo');
 const Cliente = require('../models/Cliente');
+const Cochera = require('../models/Cochera'); // 👈 para updateVehiculoDeAbono
 const Outbox = require('../models/Outbox'); // para encolar manualmente PATCH abonos
 
 /* =======================================================
@@ -967,7 +968,8 @@ exports.renovarAbono = async (req, res) => {
 const {
   ensureCocheraInterno,
   asignarVehiculoInterno,
-  registrarOutboxCocheraInterna
+  registrarOutboxCocheraInterna,
+  cleanClienteById,          // 👈 NUEVO: para recalcular cliente al desabonar cochera
 } = require('../services/cocheraService');
 
 exports.registrarAbono = async (req, res) => {
@@ -1973,11 +1975,28 @@ exports.updateVehiculoDeAbono = async (req, res) => {
     abono.vehiculo = nextVehId ? nextVehId : null;
     await abono.save();
 
-    // Si había vínculo previo y se está removiendo o cambiando, limpiar el Vehiculo previo
+    // Si había vínculo previo y se está removiendo o cambiando, limpiar el Vehículo previo
     if (prevVehId && (!nextVehId || nextVehId !== prevVehId)) {
       try {
         const vehPrev = await Vehiculo.findById(prevVehId);
         if (vehPrev) {
+
+          // 🔥 1) Sacar el vehículo de la cochera (si lo tenía asignado)
+          if (vehPrev.cocheraId) {
+            try {
+              await Cochera.updateOne(
+                { _id: vehPrev.cocheraId },
+                { $pull: { vehiculos: vehPrev._id } }
+              );
+            } catch (e2) {
+              console.warn('[updateVehiculoDeAbono] no pude pull del array cochera.vehiculos:', e2.message);
+            }
+          }
+
+          // 🔥 2) Limpiar vínculo cochera del vehículo
+          vehPrev.cocheraId = null;
+
+          // 🔥 3) Limpiar vínculo de abono
           const otherActive = await Abono.exists({ vehiculo: vehPrev._id, activo: true });
           if (!otherActive) {
             vehPrev.abonado = false;
@@ -1985,6 +2004,7 @@ exports.updateVehiculoDeAbono = async (req, res) => {
           if (String(vehPrev.abono || '') === String(id)) {
             vehPrev.abono = null;
           }
+
           await vehPrev.save();
         }
       } catch (e) {
@@ -2019,11 +2039,11 @@ exports.updateVehiculoDeAbono = async (req, res) => {
 
 
 
-/* =========================
-   DESABONAR POR COCHERA
-   - Desactiva abonos de esa cochera
-   - Desabona vehículos dentro de esa cochera
-========================= */
+// =========================
+//   DESABONAR POR COCHERA
+//   - Desactiva abonos de esa cochera (vía sus vehículos)
+//   - Desabona vehículos dentro de esa cochera
+// =========================
 exports.desactivarAbonoDeCochera = async (req, res) => {
   try {
     const Cochera = require("../models/Cochera");
@@ -2033,12 +2053,11 @@ exports.desactivarAbonoDeCochera = async (req, res) => {
       return res.status(400).json({ message: "cocheraId es obligatorio" });
     }
 
-    // Validación básica de ObjectId para evitar errores tontos
     if (!mongoose.Types.ObjectId.isValid(String(cocheraId))) {
       return res.status(400).json({ message: "cocheraId inválido" });
     }
 
-    // 1) Traigo la cochera con sus vehículos (solo _id y patente para no inflar)
+    // 1) Traigo la cochera con sus vehículos
     const coch = await Cochera.findById(cocheraId)
       .populate("vehiculos", "_id patente")
       .lean();
@@ -2048,60 +2067,127 @@ exports.desactivarAbonoDeCochera = async (req, res) => {
     }
 
     const clienteId = coch.cliente;
-    const vehiculoIds = (coch.vehiculos || []).map((v) => v._id);
+    const vehiculoIds = (coch.vehiculos || [])
+      .map((v) => v && v._id)
+      .filter(Boolean);
 
-    // 2) Desactivar TODOS los abonos activos asociados a ESTA cochera lógica
-    //    y, además, vinculados a vehículos que están dentro de esta cochera.
+    // Si no hay vehículos, no hay nada que desabonar
+    if (!vehiculoIds.length) {
+      return res.json({
+        ok: true,
+        message: "Cochera sin vehículos asociados. Nada para desactivar.",
+        cocheraId: String(cocheraId),
+        clienteId: clienteId ? String(clienteId) : null,
+        abonosDesactivados: 0,
+        vehiculosDesabonados: 0,
+        vehiculosAfectados: [],
+      });
+    }
+
+    // 🔥 Filtro SIMPLE y ROBUSTO:
+    //   - mismo cliente
+    //   - abonos activos
+    //   - vehículo dentro de los vehículos de esta cochera
+    const cliIdSafe = toObjectIdSafe(clienteId) || clienteId;
+
+    // 🔧 Filtramos solo IDs válidos para evitar problemas de casteo en $in
+    const vehiculoIdsObj = vehiculoIds
+      .map((v) => toObjectIdSafe(v))
+      .filter(Boolean);
+
+    const vehiculoIdsStr = vehiculoIds
+      .map((v) => String(v))
+      .filter((s) => !!s && s !== 'undefined' && s !== 'null');
+
     const abonoFilter = {
-      cliente: clienteId,
-      cochera: coch.tipo,       // "Fija" / "Móvil" (mapea con Abono.cochera)
-      piso: coch.piso || "",
-      exclusiva: !!coch.exclusiva,
+      cliente: cliIdSafe,
       activo: true,
+      $or: [
+        { vehiculo: { $in: vehiculoIdsObj } },   // ObjectId válido
+        { vehiculo: { $in: vehiculoIdsStr } },   // string viejo
+      ],
     };
 
-    // Queremos desactivar abonos de esa cochera, aunque tengan vehiculo:null
-    abonoFilter.$or = [
-      { vehiculo: { $in: vehiculoIds } },
-      { vehiculo: null }
-    ];
+    // Logs de debug (para ver exactamente qué se está filtrando)
+    console.log("[desactivarAbonoDeCochera] cochera:", {
+      cocheraId: String(cocheraId),
+      cliente: String(cliIdSafe || ""),
+      tipo: coch.tipo,
+      piso: coch.piso,
+      vehiculos: vehiculoIds.map(String),
+    });
+    console.log("[desactivarAbonoDeCochera] abonoFilter:", abonoFilter);
 
-    const abonosResult = await Abono.updateMany(
-      abonoFilter,
-      {
-        $set: {
-          activo: false,
-          updatedAt: new Date(),
-        },
-      }
-    );
+    // 2) Leo qué abonos voy a tocar
+    const abonosAntes = await Abono.find(abonoFilter).select("_id").lean();
+    const abonosIds = abonosAntes.map((a) => a._id);
 
-    const abonosDesactivados =
-      abonosResult?.modifiedCount ?? abonosResult?.nModified ?? 0;
+    // 2.2) Desactivar abonos
+    let abonosDesactivados = 0;
+    if (abonosIds.length) {
+      const abonosResult = await Abono.updateMany(
+        { _id: { $in: abonosIds } },
+        {
+          $set: {
+            activo: false,
+            updatedAt: new Date(),
+          },
+        }
+      );
+      abonosDesactivados =
+        abonosResult?.modifiedCount ?? abonosResult?.nModified ?? 0;
+    }
 
     // 3) Desactivar los vehículos dentro de esa cochera
-    let vehiculosResult = { modifiedCount: 0, nModified: 0 };
+    let vehiculosDesabonados = 0;
     if (vehiculoIds.length) {
-      vehiculosResult = await Vehiculo.updateMany(
+      const vehiculosResult = await Vehiculo.updateMany(
         { _id: { $in: vehiculoIds } },
         {
           $set: {
             abonado: false,
             abonoExpira: null,
-            // ❌ no tocar vehiculo.abono
+            abono: null, // 👈 AHORA sí limpiamos el puntero al abono “vigente”
           },
         }
       );
+      vehiculosDesabonados =
+        vehiculosResult?.modifiedCount ?? vehiculosResult?.nModified ?? 0;
     }
 
-    const vehiculosDesabonados =
-      vehiculosResult?.modifiedCount ?? vehiculosResult?.nModified ?? 0;
+    // 4) Encolar PATCH en Outbox para cada abono afectado
+    try {
+      for (const abonoId of abonosIds) {
+        const doc = await Abono.findById(abonoId).lean();
+        if (doc) {
+          const normalized = normalizeAbonoOutput(doc);
+          await enqueueOutboxPatchAbono(normalized);
+        }
+      }
+    } catch (e) {
+      console.warn(
+        "[desactivarAbonoDeCochera] no pude encolar Outbox PATCH para abonos:",
+        e.message || e
+      );
+    }
+
+    // 4) Recalcular estado del cliente (abonado / finAbono / arrays) usando helper robusto
+    try {
+      if (cliIdSafe) {
+        await cleanClienteById(cliIdSafe, { dryRun: false });
+      }
+    } catch (e) {
+      console.warn(
+        "[desactivarAbonoDeCochera] cleanClienteById falló (se continua igual):",
+        e.message || e
+      );
+    }
 
     return res.json({
       ok: true,
       message: "Abonos y vehículos desabonados para la cochera indicada",
       cocheraId: String(cocheraId),
-      clienteId: String(clienteId),
+      clienteId: cliIdSafe ? String(cliIdSafe) : null,
       abonosDesactivados,
       vehiculosDesabonados,
       vehiculosAfectados: vehiculoIds.map(String),

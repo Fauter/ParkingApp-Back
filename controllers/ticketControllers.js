@@ -332,12 +332,30 @@ exports.imprimirTicketAbono = (req, res) => {
 
   const arg2 = JSON.stringify(meta);
 
-  runPython(
-    scriptPath,
-    [arg1, arg2],
-    res,
-    '✅ Ticket de abono impreso correctamente',
-    'Error al imprimir ticket de abono'
+  const env = {
+    ...process.env,
+    PROPORCIONAL: meta.proporcional || "",
+    VALOR_MENSUAL: meta.valorMensual || "",
+    PATENTE: meta.patente || "",
+    NOMBRE_APELLIDO: meta.nombreApellido || "",
+    METODO_PAGO: meta.metodoPago || "",
+    TIPO_VEHICULO: meta.tipoVehiculo || "",
+    MARCA: meta.marca || "",
+    MODELO: meta.modelo || "",
+    COCHERA: meta.cochera || "",
+    PISO: meta.piso || "",
+    EXCLUSIVA: meta.exclusiva ? "true" : "false",
+    DIAS: meta.diasRestantes || ""
+  };
+
+  execFile(
+    'python',
+    [scriptPath, arg1, arg2],
+    { env, windowsHide: true, encoding: 'utf8' },
+    (error, stdout, stderr) => {
+      if (error) return res.status(500).send("❌ Error al imprimir ticket de abono");
+      return res.send("✅ Ticket de abono impreso correctamente");
+    }
   );
 };
 

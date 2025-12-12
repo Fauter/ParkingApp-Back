@@ -544,9 +544,23 @@ def _parse_optional_meta():
                     tipoVehiculo = str(obj.get("tipoVehiculo", tipoVehiculo) or "").strip()
                     marca        = str(obj.get("marca",        marca)        or "").strip()
                     modelo       = str(obj.get("modelo",       modelo)       or "").strip()
-                    cochera      = str(obj.get("cochera",      cochera)      or "").strip()
-                    piso         = str(obj.get("piso",         piso)         or "").strip()
-                    exclusiva    = bool(obj.get("exclusiva", exclusiva))
+                    raw_cochera = obj.get("cochera", cochera)
+                    raw_piso    = obj.get("piso", piso)
+                    raw_excl    = obj.get("exclusiva", exclusiva)
+
+                    # Cochera: respetar siempre lo que venga del JSON si no es vacío
+                    if raw_cochera not in (None, ""):
+                        cochera = str(raw_cochera).strip()
+
+                    # Piso: idem, no pisar con vacío
+                    if raw_piso not in (None, ""):
+                        piso = str(raw_piso).strip()
+
+                    # Exclusiva: interpretar bien strings "true"/"false"
+                    if isinstance(raw_excl, str):
+                        exclusiva = raw_excl.strip().lower() in ("true", "1", "si", "sí")
+                    else:
+                        exclusiva = bool(raw_excl)
                     diasRestantes = str(obj.get("diasRestantes", diasRestantes) or "").strip()
                     baseMensual = obj.get("baseMensual", None)
                     proporcionalRaw = obj.get("proporcionalRaw", None)
@@ -580,16 +594,30 @@ def _parse_optional_meta():
 
 def _cochera_asignada_str(cochera, piso):
     """
-    Regla:
-      - Si eligió Cochera Móvil -> "Móvil"
-      - Si eligió Fija          -> mostrar el "piso" (número de cochera)
+    Reglas según especificación:
+      - Si cochera = "Móvil" -> "Móvil"
+      - Si NO es "Móvil":
+          • Si hay número de cochera (piso): mostrar ese número
+          • Si NO hay número: mostrar el texto de cochera (Fija, Box, etc.)
+          • Sólo "-" si realmente no vino nada usable
     """
-    v = (cochera or "").strip().lower()
-    if v in ("móvil", "movil"):
+    c = (cochera or "").strip().lower()
+    p = (piso or "").strip()
+
+    # Cochera MÓVIL (siempre imprime "Móvil")
+    if c in ("móvil", "movil"):
         return "Móvil"
-    if v == "fija":
-        return (piso or "").strip() or "-"
-    return (cochera or "").strip() or "-"
+
+    # Si hay número de cochera, se respeta el número
+    if p:
+        return p
+
+    # Sin número, pero vino algún texto de cochera (por ejemplo "Fija")
+    if cochera and cochera.strip():
+        return cochera.strip()
+
+    # Fallback real: no vino nada
+    return "-"
 
 def build_ticket_lines(meta):
     fecha_alta = _today_ddmmyyyy()
