@@ -606,14 +606,29 @@ exports.removerVehiculo = async (req, res) => {
       }
     }
 
-    // 5) Desasociar completamente en el propio vehículo
-    veh.cocheraId = undefined;
-    veh.cliente = null;
-    veh.abonado = false;
-    veh.abono = null;       // limpio puntero al abono
-    veh.abonoExpira = null; // limpio fecha de expiración
-    await veh.save();
-    // 5.bis) Encolar PATCH de vehículo para sync remoto
+    // 5) Desasociar completamente en el propio vehículo (DB-first, explícito)
+    await Vehiculo.updateOne(
+      { _id: veh._id },
+      {
+        $unset: {
+          cocheraId: "",
+          abono: "",
+        },
+        $set: {
+          cliente: null,
+          abonado: false,
+          abonoExpira: null,
+          abonoVence: null,
+          abonoDesde: null,
+          abonoHasta: null,
+          fechaVencimiento: null,
+          vencimiento: null,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    // 5.bis) Encolar PATCH de vehículo (doc final)
     try {
       const Outbox = require("../models/Outbox");
       const vehDoc = await Vehiculo.findById(veh._id).lean();

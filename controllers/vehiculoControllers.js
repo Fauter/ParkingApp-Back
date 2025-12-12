@@ -1271,6 +1271,11 @@ exports.syncVehiculoFromAbono = async (req, res) => {
     if (abono.activo === false) {
       const vehId = oidOrNull(abono.vehiculo);
 
+      // Resolver clienteId desde abono (o desde el vehículo si hace falta)
+      const cliId =
+        oidOrNull(abono.cliente) ||
+        (vehId ? oidOrNull((await Vehiculo.findById(vehId).select('cliente').lean())?.cliente) : null);
+
       if (vehId) {
         await Vehiculo.updateOne(
           { _id: vehId },
@@ -1287,11 +1292,20 @@ exports.syncVehiculoFromAbono = async (req, res) => {
         );
       }
 
+      // ✅ CRÍTICO: limpiar referencia en cliente.vehiculos
+      if (cliId && vehId) {
+        await Cliente.updateOne(
+          { _id: cliId },
+          { $pull: { vehiculos: vehId }, $set: { updatedAt: new Date() } }
+        );
+      }
+
       return res.json({
         ok: true,
         cleared: true,
-        msg: "Vehículo desabonado por sync-from-abono",
+        msg: "Vehículo desabonado y desvinculado del cliente (sync-from-abono)",
         vehiculoId: vehId ? String(vehId) : null,
+        clienteId: cliId ? String(cliId) : null,
       });
     }
 

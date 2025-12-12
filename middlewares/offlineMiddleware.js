@@ -227,7 +227,7 @@ function pickDocumentForOutbox(method, collection, req, capturedBody) {
       }
     }
   }
-
+  
   return candidate;
 }
 

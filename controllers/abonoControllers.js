@@ -854,6 +854,13 @@ exports.renovarAbono = async (req, res) => {
 
     await abono.save(sopt);
 
+    // 🔥 FIX CRÍTICO: sincronizar CREATE de Abono (renovación)
+    try {
+      await enqueueOutboxPatchAbono(abono.toObject());
+    } catch (e) {
+      console.warn('[renovarAbono] no pude encolar Outbox Abono:', e.message);
+    }
+
     // ========= 🔥 CREAR / ACTUALIZAR VEHÍCULO SEGÚN LA RENOVACIÓN =========
 
     // 1) Buscar vehículo por patente
@@ -1222,6 +1229,13 @@ exports.registrarAbono = async (req, res) => {
       exclusiva: exclusivaNorm
     });
     await AbonoModelo.save(sopt);
+
+    // 🔥 FIX CRÍTICO: sincronizar CREATE de Abono
+    try {
+      await enqueueOutboxPatchAbono(AbonoModelo.toObject());
+    } catch (e) {
+      console.warn('[registrarAbono] no pude encolar Outbox Abono:', e.message);
+    }
     if (!session) created.abono = AbonoModelo;
 
     // ============================================================
@@ -1663,6 +1677,25 @@ async function enqueueOutboxPatchAbono(abonoDoc) {
   }
 }
 
+async function enqueueOutboxPatchVehiculo(vehDoc) {
+  try {
+    if (!vehDoc?._id) return;
+    if (process.env.SYNC_DISABLE_PUSH === '1') return;
+
+    await Outbox.create({
+      method: 'PATCH',
+      route: `/api/vehiculos/${vehDoc._id}`,
+      collection: 'vehiculos',
+      params: { id: String(vehDoc._id), _id: String(vehDoc._id) },
+      document: vehDoc,
+      status: 'pending',
+      createdAt: new Date(),
+    });
+  } catch (e) {
+    console.warn('[actualizarAbono] no pude encolar Outbox PATCH vehiculo:', e.message || e);
+  }
+}
+
 // PATCH /api/abonos/:id
 exports.actualizarAbono = async (req, res) => {
   try {
@@ -1747,9 +1780,11 @@ exports.actualizarAbono = async (req, res) => {
             veh.abonado = false;
             veh.abono = null;
             await veh.save();
+            await enqueueOutboxPatchVehiculo(veh.toObject());
           } else if (String(veh.abono || '') === String(id)) {
             veh.abono = null;
             await veh.save();
+            await enqueueOutboxPatchVehiculo(veh.toObject());
           }
         }
       } catch (e) {
@@ -1795,6 +1830,7 @@ exports.actualizarAbono = async (req, res) => {
           if ('anio' in updated && Number.isFinite(Number(updated.anio))) veh.anio = Number(updated.anio);
 
           await veh.save();
+          await enqueueOutboxPatchVehiculo(veh.toObject());
 
           // Aseguro puntero en Abono → vehiculo
           const vehIdFinal = toObjectIdSafe(veh._id) || veh._id;
@@ -1858,7 +1894,7 @@ exports.actualizarAbono = async (req, res) => {
               cliente: updated.cliente || undefined
             });
             await v.save();
-
+            await enqueueOutboxPatchVehiculo(v.toObject());
             // vinculo en Abono y Cliente
             const vId = toObjectIdSafe(v._id) || v._id;
             updated.vehiculo = vId;
@@ -2263,18 +2299,34 @@ exports.desactivarAbonoDeCochera = async (req, res) => {
     // 3) Desactivar los vehículos dentro de esa cochera
     let vehiculosDesabonados = 0;
     if (vehiculoIds.length) {
-      const vehiculosResult = await Vehiculo.updateMany(
+      await Vehiculo.updateMany(
         { _id: { $in: vehiculoIds } },
         {
           $set: {
             abonado: false,
             abonoExpira: null,
-            abono: null, // 👈 AHORA sí limpiamos el puntero al abono “vigente”
+            abono: null,
           },
         }
       );
-      vehiculosDesabonados =
-        vehiculosResult?.modifiedCount ?? vehiculosResult?.nModified ?? 0;
+
+      // ✅ Refuerzo: limpiar cliente.vehiculos explícitamente
+      if (cliIdSafe) {
+        try {
+          await Cliente.updateOne(
+            { _id: cliIdSafe },
+            {
+              $pull: { vehiculos: { $in: vehiculoIds } },
+              $set: { updatedAt: new Date() },
+            }
+          );
+        } catch (e) {
+          console.warn(
+            "[desactivarAbonoDeCochera] no pude limpiar cliente.vehiculos:",
+            e.message
+          );
+        }
+      }
     }
 
     // 4) Encolar PATCH en Outbox para cada abono afectado

@@ -684,13 +684,14 @@ async function processOutboxItem(remoteDb, item) {
   const canonCol = canonicalizeName(colName);
 
   // 🟥 CASO ESPECIAL DEFINITIVO: remover vehículo de cochera
+  // Objetivo: coherencia de grafo (cochera + vehiculo + cliente) en remoto.
   if (
     canonCol === 'cocheras' &&
     /\/cocheras\/remover-vehiculo\b/i.test(item?.route || '')
   ) {
-    console.log("[syncService] CASO ESPECIAL: remover vehículo de cochera (ESPEJO COMPLETO LOCAL → ATLAS)");
+    console.log("[syncService] CASO ESPECIAL: remover vehículo (PUSH grafo: cochera+vehiculo+cliente)");
 
-    // 1) Detectar cocheraId correctamente
+    // 1) Detectar cocheraId y vehiculoId
     let cocheraId =
       item.document?.cocheraId ||
       item.document?.cochera ||
@@ -708,47 +709,106 @@ async function processOutboxItem(remoteDb, item) {
     if (!cocheraId) cocheraId = extractIdFromItem(item);
     if (!cocheraId) throw new Error("cocheraId_missing_remover_vehiculo");
 
-    // 2) Leer cochera local COMPLETAMENTE ACTUALIZADA
-    const local = await Cochera.findById(cocheraId).lean();
-    if (!local) throw new Error("cochera_no_encontrada_local_para_remover");
+    // Intentar detectar vehiculoId (depende de cómo armes el body del endpoint)
+    let vehiculoId =
+      item.document?.vehiculoId ||
+      item.document?.vehiculo ||
+      item.params?.vehiculoId ||
+      null;
 
-    // 3) Normalizar cliente y vehículos → SOLO IDs
-    const clienteId = local.cliente ? (local.cliente._id || local.cliente) : null;
-    const vehiculosIds = Array.isArray(local.vehiculos)
-      ? local.vehiculos.map(v => (v && v._id) ? v._id : v)
+    // 2) Leer cochera local ya actualizada
+    const cocheraLocal = await Cochera.findById(cocheraId).lean();
+    if (!cocheraLocal) throw new Error("cochera_no_encontrada_local_para_remover");
+
+    // 3) Resolver clienteId desde cocheraLocal
+    const clienteId = cocheraLocal.cliente ? (cocheraLocal.cliente._id || cocheraLocal.cliente) : null;
+
+    // 4) Si no vino vehiculoId, intentar inferir por diferencia (caro pero seguro)
+    //    Nota: esto requiere que en el Outbox guardes al menos el vehiculoId removido; si no, inferimos.
+    let vehiculoLocal = null;
+    if (vehiculoId && mongoose.Types.ObjectId.isValid(String(vehiculoId))) {
+      vehiculoLocal = await Vehiculo.findById(vehiculoId).lean();
+    }
+
+    // Si no tenemos vehiculoId, no podemos “limpiar” vehiculo/cliente con certeza.
+    // Aun así, empujamos cochera (que ya quedó bien).
+    // Recomendación: GUARDA vehiculoId removido en el Outbox del endpoint.
+    // (te lo marco abajo como ajuste de controllers)
+    // ------------------------------------------------------------
+
+    // 5) Normalizar payload de cochera → SOLO IDs
+    const vehiculosIds = Array.isArray(cocheraLocal.vehiculos)
+      ? cocheraLocal.vehiculos.map(v => (v && v._id) ? v._id : v)
       : [];
 
-    const payload = {
+    const cocheraPayload = {
       _id: safeObjectId(cocheraId),
       cliente: clienteId ? safeObjectId(clienteId) : null,
-      tipo: local.tipo,
-      piso: local.piso,
-      exclusiva: !!local.exclusiva,
+      tipo: cocheraLocal.tipo,
+      piso: cocheraLocal.piso,
+      exclusiva: !!cocheraLocal.exclusiva,
       vehiculos: vehiculosIds.map(id => safeObjectId(id)),
       updatedAt: new Date()
     };
 
-    // 4) PUSH EXACTO AL REMOTO (sin doc incompleto)
-    const remoteColl = remoteDb.collection("cocheras");
-    const res = await remoteColl.updateOne(
-      { _id: payload._id },
-      { $set: payload },
+    // 6) Empujar cochera (exacto)
+    await remoteDb.collection("cocheras").updateOne(
+      { _id: cocheraPayload._id },
+      { $set: cocheraPayload },
       { upsert: true }
     );
 
-    console.log("[syncService] remover-vehiculo → REMOTO ACTUALIZADO:", {
-      matched: res.matchedCount,
-      modified: res.modifiedCount,
-      upserted: res.upsertedId || null
-    });
+    // 7) Si tenemos vehiculoLocal: empujar el vehiculo ya actualizado en LOCAL
+    //    (idealmente el endpoint local ya le puso cocheraId=null y/o lo que corresponda)
+    if (vehiculoLocal && vehiculoLocal._id) {
+      // Releer por seguridad el estado final local
+      const vehFinal = await Vehiculo.findById(vehiculoLocal._id).lean();
 
-    // 5) Marcar como procesado y TERMINAR
+      if (vehFinal) {
+        // Normalización de ids (tu helper existente)
+        const vehNorm = normalizeIds(deepClone(vehFinal), 'vehiculos');
+
+        // Upsert remoto por patente (consistente con tu lógica de vehiculos)
+        const vehRemoteName = (getRemoteNames('vehiculos')[0] || 'vehiculos');
+        const vehColl = remoteDb.collection(vehRemoteName);
+
+        const filter = vehNorm.patente ? { patente: vehNorm.patente } : { _id: safeObjectId(vehNorm._id) };
+
+        const vehDocWithoutId = deepClone(vehNorm);
+        delete vehDocWithoutId._id;
+
+        await vehColl.updateOne(
+          filter,
+          { $set: vehDocWithoutId, $setOnInsert: vehNorm.patente ? { patente: vehNorm.patente } : {} },
+          { upsert: true }
+        );
+      }
+    }
+
+    // 8) Si tenemos clienteId: empujar el cliente (para que /clientes refleje vehiculos[])
+    //    OJO: esto asume que el endpoint local efectivamente removió el vehiculo del array del cliente.
+    if (clienteId && mongoose.Types.ObjectId.isValid(String(clienteId))) {
+      const cliFinal = await Cliente.findById(clienteId).lean();
+      if (cliFinal) {
+        const cliNorm = normalizeIds(deepClone(cliFinal), 'clientes');
+
+        const cliColl = remoteDb.collection(getRemoteNames('clientes')[0] || 'clientes');
+        await cliColl.updateOne(
+          { _id: safeObjectId(cliNorm._id) },
+          { $set: removeNulls(deepClone((() => { const x = deepClone(cliNorm); delete x._id; return x; })())) },
+          { upsert: true }
+        );
+      }
+    }
+
+    console.log("[syncService] remover-vehiculo → REMOTO ACTUALIZADO (cochera+vehiculo+cliente)");
+
+    // 9) Marcar outbox y terminar
     await Outbox.updateOne(
       { _id: item._id },
       { status: "synced", syncedAt: new Date(), error: null }
     );
-
-    return; // 👈 CRÍTICO
+    return;
   }
 
   // Permitimos doc vacío SOLO para vehiculos (vamos a leer desde Mongo local)
@@ -888,7 +948,7 @@ async function processOutboxItem(remoteDb, item) {
         }
       }
 
-      // 4) SIEMPRE leer el vehículo completo y actualizado DESDE MONGO LOCAL
+      // ✅ 4) Leer vehículo completo local
       const vehiculoLocal =
         (vehiculo && vehiculo._id)
           ? (await Vehiculo.findById(vehiculo._id).lean()) || vehiculo
@@ -899,8 +959,12 @@ async function processOutboxItem(remoteDb, item) {
         throw new Error('vehiculo_local_no_encontrado_para_push');
       }
 
-      // Normalizamos el vehículo REAL (no el del Outbox)
-      const normalizedFullVeh = normalizeIds(vehiculoLocal, 'vehiculos');
+      // ✅ 5) Construir “vista local” SIN perder nulls (para poder desenganchar en remoto)
+      const localRaw = deepClone(vehiculoLocal);
+
+      // Normalizamos ids pero OJO: normalizeIds() elimina nulls.
+      // Usamos normalizeIds() para ids/limpieza, pero guardamos el raw para decidir $unset.
+      const normalizedFullVeh = normalizeIds(localRaw, 'vehiculos');
 
       // Preparamos payload sin _id ni patente
       const docWithoutId = deepClone(normalizedFullVeh);
@@ -912,41 +976,83 @@ async function processOutboxItem(remoteDb, item) {
         ? { patente: normalizedFullVeh.patente }
         : { _id: safeObjectId(normalizedFullVeh._id) };
 
-      // Colección remota
       const vehRemoteName = remoteNames[0] || 'vehiculos';
       const vehColl = remoteDb.collection(vehRemoteName);
 
-      // 🧽 EXTRA: construir $unset para campos de estadiaActual que existan en remoto y ya no existan localmente
+      // 🧽 6) Construir $unset para campos “link” que quedaron null/undefined en LOCAL
+      // (si no lo hacés, el remoto conserva valores viejos)
+      const UNSET_IF_EMPTY = [
+        // ⚠️ LINKS RELACIONALES: NUNCA auto-unset
+        // 'cliente',
+        // 'abono',
+
+        // ✅ solo metadata del abono
+        'cocheraId',
+        'abonoExpira',
+        'abonoVence',
+        'abonoDesde',
+        'abonoHasta',
+        'fechaVencimiento',
+        'vencimiento',
+
+        // estadía se maneja aparte
+        'estadiaActual',
+      ];
+
+      const unsetLinks = {};
+      try {
+        const remoteSnap = await vehColl.findOne(filter, {
+          projection: UNSET_IF_EMPTY.reduce((acc, k) => (acc[k] = 1, acc), {})
+        });
+
+        for (const k of UNSET_IF_EMPTY) {
+          const localVal = localRaw?.[k];
+
+          const localEmpty =
+            localVal === null ||
+            localVal === undefined ||
+            (typeof localVal === 'string' && localVal.trim() === '') ||
+            (Array.isArray(localVal) && localVal.length === 0) ||
+            (typeof localVal === 'object' && !Array.isArray(localVal) && localVal && Object.keys(localVal).length === 0);
+
+          const remoteHas = remoteSnap && Object.prototype.hasOwnProperty.call(remoteSnap, k);
+
+          // Si local está vacío y remoto tiene el campo → lo desinstalamos
+          if (localEmpty && remoteHas) {
+            unsetLinks[k] = '';
+          }
+        }
+      } catch (e) {
+        console.warn('[syncService] [vehiculos] no pude leer remoto para build unsetLinks:', String(e && e.message || e));
+      }
+
+      // 🧽 7) Unset fino de estadiaActual.* (tu lógica existente)
       let unsetEstadia = {};
       try {
-        const remoteSnap = await vehColl.findOne(filter, { projection: { estadiaActual: 1 } });
-        if (remoteSnap && remoteSnap.estadiaActual && typeof remoteSnap.estadiaActual === 'object') {
+        const remoteSnap2 = await vehColl.findOne(filter, { projection: { estadiaActual: 1 } });
+        if (remoteSnap2 && remoteSnap2.estadiaActual && typeof remoteSnap2.estadiaActual === 'object') {
           const localEstadia =
-            normalizedFullVeh.estadiaActual && typeof normalizedFullVeh.estadiaActual === 'object'
-              ? normalizedFullVeh.estadiaActual
+            localRaw.estadiaActual && typeof localRaw.estadiaActual === 'object'
+              ? localRaw.estadiaActual
               : null;
 
-          for (const k of Object.keys(remoteSnap.estadiaActual)) {
-            // si el campo NO existe en la versión local → lo desinstalamos en Atlas
-            if (!localEstadia || !(k in localEstadia)) {
-              unsetEstadia[`estadiaActual.${k}`] = '';
+          for (const kk of Object.keys(remoteSnap2.estadiaActual)) {
+            if (!localEstadia || !(kk in localEstadia)) {
+              unsetEstadia[`estadiaActual.${kk}`] = '';
             }
           }
         }
       } catch (e) {
-        console.warn(
-          '[syncService] [vehiculos] no pude leer remoto para build unsetEstadia:',
-          String(e && e.message || e)
-        );
+        console.warn('[syncService] [vehiculos] no pude leer remoto para build unsetEstadia:', String(e && e.message || e));
       }
 
       const updateOps = {
         $set: docWithoutId,
         $setOnInsert: normalizedFullVeh.patente ? { patente: normalizedFullVeh.patente } : {}
       };
-      if (Object.keys(unsetEstadia).length) {
-        updateOps.$unset = unsetEstadia;
-      }
+
+      const mergedUnset = { ...unsetLinks, ...unsetEstadia };
+      if (Object.keys(mergedUnset).length) updateOps.$unset = mergedUnset;
 
       const res = await vehColl.updateOne(filter, updateOps, { upsert: true });
 
@@ -954,7 +1060,8 @@ async function processOutboxItem(remoteDb, item) {
         filter,
         matched: res.matchedCount,
         modified: res.modifiedCount,
-        upsertedId: res.upsertedId || null
+        upsertedId: res.upsertedId || null,
+        unset: Object.keys(mergedUnset)
       });
 
       // 🆕 REFRESH LOCAL SOLO DEL VEHÍCULO (micro-mirror)
@@ -964,8 +1071,32 @@ async function processOutboxItem(remoteDb, item) {
       try {
         const vehRemote = await vehColl.findOne(filter);
         if (vehRemote) {
-          const ModelVeh = mongoose.models['vehiculos'] || mongoose.models['Vehiculo'];
-          await ModelVeh.updateOne({ patente: vehRemote.patente }, { $set: vehRemote }, { upsert: true });
+          const localName = await resolveLocalCollectionName(mongoose.connection, 'vehiculos');
+          const localVehColl = mongoose.connection.collection(localName);
+
+          const copy = deepClone(vehRemote);
+          delete copy._id;
+
+          // ⛔ NO reflejar info derivada de abono
+          delete copy.abono;
+          delete copy.abonoExpira;
+          delete copy.abonoVence;
+          delete copy.abonoDesde;
+          delete copy.abonoHasta;
+
+          // ⛔ NO tocar campos que el local deriva desde Abono
+          delete copy.companiaSeguro;
+          delete copy.fotoSeguro;
+          delete copy.fotoDNI;
+          delete copy.fotoCedulaVerde;
+          delete copy.fotoCedulaAzul;
+
+          await localVehColl.updateOne(
+            { patente: vehRemote.patente },
+            { $set: copy },
+            { upsert: true }
+          );
+
           console.log('[syncService] [vehiculos] local actualizado post-push (micro-mirror)');
         }
       } catch (e) {
@@ -1669,22 +1800,9 @@ async function pullCollectionsFromRemote(remoteDb, requestedCollections = [], op
       // ======================================================
       // 🔥 USAR MODELO MONGOOSE REAL (elimina Native Collection)
       // ======================================================
-      let localCollection = null;
-      try {
-        // Intentar obtener modelo ya cargado
-        localCollection = mongoose.models[canonName];
-        if (!localCollection) {
-          // Segundo intento: plural / singular
-          const alt = canonName.charAt(0).toUpperCase() + canonName.slice(1);
-          localCollection = mongoose.models[alt];
-        }
-      } catch (_) {}
-
-      // Si no existe modelo → fallback a Native Collection (último recurso)
-      if (!localCollection) {
-        const localName = await resolveLocalCollectionName(mongoose.connection, canonName);
-        localCollection = mongoose.connection.collection(localName);
-      }
+      // ✅ En PULL usamos SIEMPRE Native Collection (evita mixed API Model vs Driver)
+      const localName = await resolveLocalCollectionName(mongoose.connection, canonName);
+      const localCollection = mongoose.connection.collection(localName);
 
       for (let raw of union) {
 

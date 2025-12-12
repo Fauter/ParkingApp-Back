@@ -276,10 +276,10 @@ async function registrarOutboxCocheraInterna({
     };
 
     // ⛔️ Jamás enviar cliente=null al outbox → produce $unset
-    const clienteSafe =
-      cliente && String(cliente).length === 24
-        ? cliente
-        : undefined; // eliminar campo → NO tocar cliente en remoto/local
+    const clienteSafe = (() => {
+      const oid = asObjectId(cliente) || (cliente && cliente._id && asObjectId(cliente._id));
+      return oid ? String(oid) : undefined;
+    })();
 
     await Outbox.create({
       method: 'PATCH',
