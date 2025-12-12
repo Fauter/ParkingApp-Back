@@ -1950,90 +1950,212 @@ exports.setExclusiva = async (req, res) => {
 exports.updateVehiculoDeAbono = async (req, res) => {
   try {
     const { id } = req.params;
+
     if (!mongoose.Types.ObjectId.isValid(String(id))) {
-      return res.status(400).json({ message: 'ID inválido' });
+      return res.status(400).json({ message: "ID inválido" });
     }
 
     const { vehiculoId } = req.body;
     const abono = await Abono.findById(id);
-    if (!abono) return res.status(404).json({ message: 'Abono no encontrado' });
+    if (!abono) {
+      return res.status(404).json({ message: "Abono no encontrado" });
+    }
 
-    const prevVehId = abono.vehiculo ? String(abono.vehiculo) : null;
+    // Cliente “seguro” para luego recalcular estado
+    const cliIdSafe =
+      toObjectIdSafe(abono.cliente) ||
+      toObjectIdSafe(abono.cliente && abono.cliente._id) ||
+      (abono.cliente && abono.cliente.buffer ? toObjectIdSafe(abono.cliente) : null) ||
+      null;
 
-    // Validación de nuevo vehiculo (si viene)
+    const prevVehId = toObjectIdSafe(abono.vehiculo);
+    const hasNewVeh =
+      vehiculoId !== undefined &&
+      vehiculoId !== null &&
+      String(vehiculoId).trim() !== "";
+
     let nextVehId = null;
-    if (vehiculoId) {
+
+    // ===============================
+    // 1) CASO A: asignar NUEVO vehículo
+    // ===============================
+    if (hasNewVeh) {
       if (!mongoose.Types.ObjectId.isValid(String(vehiculoId))) {
-        return res.status(400).json({ message: 'vehiculoId inválido' });
+        return res.status(400).json({ message: "vehiculoId inválido" });
       }
-      const exists = await Vehiculo.exists({ _id: vehiculoId });
-      if (!exists) return res.status(404).json({ message: 'Vehículo no encontrado' });
-      nextVehId = String(vehiculoId);
-    }
 
-    // Actualizo vínculo en Abono
-    abono.vehiculo = nextVehId ? nextVehId : null;
-    await abono.save();
+      const vehExists = await Vehiculo.findById(vehiculoId);
+      if (!vehExists) {
+        return res.status(404).json({ message: "Vehículo no encontrado" });
+      }
 
-    // Si había vínculo previo y se está removiendo o cambiando, limpiar el Vehículo previo
-    if (prevVehId && (!nextVehId || nextVehId !== prevVehId)) {
-      try {
-        const vehPrev = await Vehiculo.findById(prevVehId);
-        if (vehPrev) {
+      nextVehId = vehExists._id;
 
-          // 🔥 1) Sacar el vehículo de la cochera (si lo tenía asignado)
-          if (vehPrev.cocheraId) {
-            try {
-              await Cochera.updateOne(
-                { _id: vehPrev.cocheraId },
-                { $pull: { vehiculos: vehPrev._id } }
-              );
-            } catch (e2) {
-              console.warn('[updateVehiculoDeAbono] no pude pull del array cochera.vehiculos:', e2.message);
+      // si es el mismo vehículo, no hacemos cambios de vínculos
+      const sameVeh =
+        prevVehId && String(prevVehId) === String(nextVehId);
+
+      // apuntar abono al nuevo vehículo, mantener activo tal como está
+      abono.vehiculo = nextVehId;
+      await abono.save();
+
+      // limpiar vínculos del vehículo previo si es distinto
+      if (prevVehId && !sameVeh) {
+        try {
+          const vehPrev = await Vehiculo.findById(prevVehId);
+          if (vehPrev) {
+            // sacar de la cochera
+            if (vehPrev.cocheraId) {
+              try {
+                await Cochera.updateOne(
+                  { _id: vehPrev.cocheraId },
+                  { $pull: { vehiculos: vehPrev._id } }
+                );
+              } catch (e2) {
+                console.warn(
+                  "[updateVehiculoDeAbono] no pude pull cochera.vehiculos:",
+                  e2.message
+                );
+              }
             }
-          }
 
-          // 🔥 2) Limpiar vínculo cochera del vehículo
-          vehPrev.cocheraId = null;
+            vehPrev.cocheraId = null;
 
-          // 🔥 3) Limpiar vínculo de abono
-          const otherActive = await Abono.exists({ vehiculo: vehPrev._id, activo: true });
-          if (!otherActive) {
-            vehPrev.abonado = false;
-          }
-          if (String(vehPrev.abono || '') === String(id)) {
-            vehPrev.abono = null;
-          }
+            // si ya no tiene otros abonos activos, bajar bandera
+            const otherActive = await Abono.exists({
+              vehiculo: vehPrev._id,
+              activo: true,
+              _id: { $ne: abono._id },
+            });
+            if (!otherActive) {
+              vehPrev.abonado = false;
+              vehPrev.abonoExpira = null;
+            }
+            if (String(vehPrev.abono || "") === String(abono._id)) {
+              vehPrev.abono = null;
+            }
 
-          await vehPrev.save();
+            await vehPrev.save();
+          }
+        } catch (e) {
+          console.warn(
+            "[updateVehiculoDeAbono] limpiar vehículo previo:",
+            e.message
+          );
         }
-      } catch (e) {
-        console.warn('[updateVehiculoDeAbono] limpiar vehiculo previo:', e.message);
       }
-    }
 
-    // Si setearon un nuevo vehículo, subimos su bandera y lo vinculamos
-    if (nextVehId) {
+      // Marcar el nuevo vehículo como abonado y vinculado a este abono
       try {
         const vehNext = await Vehiculo.findById(nextVehId);
         if (vehNext) {
           vehNext.abonado = true;
           vehNext.abono = abono._id;
+          // opcional: heredamos fecha de expiración del abono
+          vehNext.abonoExpira = abono.fechaExpiracion || null;
           await vehNext.save();
         }
       } catch (e) {
-        console.warn('[updateVehiculoDeAbono] setear vehiculo nuevo:', e.message);
+        console.warn(
+          "[updateVehiculoDeAbono] setear vehículo nuevo:",
+          e.message
+        );
+      }
+
+      // Recalcular cliente (por si cambió algo en la matriz de abonos/vehículos)
+      if (cliIdSafe) {
+        try {
+          await cleanClienteById(cliIdSafe, { dryRun: false });
+        } catch (e) {
+          console.warn(
+            "[updateVehiculoDeAbono] cleanClienteById (asignar) falló:",
+            e.message
+          );
+        }
+      }
+
+    } else {
+      // ===============================
+      // 2) CASO B: remover vehículo del abono (DESABONAR)
+      // ===============================
+
+      // abono sin vehículo NO debe seguir activo
+      abono.vehiculo = null;
+      abono.activo = false;
+      await abono.save();
+
+      // limpiar vínculos en el vehículo previo
+      if (prevVehId) {
+        try {
+          const vehPrev = await Vehiculo.findById(prevVehId);
+          if (vehPrev) {
+            // sacar de la cochera
+            if (vehPrev.cocheraId) {
+              try {
+                await Cochera.updateOne(
+                  { _id: vehPrev.cocheraId },
+                  { $pull: { vehiculos: vehPrev._id } }
+                );
+              } catch (e2) {
+                console.warn(
+                  "[updateVehiculoDeAbono] no pude pull cochera.vehiculos (remove):",
+                  e2.message
+                );
+              }
+            }
+
+            vehPrev.cocheraId = null;
+            vehPrev.abonado = false;
+            if (String(vehPrev.abono || "") === String(abono._id)) {
+              vehPrev.abono = null;
+            }
+            vehPrev.abonoExpira = null;
+
+            await vehPrev.save();
+          }
+        } catch (e) {
+          console.warn(
+            "[updateVehiculoDeAbono] limpiar vehículo previo (remove):",
+            e.message
+          );
+        }
+      }
+
+      // Recalcular estado completo del cliente (abonado / finAbono / arrays)
+      if (cliIdSafe) {
+        try {
+          await cleanClienteById(cliIdSafe, { dryRun: false });
+        } catch (e) {
+          console.warn(
+            "[updateVehiculoDeAbono] cleanClienteById (remove) falló:",
+            e.message
+          );
+        }
       }
     }
 
+    // ===============================
+    // 3) Encolar PATCH del abono para sync
+    // ===============================
     try {
       await enqueueOutboxPatchAbono(abono.toObject());
-    } catch (_) {}
+    } catch (e) {
+      console.warn(
+        "[updateVehiculoDeAbono] no se pudo encolar Outbox PATCH:",
+        e.message
+      );
+    }
 
-    return res.json({ ok: true, abono: normalizeAbonoOutput(abono.toObject()) });
+    return res.json({
+      ok: true,
+      abono: normalizeAbonoOutput(abono.toObject()),
+    });
   } catch (e) {
-    console.error('updateVehiculoDeAbono error:', e);
-    res.status(500).json({ message: 'Error al actualizar vínculo de vehículo del abono' });
+    console.error("updateVehiculoDeAbono error:", e);
+    return res.status(500).json({
+      message: "Error al actualizar vínculo de vehículo del abono",
+      error: e.message,
+    });
   }
 };
 

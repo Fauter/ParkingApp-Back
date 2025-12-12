@@ -1259,39 +1259,69 @@ exports.syncVehiculoFromAbono = async (req, res) => {
     if (!abonoId?.match(/^[0-9a-fA-F]{24}$/)) {
       return res.status(400).json({ msg: "abonoId inválido" });
     }
+
     const abono = await Abono.findById(abonoId);
-    if (!abono) return res.status(404).json({ msg: "Abono no encontrado" });
-
-    try {
-      const vehiculo = await ensureVehiculoFromAbono(abono);
-
-      // Garantizo vínculo en cliente (por si el helper no pudo setear por alguna razón),
-      // PERO SIN USAR getIdAny: casteo fuerte a ObjectId o salteo.
-      const cliId = (await resolveClienteIdForAbono(abono)) || oidOrNull(abono.cliente);
-      const vehId = oidOrNull(vehiculo?._id);
-
-      if (cliId && vehId) {
-        try {
-          await Cliente.updateOne({ _id: cliId }, { $addToSet: { vehiculos: vehId } });
-        } catch (e) {
-          console.warn("[syncVehiculoFromAbono] addToSet cliente.vehiculos:", e?.message);
-        }
-      } else {
-        console.warn("[syncVehiculoFromAbono] skip addToSet (no cliId o vehId casteables)", {
-          cliId: String(cliId || ""),
-          vehId: String(vehId || ""),
-        });
-      }
-
-      return res.json({ msg: "Vehículo sincronizado desde Abono", vehiculo: formatVehiculo(vehiculo.toObject()) });
-    } catch (e) {
-      if (e?.statusCode === 409) {
-        return res.status(409).json({ msg: e.message });
-      }
-      throw e;
+    if (!abono) {
+      return res.status(404).json({ msg: "Abono no encontrado" });
     }
+
+    // =====================================================
+    // 🔥 ABONO INACTIVO → LIMPIAR VEHÍCULO
+    // =====================================================
+    if (abono.activo === false) {
+      const vehId = oidOrNull(abono.vehiculo);
+
+      if (vehId) {
+        await Vehiculo.updateOne(
+          { _id: vehId },
+          {
+            $set: {
+              abonado: false,
+              abono: null,
+              abonoExpira: null,
+              cocheraId: null,
+              cliente: null,
+              updatedAt: new Date(),
+            },
+          }
+        );
+      }
+
+      return res.json({
+        ok: true,
+        cleared: true,
+        msg: "Vehículo desabonado por sync-from-abono",
+        vehiculoId: vehId ? String(vehId) : null,
+      });
+    }
+
+    // =====================================================
+    // 🟢 ABONO ACTIVO → ASEGURAR VEHÍCULO
+    // =====================================================
+    const vehiculo = await ensureVehiculoFromAbono(abono);
+
+    const cliId = (await resolveClienteIdForAbono(abono)) || oidOrNull(abono.cliente);
+    const vehId = oidOrNull(vehiculo?._id);
+
+    if (cliId && vehId) {
+      try {
+        await Cliente.updateOne(
+          { _id: cliId },
+          { $addToSet: { vehiculos: vehId } }
+        );
+      } catch (e) {
+        console.warn("[syncVehiculoFromAbono] addToSet cliente.vehiculos:", e?.message);
+      }
+    }
+
+    return res.json({
+      ok: true,
+      msg: "Vehículo sincronizado desde Abono",
+      vehiculo: formatVehiculo(vehiculo.toObject()),
+    });
+
   } catch (err) {
     console.error("💥 Error en syncVehiculoFromAbono:", err);
-    res.status(500).json({ msg: "Error del servidor" });
+    return res.status(500).json({ msg: "Error del servidor" });
   }
 };

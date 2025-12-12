@@ -683,6 +683,74 @@ async function processOutboxItem(remoteDb, item) {
 
   const canonCol = canonicalizeName(colName);
 
+  // 🟥 CASO ESPECIAL DEFINITIVO: remover vehículo de cochera
+  if (
+    canonCol === 'cocheras' &&
+    /\/cocheras\/remover-vehiculo\b/i.test(item?.route || '')
+  ) {
+    console.log("[syncService] CASO ESPECIAL: remover vehículo de cochera (ESPEJO COMPLETO LOCAL → ATLAS)");
+
+    // 1) Detectar cocheraId correctamente
+    let cocheraId =
+      item.document?.cocheraId ||
+      item.document?.cochera ||
+      item.params?.cocheraId ||
+      item.params?.id ||
+      null;
+
+    if (!cocheraId && item.document?.filter) {
+      cocheraId =
+        item.document.filter._id ||
+        item.document.filter.cocheraId ||
+        null;
+    }
+
+    if (!cocheraId) cocheraId = extractIdFromItem(item);
+    if (!cocheraId) throw new Error("cocheraId_missing_remover_vehiculo");
+
+    // 2) Leer cochera local COMPLETAMENTE ACTUALIZADA
+    const local = await Cochera.findById(cocheraId).lean();
+    if (!local) throw new Error("cochera_no_encontrada_local_para_remover");
+
+    // 3) Normalizar cliente y vehículos → SOLO IDs
+    const clienteId = local.cliente ? (local.cliente._id || local.cliente) : null;
+    const vehiculosIds = Array.isArray(local.vehiculos)
+      ? local.vehiculos.map(v => (v && v._id) ? v._id : v)
+      : [];
+
+    const payload = {
+      _id: safeObjectId(cocheraId),
+      cliente: clienteId ? safeObjectId(clienteId) : null,
+      tipo: local.tipo,
+      piso: local.piso,
+      exclusiva: !!local.exclusiva,
+      vehiculos: vehiculosIds.map(id => safeObjectId(id)),
+      updatedAt: new Date()
+    };
+
+    // 4) PUSH EXACTO AL REMOTO (sin doc incompleto)
+    const remoteColl = remoteDb.collection("cocheras");
+    const res = await remoteColl.updateOne(
+      { _id: payload._id },
+      { $set: payload },
+      { upsert: true }
+    );
+
+    console.log("[syncService] remover-vehiculo → REMOTO ACTUALIZADO:", {
+      matched: res.matchedCount,
+      modified: res.modifiedCount,
+      upserted: res.upsertedId || null
+    });
+
+    // 5) Marcar como procesado y TERMINAR
+    await Outbox.updateOne(
+      { _id: item._id },
+      { status: "synced", syncedAt: new Date(), error: null }
+    );
+
+    return; // 👈 CRÍTICO
+  }
+
   // Permitimos doc vacío SOLO para vehiculos (vamos a leer desde Mongo local)
   if (
     item.method !== 'DELETE' &&
@@ -889,6 +957,21 @@ async function processOutboxItem(remoteDb, item) {
         upsertedId: res.upsertedId || null
       });
 
+      // 🆕 REFRESH LOCAL SOLO DEL VEHÍCULO (micro-mirror)
+      // No afecta ninguna otra colección.
+      // No es mirror global.
+      // No pisa estadías ni campos críticos.
+      try {
+        const vehRemote = await vehColl.findOne(filter);
+        if (vehRemote) {
+          const ModelVeh = mongoose.models['vehiculos'] || mongoose.models['Vehiculo'];
+          await ModelVeh.updateOne({ patente: vehRemote.patente }, { $set: vehRemote }, { upsert: true });
+          console.log('[syncService] [vehiculos] local actualizado post-push (micro-mirror)');
+        }
+      } catch (e) {
+        console.warn('[syncService] [vehiculos] no se pudo refrescar local post-push:', e.message);
+      }
+
       // ⬅️ importante: NO seguir con la lógica genérica
       return;
     }
@@ -1050,7 +1133,7 @@ async function upsertLocalDocWithConflictResolution(localCollection, collName, r
   // LOCAL es dueño absoluto de la verdad.
   // Solo aceptar docs remotos si NO existen localmente.
   if (collName === 'cocheras') {
-  const id = safeObjectId(remoteDoc && remoteDoc._id);
+    const id = safeObjectId(remoteDoc && remoteDoc._id);
     if (id) {
       let exists = null;
 
@@ -1956,15 +2039,13 @@ async function syncTick(atlasUri, opts = {}, statusCb = () => {}) {
 // ===============================
 // SYNC_ENABLED:
 // 1 → sync completo: inicial + periódico + push
-// 0 → SOLO PULL INICIAL ABSOLUTO DESDE REMOTO → LOCAL
-//     (SIN loop periódico, SIN push, SIN incremental)
+// 0 → SOLO PULL INICIAL ABSOLUTO (sin loop, sin push, sin incremental)
 const SYNC_ENABLED = process.env.SYNC_ENABLED !== '0';
 
+// Si está apagado → bloquear push y forzar FULL PULL
 if (!SYNC_ENABLED) {
-  // Garantizar que NO haya push jamás cuando está apagado
   process.env.SYNC_DISABLE_PUSH = '1';
-  // No permitir incremental
-  process.env.SYNC_PULL = '*'; // obligamos pull completo inicial
+  process.env.SYNC_PULL = '*';
 }
 
 // ===============================
@@ -1974,27 +2055,23 @@ function startPeriodicSync(atlasUri, opts = {}, statusCb = () => {}) {
   const intervalMs = opts.intervalMs || 30000;
 
   // ============================================================
-  // 🔴 MODO SYNC DESACTIVADO (SYNC_ENABLED=0)
-  //     → solo pull inicial absoluto, SIN loop periódico
+  // 🔴 MODO SYNC OFF → solo pull inicial absoluto
   // ============================================================
   if (!SYNC_ENABLED) {
-    console.log("[syncService] SYNC desactivado. Ejecutando SOLO PULL INICIAL...");
+    console.log("[syncService] SYNC desactivado. Haciendo SOLO PULL INICIAL...");
 
-    // ⬇️ opciones PARA EL PULL INICIAL
     const initialOpts = {
-      pullAll: true,                // 🔥 FULL desde remoto
+      pullAll: true,
       mirrorAll: false,
       mirrorCollections: opts.mirrorCollections || [],
       skipCollections: opts.skipCollections || [],
       remoteDbName: opts.remoteDbName
     };
 
-    // Ejecutamos una sola vez
     syncTick(atlasUri, initialOpts, statusCb)
       .then(() => console.log("[syncService] PULL INICIAL COMPLETADO (SYNC apagado)."))
-      .catch(e => console.error("[syncService] Error en pull inicial:", e));
+      .catch(err => console.error("[syncService] Error en pull inicial:", err));
 
-    // devolvemos handle vacío
     return {
       stop: () => {},
       runOnce: () => Promise.resolve(),
@@ -2004,32 +2081,34 @@ function startPeriodicSync(atlasUri, opts = {}, statusCb = () => {}) {
   }
 
   // ============================================================
-  // 🔵 MODO SYNC ACTIVADO (SYNC_ENABLED=1)
-  //     → todo igual que siempre
+  // 🔵 SYNC ON
   // ============================================================
-  console.log('[syncService] iniciando sincronizador. Intervalo:', intervalMs, 'ms');
+  console.log("[syncService] iniciando sincronizador. Intervalo =", intervalMs, "ms");
 
   if (opts.remoteDbName) {
     SELECTED_REMOTE_DBNAME = opts.remoteDbName;
-    console.log(`[syncService] DB remota seleccionada: "${SELECTED_REMOTE_DBNAME}"`);
+    console.log(`[syncService] Base remota usada: "${SELECTED_REMOTE_DBNAME}"`);
   }
 
   const effectiveOpts = {
     ...opts,
-    pullCollections: process.env.SYNC_PULL
-      ? process.env.SYNC_PULL.split(',').filter(Boolean)
-      : [],
+    pullCollections:
+      process.env.SYNC_PULL
+        ? process.env.SYNC_PULL.split(",").filter(Boolean)
+        : [],
   };
 
-  // Primer tick
+  // ████████████████████████████████████████████████████████
+  // PRIMER TICK (ÚNICO MOMENTO DONDE COCHERAS ACEPTA PULL)
+  // ████████████████████████████████████████████████████████
   syncTick(atlasUri, effectiveOpts, statusCb)
     .then(() => {
       INITIAL_PULL_DONE = true;
-      console.log("[syncService] Primer pull completado. Cocheras pasan a modo push-only.");
+      console.log("[syncService] Primer pull completado → cocheras ahora PUSH-ONLY.");
     })
-    .catch(e => console.error('[syncService] primer tick falló:', e));
+    .catch(err => console.error("[syncService] primer tick falló:", err));
 
-  // Loop periódico
+  // LOOP PERIÓDICO
   const handle = setInterval(
     () => syncTick(atlasUri, effectiveOpts, statusCb),
     intervalMs
@@ -2040,16 +2119,24 @@ function startPeriodicSync(atlasUri, opts = {}, statusCb = () => {}) {
     runOnce: () => syncTick(atlasUri, effectiveOpts, statusCb),
     getStatus: () => ({ ...status }),
     inspectRemote: async (cols = []) => {
-      const db = getRemoteDbInstance() || await connectRemote(atlasUri, SELECTED_REMOTE_DBNAME);
+      const db =
+        getRemoteDbInstance() ||
+        await connectRemote(atlasUri, SELECTED_REMOTE_DBNAME);
+
       let collections = cols.length
         ? cols
-        : (await db.listCollections().toArray()).map(c => canonicalizeName(c.name));
+        : (await db.listCollections().toArray()).map(c =>
+            canonicalizeName(c.name)
+          );
+
       const out = {};
       for (const c of collections) {
         try {
           let total = 0;
           for (const name of getRemoteNames(c)) {
-            try { total += await db.collection(name).countDocuments(); } catch (_) {}
+            try {
+              total += await db.collection(name).countDocuments();
+            } catch (_) {}
           }
           out[c] = total;
         } catch (e) {

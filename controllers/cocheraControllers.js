@@ -477,6 +477,8 @@ exports.removerVehiculo = async (req, res) => {
 
     // 2) Desactivar abonos activos asociados a ESTE vehículo (del mismo cliente)
     let abonosDesactivados = 0;
+    let abonosIds = [];
+
     if (cliIdSafe) {
       const vehIdObj = veh._id;
       const vehIdStr = String(veh._id);
@@ -496,7 +498,7 @@ exports.removerVehiculo = async (req, res) => {
         .select("_id fechaExpiracion")
         .lean();
 
-      const abonosIds = abonosAntes.map((a) => a._id);
+      abonosIds = abonosAntes.map((a) => a._id);
 
       if (abonosIds.length) {
         const upd = await Abono.updateMany(
@@ -522,33 +524,38 @@ exports.removerVehiculo = async (req, res) => {
       );
     }
 
+    // 2.bis) Encolar PATCH en Outbox para cada abono afectado (igual que desactivarAbonoDeCochera)
+    if (abonosIds.length) {
+      try {
+        const Outbox = require("../models/Outbox");
+        const docs = await Abono.find({ _id: { $in: abonosIds } }).lean();
+        for (const doc of docs) {
+          await Outbox.create({
+            method: "PATCH",
+            route: `/api/abonos/${doc._id}`,
+            params: { id: String(doc._id) },
+            document: doc,
+            status: "pending",
+            createdAt: new Date(),
+          });
+        }
+      } catch (e) {
+        console.warn(
+          "[removerVehiculo] no se pudo encolar Outbox PATCH para abonos:",
+          e.message || e
+        );
+      }
+    }
+
     // 3) Sacar el vehículo de la cochera
     await Cochera.updateOne(
       { _id: coch._id },
       { $pull: { vehiculos: veh._id } }
     );
 
-    // 4) Sacar el vehículo del cliente (si lo tenía)
+    // 4 + 6) Actualizar Cliente: sacar vehículo y recalcular abonado/finAbono
     if (cliIdSafe) {
-      await Cliente.updateOne(
-        { _id: cliIdSafe },
-        {
-          $pull: { vehiculos: veh._id },
-          $set: { updatedAt: new Date() },
-        }
-      );
-    }
-
-    // 5) Desasociar completamente en el propio vehículo
-    veh.cocheraId = undefined;
-    veh.cliente = null;
-    veh.abonado = false;
-    veh.abono = null;       // limpio puntero al abono
-    veh.abonoExpira = null; // limpio fecha de expiración
-    await veh.save();
-
-    // 6) Recalcular estado del cliente (abonado / finAbono) si tenemos cliIdSafe
-    if (cliIdSafe) {
+      // 4.a) Recalcular abonados activos
       const activos = await Abono.find({
         cliente: cliIdSafe,
         activo: true,
@@ -568,15 +575,61 @@ exports.removerVehiculo = async (req, res) => {
         finAbono = maxTs > 0 ? new Date(maxTs) : null;
       }
 
+      // 4.b) Un solo update: sacar vehículo + estado de abonos
       await Cliente.updateOne(
         { _id: cliIdSafe },
         {
+          $pull: { vehiculos: veh._id },
           $set: {
             abonado: activos.length > 0,
             finAbono,
             updatedAt: new Date(),
           },
         }
+      );
+
+      // 4.c) AHORA sí, encolar PATCH con el cliente ya actualizado
+      try {
+        const Outbox = require("../models/Outbox");
+        const cliDoc = await Cliente.findById(cliIdSafe).lean();
+
+        await Outbox.create({
+          method: "PATCH",
+          route: `/api/clientes/${cliIdSafe}`,
+          params: { id: String(cliIdSafe) },
+          document: cliDoc, // cliente completo, ya consistente
+          status: "pending",
+          createdAt: new Date(),
+        });
+      } catch (e) {
+        console.warn("[removerVehiculo] no se pudo encolar PATCH de cliente:", e.message);
+      }
+    }
+
+    // 5) Desasociar completamente en el propio vehículo
+    veh.cocheraId = undefined;
+    veh.cliente = null;
+    veh.abonado = false;
+    veh.abono = null;       // limpio puntero al abono
+    veh.abonoExpira = null; // limpio fecha de expiración
+    await veh.save();
+    // 5.bis) Encolar PATCH de vehículo para sync remoto
+    try {
+      const Outbox = require("../models/Outbox");
+      const vehDoc = await Vehiculo.findById(veh._id).lean();
+
+      await Outbox.create({
+        method: "PATCH",
+        route: `/api/vehiculos/${veh._id}`,
+        params: { id: String(veh._id) },
+        document: vehDoc,
+        status: "pending",
+        createdAt: new Date(),
+      });
+    } catch (e) {
+      console.warn(
+        "[removerVehiculo] no se pudo encolar PATCH de vehiculo:",
+        e.message || e
       );
     }
 
