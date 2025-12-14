@@ -58,31 +58,53 @@ exports.ensureCochera = async (req, res) => {
     const exclusivaNorm =
       tipoNorm === "Fija" ? normExclusiva(exclusiva, tipoNorm) : false;
 
-    let coch = await Cochera.findOne({
+    let coch = null;
+
+    // ✅ REGLA: MÓVIL NUNCA SE REUTILIZA
+    if (tipoNorm !== "Móvil") {
+      coch = await Cochera.findOne({
+        cliente: clienteId,
+        tipo: tipoNorm,
+        piso: pisoNorm,
+        exclusiva: exclusivaNorm,
+      });
+
+      if (coch) {
+        await Cliente.updateOne(
+          { _id: clienteId, "cocheras.cocheraId": { $ne: coch._id } },
+          { $push: { cocheras: { cocheraId: coch._id } } }
+        );
+
+        return res.json({
+          message: "Cochera existente reutilizada",
+          data: coch,
+          cocheraId: coch._id,
+        });
+      }
+    }
+
+    // ⬇️ si es Móvil, o si no existía Fija, se crea NUEVA
+    coch = new Cochera({
       cliente: clienteId,
       tipo: tipoNorm,
       piso: pisoNorm,
       exclusiva: exclusivaNorm,
+      vehiculos: [],
     });
 
-    if (coch) {
-      // 👇 IMPORTANTE: también saneamos Cliente.cocheras para no duplicar
-      await Cliente.updateOne(
-        {
-          _id: clienteId,
-          "cocheras.cocheraId": { $ne: coch._id },
-        },
-        {
-          $push: { cocheras: { cocheraId: coch._id } },
-        }
-      );
+    await coch.save();
 
-      return res.json({
-        message: "Cochera existente reutilizada",
-        data: coch,
-        cocheraId: coch._id,
-      });
-    }
+    await Cliente.updateOne(
+      { _id: clienteId, "cocheras.cocheraId": { $ne: coch._id } },
+      { $push: { cocheras: { cocheraId: coch._id } } }
+    );
+
+    return res.status(201).json({
+      message: "Cochera creada",
+      data: coch,
+      cocheraId: coch._id,
+    });
+
 
     coch = new Cochera({
       cliente: clienteId,
@@ -142,27 +164,26 @@ exports.crearCochera = async (req, res) => {
     const pisoNorm = normPiso(piso);
     const exclusivaNorm = normExclusiva(exclusiva, tipoNorm);
 
-    const existente = await Cochera.findOne({
-      cliente: clienteId,
-      tipo: tipoNorm,
-      piso: pisoNorm,
-      exclusiva: exclusivaNorm,
-    });
+    let existente = null;
 
-    if (existente) {
-      // 👇 Igual que en ensure: si ya existe, nos aseguramos de que esté en cliente.cocheras sin duplicar
-      await Cliente.updateOne(
-        {
-          _id: clienteId,
-          "cocheras.cocheraId": { $ne: existente._id },
-        },
-        {
-          $push: { cocheras: { cocheraId: existente._id } },
-        }
-      );
+    // ✅ MÓVIL NUNCA SE REUTILIZA
+    if (tipoNorm !== "Móvil") {
+      existente = await Cochera.findOne({
+        cliente: clienteId,
+        tipo: tipoNorm,
+        piso: pisoNorm,
+        exclusiva: exclusivaNorm,
+      });
 
-      return res.json({ message: "Cochera ya existía", data: existente });
+      if (existente) {
+        await Cliente.updateOne(
+          { _id: clienteId, "cocheras.cocheraId": { $ne: existente._id } },
+          { $push: { cocheras: { cocheraId: existente._id } } }
+        );
+        return res.json({ message: "Cochera ya existía", data: existente });
+      }
     }
+
 
     const nueva = new Cochera({
       cliente: clienteId,

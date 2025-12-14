@@ -77,32 +77,29 @@ async function ensureCocheraInterno({
   const exclusivaNorm =
     tipoNorm === 'Fija' ? normExclusiva(exclusiva, tipoNorm) : false;
 
-  let coch = await Cochera.findOne({
-    cliente: cli._id,
-    tipo: tipoNorm,
-    piso: pisoNorm,
-    exclusiva: exclusivaNorm,
-  }).session(session || null);
+  // =======================================================
+  // 🔥 REGLA DURA: SOLO FIJA SE REUTILIZA
+  // =======================================================
 
-  if (coch) {
-    // 🧼 SANEAMOS cochera.cliente si está mal o apunta a otro lado
-    const currentCliId =
-      asObjectId(coch.cliente) ||
-      (coch.cliente && coch.cliente._id && asObjectId(coch.cliente._id));
+  let coch = null;
 
-    if (!currentCliId || String(currentCliId) !== String(cli._id)) {
-      coch.cliente = cli._id;
-      try {
-        await coch.save({ session });
-      } catch (e) {
-        console.warn('[ensureCocheraInterno] no pude sanear cochera.cliente:', e.message || e);
-      }
+  if (tipoNorm === 'Fija') {
+    coch = await Cochera.findOne({
+      cliente: cli._id,
+      tipo: 'Fija',
+      piso: pisoNorm,
+      exclusiva: exclusivaNorm,
+    }).session(session || null);
+
+    if (coch) {
+      return coch;
     }
-
-    return coch;
   }
 
-  // 🆕 Creación de cochera nueva, siempre con cliente bien seteado
+  // =======================================================
+  // ⬇️ MÓVIL O FIJA INEXISTENTE → CREAR NUEVA
+  // =======================================================
+
   coch = new Cochera({
     cliente: cli._id,
     tipo: tipoNorm,
@@ -113,22 +110,20 @@ async function ensureCocheraInterno({
 
   await coch.save({ session });
 
-  // MODELO A: referencia única por cocheraId (sin duplicados)
   await Cliente.updateOne(
     {
       _id: cli._id,
-      "cocheras.cocheraId": { $ne: coch._id }   // si NO existe, lo agregamos
+      "cocheras.cocheraId": { $ne: coch._id }
     },
     {
-      $push: {
-        cocheras: { cocheraId: coch._id }       // subdoc SIN _id → NO duplica más
-      }
+      $push: { cocheras: { cocheraId: coch._id } }
     },
     { session }
   );
 
   return coch;
 }
+
 
 /* =======================================================
    🚗 ASIGNAR VEHÍCULO INTERNO
