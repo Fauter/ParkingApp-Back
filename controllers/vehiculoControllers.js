@@ -15,6 +15,7 @@ const Tarifa = require("../models/Tarifa");
 const Abono = require("../models/Abono");
 const Cliente = require("../models/Cliente");
 const Counter = require("../models/Counter");
+const Outbox = require("../models/Outbox");
 
 // ===== Config de archivos
 const UPLOADS_DIR = path.join(__dirname, "../uploads");
@@ -875,6 +876,27 @@ exports.registrarSalida = async (req, res) => {
 
     await session.commitTransaction();
     session.endSession();
+
+    // ✅ Encolar delta de historial para sync remoto (NO $set del vehículo entero)
+    try {
+      await Outbox.create({
+        method: "PATCH",
+        route: `/api/vehiculos/${patenteUp}/historial`, // ruta lógica (la interpreta el syncService)
+        collection: "vehiculos",
+        status: "pending",
+        document: {
+          patente: patenteUp,
+          // delta exacto: lo que acabás de pushear al historial
+          __op: "push_historial_estadia",
+          estadia: estadiaSnapshot,
+          // opcional: para orden y trazabilidad
+          updatedAt: new Date(),
+        },
+        createdAt: new Date(),
+      });
+    } catch (e) {
+      console.warn("[registrarSalida] no pude encolar Outbox vehiculos historial:", e?.message);
+    }
 
     // ========================================================
     // 🔥 2) NO crear movimiento para abonados o turnos

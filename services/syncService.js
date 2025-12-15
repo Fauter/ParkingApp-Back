@@ -881,6 +881,35 @@ async function processOutboxItem(remoteDb, item) {
         method: item.method,
       });
 
+      // ✅ CASO DELTA: push de historial (evita $set del array completo)
+      if (item?.document?.__op === "push_historial_estadia" && item?.document?.patente) {
+        const patente = String(item.document.patente).toUpperCase();
+        const vehRemoteName = remoteNames[0] || "vehiculos";
+        const vehColl = remoteDb.collection(vehRemoteName);
+
+        // Sanitizar estadia (muy importante: sin _id basura)
+        const estadia = deepClone(item.document.estadia || {});
+        if (estadia && typeof estadia === "object" && estadia._id) delete estadia._id;
+
+        await vehColl.updateOne(
+          { patente },
+          {
+            $push: { historialEstadias: estadia },
+            $unset: { estadiaActual: "" },
+            $set: { updatedAt: new Date() },
+            $setOnInsert: { patente }
+          },
+          { upsert: true }
+        );
+
+        console.log("[syncService] [vehiculos] delta push historialEstadias OK", {
+          patente,
+          ticket: estadia?.ticket,
+        });
+
+        return; // ⬅️ NO seguir con tu lógica genérica de $set completo
+      }
+
       // 1) Intentar ID directo (_id en document o extraído de la ruta)
       let id =
         (item.document && (item.document._id || item.document.id)) ||

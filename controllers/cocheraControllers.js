@@ -361,24 +361,86 @@ exports.actualizarCochera = async (req, res) => {
 exports.eliminarCochera = async (req, res) => {
   try {
     const { id } = req.params;
-    const coch = await Cochera.findById(id);
-    if (!coch) return res.status(404).json({ message: "Cochera no encontrada" });
 
-    await Vehiculo.updateMany(
-      { cocheraId: id },
-      { $unset: { cocheraId: "" } }
-    );
+    const coch = await Cochera.findById(id).lean();
+    if (!coch) {
+      return res.status(404).json({ message: "Cochera no encontrada" });
+    }
 
-    await Cliente.updateOne(
-      { _id: coch.cliente },
-      { $pull: { cocheras: { cocheraId: id } } }
-    );
+    const vehiculos = Array.isArray(coch.vehiculos) ? [...coch.vehiculos] : [];
 
-    await coch.deleteOne();
+    // 🔁 1) REMOVER VEHÍCULO POR VEHÍCULO
+    for (const vehiculoId of vehiculos) {
+      // reutilizamos EXACTAMENTE la misma lógica
+      // que el endpoint /remover-vehiculo
+      await exports.removerVehiculo(
+        {
+          body: {
+            cocheraId: id,
+            vehiculoId,
+          },
+        },
+        {
+          status: () => ({ json: () => {} }),
+          json: () => {},
+        }
+      );
+    }
 
-    res.json({ message: "Cochera eliminada" });
+    // 🧹 2) SACAR LA COCHERA DEL CLIENTE
+    if (coch.cliente) {
+      await Cliente.updateOne(
+        { _id: coch.cliente },
+        { $pull: { cocheras: { cocheraId: id } } }
+      );
+
+      // 🔔 Outbox cliente
+      try {
+        const Outbox = require("../models/Outbox");
+        const cliDoc = await Cliente.findById(coch.cliente).lean();
+        if (cliDoc) {
+          await Outbox.create({
+            method: "PATCH",
+            route: `/api/clientes/${coch.cliente}`,
+            params: { id: String(coch.cliente) },
+            document: cliDoc,
+            status: "pending",
+            createdAt: new Date(),
+          });
+        }
+      } catch (e) {
+        console.warn("[eliminarCochera] Outbox cliente:", e.message);
+      }
+    }
+
+    // 🗑️ 3) BORRAR COCHERA
+    await Cochera.deleteOne({ _id: id });
+
+    // 🔔 Outbox cochera (DELETE lógico remoto)
+    try {
+      const Outbox = require("../models/Outbox");
+      await Outbox.create({
+        method: "DELETE",
+        route: `/api/cocheras/${id}`,
+        params: { id },
+        document: { _id: id },
+        status: "pending",
+        createdAt: new Date(),
+      });
+    } catch (e) {
+      console.warn("[eliminarCochera] Outbox cochera:", e.message);
+    }
+
+    return res.json({
+      message: "Cochera eliminada con cierre completo",
+      vehiculosRemovidos: vehiculos.length,
+    });
   } catch (err) {
-    res.status(500).json({ message: "Error al eliminar cochera", error: err.message });
+    console.error("Error al eliminar cochera:", err);
+    return res.status(500).json({
+      message: "Error al eliminar cochera",
+      error: err.message,
+    });
   }
 };
 
