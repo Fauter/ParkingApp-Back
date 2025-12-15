@@ -1759,12 +1759,27 @@ exports.actualizarAbono = async (req, res) => {
     const willChangePatente = newPatUP !== beforePatUP;
 
     // 🔍 Pre-chequeo de colisión si cambia la patente (para cortar temprano)
+    // ✅ FIX: comparar usando ObjectId saneado (before.vehiculo puede venir como buffer/string legacy)
+    const beforeVehIdSafe = toObjectIdSafe(before.vehiculo);
+
+    // Si no hay vínculo confiable, intentamos inferir el vehículo por patente anterior
+    let inferredVehId = beforeVehIdSafe;
+    if (!inferredVehId && beforePatUP) {
+      const vehByOldPat = await Vehiculo.findOne({ patente: beforePatUP }).select('_id').lean();
+      if (vehByOldPat?._id) inferredVehId = vehByOldPat._id;
+    }
+
     if (willChangePatente) {
-      const dup = await Vehiculo.findOne({ patente: newPatUP });
-      if (dup && (!before.vehiculo || String(dup._id) !== String(before.vehiculo))) {
-        return res.status(409).json({ message: 'Patente ya existe en otro vehículo', code: 'PATENTE_DUPLICADA' });
+      const dup = await Vehiculo.findOne({ patente: newPatUP }).select('_id').lean();
+      // Si existe un vehículo con la nueva patente y NO es el mismo vehículo que estamos renombrando → colisión real
+      if (dup && (!inferredVehId || String(dup._id) !== String(inferredVehId))) {
+        return res.status(409).json({
+          message: 'Patente ya existe en otro vehículo',
+          code: 'PATENTE_DUPLICADA'
+        });
       }
     }
+
 
     // ⬆️ Actualizo Abono primero
     const updated = await Abono.findByIdAndUpdate(id, { $set: updates }, { new: true });
@@ -1796,7 +1811,7 @@ exports.actualizarAbono = async (req, res) => {
     if (willChangePatente) {
       try {
         const abonoId = updated._id;
-        const vehIdFromBefore = toObjectIdSafe(before.vehiculo);
+        const vehIdFromBefore = beforeVehIdSafe;
         let veh = null;
 
         // 1) Intento por ID ya vinculado
